@@ -2028,6 +2028,14 @@ int main(int argc, char **argv)
 		b = auth_once(&s, 2);
 		logf("auth pair %d %d", a, b);
 		rc = (a == 0 && b == 0) ? 0 : 2;
+	} else if (!strcmp(mode, "auth1")) {
+		/* One press per run, for app/fp5_qtee_crossfinger.py. */
+		int a;
+
+		set_group(&s, group_path());
+		a = auth_once(&s, 1);
+		logf("auth single %d", a);
+		rc = a == 0 ? 0 : 2;
 	} else {
 		logf("unknown mode %s", mode);
 		rc = 1;
