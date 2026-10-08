@@ -1,0 +1,5 @@
+GPL-2.0-only
+
+The C session is GPL-2.0-only unless a file states otherwise.
+Python in app/ is CC0-1.0 / public domain for convenience
+(or GPL-2.0-only if you prefer the same).

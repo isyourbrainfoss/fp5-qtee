@@ -1,0 +1,12 @@
+#!/bin/sh
+# Open the Finger app. Does not start an enroll by itself.
+export PYTHONUNBUFFERED=1
+APP_DIR=/home/user/.local/share/fp5-qtee
+export PYTHONPATH="${APP_DIR}${PYTHONPATH:+:$PYTHONPATH}"
+if [ -z "$XDG_RUNTIME_DIR" ] && [ -d /run/user/10000 ]; then
+  export XDG_RUNTIME_DIR=/run/user/10000
+fi
+if [ -z "$WAYLAND_DISPLAY" ] && [ -S "${XDG_RUNTIME_DIR:-}/wayland-0" ]; then
+  export WAYLAND_DISPLAY=wayland-0
+fi
+exec python3 "$APP_DIR/fp5-qtee-app.py" "$@"

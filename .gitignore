@@ -1,0 +1,8 @@
+session/fp5-qtee-session
+session/fp5-qtee-load
+session/test_fp5_wire
+session/test_fp5_image
+*.o
+*.ko
+__pycache__/
+*.pyc
