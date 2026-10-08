@@ -237,6 +237,102 @@ static void test_rpmb(void)
 	       "read stays at request offset");
 }
 
+static void plan_one(uint8_t *sb, size_t len, uint32_t cmd, uint32_t nfr,
+		     uint16_t rr, struct fp5_rpmb *plan)
+{
+	uint32_t i;
+
+	memset(sb, 0, len);
+	*(uint32_t *)sb = cmd;
+	*(uint32_t *)(sb + 4) = nfr;
+	*(uint32_t *)(sb + 8) = 512;
+	*(uint32_t *)(sb + 0xc) = 0x18;
+	for (i = 0; i < (nfr ? nfr : 1); i++)
+		put_frame_rr(sb + 0x18 + 512 * i, rr, 0);
+	fp5_rpmb_plan(sb, len, plan);
+}
+
+static void test_rpmb_write_gate(void)
+{
+	uint8_t sb[0x1400];
+	struct fp5_rpmb plan;
+
+	/* Default off: every authenticated data write is refused. */
+	plan_one(sb, sizeof(sb), 0x103, 2, 3, &plan);
+	expect(plan.kind == FP5_RPMB_MULTI_WRITE && fp5_rpmb_is_write(&plan),
+	       "multi write is a write");
+	fp5_rpmb_gate_write(&plan, 0);
+	expect(plan.kind == FP5_RPMB_WRITE_OFF, "multi write refused by default");
+
+	plan_one(sb, sizeof(sb), 0x103, 1, 3, &plan);
+	expect(plan.kind == FP5_RPMB_SINGLE && fp5_rpmb_is_write(&plan),
+	       "single rr3 is a write");
+	fp5_rpmb_gate_write(&plan, 0);
+	expect(plan.kind == FP5_RPMB_WRITE_OFF, "single write refused by default");
+
+	plan_one(sb, sizeof(sb), 0x102, 2, 3, &plan);
+	expect(fp5_rpmb_is_write(&plan), "rr3 frame on 0x102 is still a write");
+	fp5_rpmb_gate_write(&plan, 0);
+	expect(plan.kind == FP5_RPMB_WRITE_OFF, "rr3 on 0x102 refused by default");
+
+	/* Opt-in keeps the original plan. */
+	plan_one(sb, sizeof(sb), 0x103, 2, 3, &plan);
+	fp5_rpmb_gate_write(&plan, 1);
+	expect(plan.kind == FP5_RPMB_MULTI_WRITE, "multi write allowed on opt-in");
+	plan_one(sb, sizeof(sb), 0x103, 1, 3, &plan);
+	fp5_rpmb_gate_write(&plan, 1);
+	expect(plan.kind == FP5_RPMB_SINGLE && plan.rr == 3,
+	       "single write allowed on opt-in");
+
+	/* Reads, counter reads and result reads stay allowed. */
+	plan_one(sb, sizeof(sb), 0x102, 1, 4, &plan);
+	fp5_rpmb_gate_write(&plan, 0);
+	expect(plan.kind == FP5_RPMB_SINGLE && !fp5_rpmb_is_write(&plan),
+	       "data read allowed");
+	plan_one(sb, sizeof(sb), 0x102, 2, 4, &plan);
+	fp5_rpmb_gate_write(&plan, 0);
+	expect(plan.kind == FP5_RPMB_MULTI_READ, "multi read allowed");
+	plan_one(sb, sizeof(sb), 0x102, 1, 2, &plan);
+	fp5_rpmb_gate_write(&plan, 0);
+	expect(plan.kind == FP5_RPMB_SINGLE && plan.rr == 2,
+	       "write-counter read allowed");
+	plan_one(sb, sizeof(sb), 0x102, 1, 0, &plan);
+	fp5_rpmb_gate_write(&plan, 0);
+	expect(plan.kind == FP5_RPMB_SINGLE && plan.rr == 2,
+	       "empty 0x102 frame becomes a counter read");
+	plan_one(sb, sizeof(sb), 0x103, 1, 5, &plan);
+	fp5_rpmb_gate_write(&plan, 0);
+	expect(plan.kind == FP5_RPMB_SINGLE && plan.rr == 5,
+	       "result read allowed");
+	memset(sb, 0, sizeof(sb));
+	*(uint32_t *)sb = 0x104;
+	fp5_rpmb_plan(sb, sizeof(sb), &plan);
+	fp5_rpmb_gate_write(&plan, 0);
+	expect(plan.kind == FP5_RPMB_GET_INFO, "get info allowed");
+
+	/* Key provisioning stays refused even with writes on. */
+	memset(sb, 0, sizeof(sb));
+	*(uint32_t *)sb = 0x101;
+	fp5_rpmb_plan(sb, sizeof(sb), &plan);
+	fp5_rpmb_gate_write(&plan, 1);
+	expect(plan.kind == FP5_RPMB_REFUSE, "0x101 refused with writes on");
+	{
+		/* req_resp 1 at every offset the planner tries (see test_rpmb). */
+		static const uint32_t at[] = { 0x08, 0x10, 0x14, 0x18, 0x20 };
+		unsigned i;
+
+		plan_one(sb, sizeof(sb), 0x102, 1, 1, &plan);
+		for (i = 0; i < 5; i++) {
+			sb[at[i] + 510] = 0x00;
+			sb[at[i] + 511] = 0x01;
+		}
+		fp5_rpmb_plan(sb, sizeof(sb), &plan);
+	}
+	fp5_rpmb_gate_write(&plan, 1);
+	expect(plan.kind == FP5_RPMB_REFUSE, "req_resp 1 refused with writes on");
+	expect(!fp5_rpmb_is_write(NULL), "null plan");
+}
+
 static void test_time_and_config(void)
 {
 	uint8_t sb[64];
@@ -280,6 +376,7 @@ int main(void)
 	test_decisions();
 	test_gpfile();
 	test_rpmb();
+	test_rpmb_write_gate();
 	test_time_and_config();
 	if (fails) {
 		fprintf(stderr, "%d failed\n", fails);

@@ -126,6 +126,7 @@ int fp5_gp_header_is_template(const uint8_t *buf, size_t n);
 #define FP5_RPMB_MULTI_READ 4
 #define FP5_RPMB_SINGLE 5
 #define FP5_RPMB_FAIL 6
+#define FP5_RPMB_WRITE_OFF 7 /* data write refused: writes not enabled */
 
 struct fp5_rpmb {
 	int kind;
@@ -139,6 +140,12 @@ struct fp5_rpmb {
 };
 
 int fp5_rpmb_plan(const uint8_t *sb, size_t len, struct fp5_rpmb *out);
+/* 1 when the plan sends an authenticated data write (req_resp 3, single or
+ * multi frame), i.e. anything that changes RPMB data and its write counter. */
+int fp5_rpmb_is_write(const struct fp5_rpmb *plan);
+/* Turns a write plan into FP5_RPMB_WRITE_OFF unless allow_write is set.
+ * Reads, write-counter reads and result reads are left alone. */
+void fp5_rpmb_gate_write(struct fp5_rpmb *plan, int allow_write);
 void fp5_rpmb_reply_err(uint8_t *sb, uint32_t err);
 void fp5_rpmb_place_multi_write(uint8_t *sb, const uint8_t *frame);
 void fp5_rpmb_place_multi_read(uint8_t *sb, uint32_t off, const uint8_t *data,

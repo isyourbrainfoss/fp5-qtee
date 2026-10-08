@@ -644,6 +644,23 @@ int fp5_rpmb_plan(const uint8_t *sb, size_t len, struct fp5_rpmb *out)
 	return 0;
 }
 
+int fp5_rpmb_is_write(const struct fp5_rpmb *plan)
+{
+	if (!plan)
+		return 0;
+	if (plan->kind == FP5_RPMB_MULTI_WRITE)
+		return 1;
+	/* MULTI_READ and SINGLE both send the frame at plan->off as is. */
+	return (plan->kind == FP5_RPMB_SINGLE ||
+		plan->kind == FP5_RPMB_MULTI_READ) && plan->rr == 3;
+}
+
+void fp5_rpmb_gate_write(struct fp5_rpmb *plan, int allow_write)
+{
+	if (plan && !allow_write && fp5_rpmb_is_write(plan))
+		plan->kind = FP5_RPMB_WRITE_OFF;
+}
+
 void fp5_time_apply(uint8_t *sb, size_t len, int64_t sec, int32_t nsec)
 {
 	uint32_t cmd;
