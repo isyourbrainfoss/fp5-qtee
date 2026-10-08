@@ -75,6 +75,33 @@ class CoachTest(unittest.TestCase):
         self.assertEqual(c.hero, "NOT SAVED")
         self.assertFalse(c.ok)
 
+    def test_refused_rpmb_write_explains_not_saved(self) -> None:
+        c = play(
+            "enroll",
+            [
+                "RPMB writes off (default). Reads allowed. Pass --allow-rpmb-write to let enroll save through RPMB.",
+                "rem=0 sample=19",
+                "RPMB refuse WRITE cmd=0x103 rr=3 frames=2: RPMB writes are off (use --allow-rpmb-write or FP5_QTEE_RPMB_WRITE=1)",
+                "enroll done rem=0 wrote=0 save_ms=40",
+                "session_exit:2",
+            ],
+        )
+        self.assertEqual(c.hero, "NOT SAVED")
+        self.assertTrue(c.rpmb_refused)
+        self.assertIn("Allow RPMB writes", c.sub)
+        self.assertFalse(c.ok)
+
+    def test_not_saved_without_refusal_has_no_rpmb_hint(self) -> None:
+        c = play(
+            "enroll",
+            [
+                "rem=0 sample=19",
+                "enroll done rem=0 wrote=0 save_ms=40",
+            ],
+        )
+        self.assertEqual(c.hero, "NOT SAVED")
+        self.assertNotIn("RPMB", c.sub)
+
     def test_template_write_is_saved(self) -> None:
         c = play(
             "enroll",

@@ -47,6 +47,7 @@ class Coach:
         self.saw_no_finger = False
         self.exit_code: int | None = None
         self.scores: list[int] = []
+        self.rpmb_refused = False
 
     def begin(self, mode: str) -> None:
         self.mode = mode
@@ -58,6 +59,7 @@ class Coach:
         self.saw_no_finger = False
         self.exit_code = None
         self.scores = []
+        self.rpmb_refused = False
         self.rem = None
         self.sample = None
         self.detail = ""
@@ -86,6 +88,10 @@ class Coach:
         if line.startswith("open /dev/tee0") or line.startswith("ENROLL rejected"):
             self.detail = line
             self._set("FAILED", line, "warn")
+            return
+        if line.startswith("RPMB refuse WRITE"):
+            # Not a prompt change. Explains a NOT SAVED later.
+            self.rpmb_refused = True
             return
         m = _INVOKE.search(line)
         if m and int(m.group(2), 16) != 0:
@@ -186,9 +192,14 @@ class Coach:
                     "done",
                 )
             else:
+                hint = (
+                    " RPMB writes are off. Tick 'Allow RPMB writes' to save."
+                    if self.rpmb_refused
+                    else ""
+                )
                 self._set(
                     "NOT SAVED",
-                    f"Not saved (remaining {rem}, wrote {wrote}, {save_ms} ms).",
+                    f"Not saved (remaining {rem}, wrote {wrote}, {save_ms} ms).{hint}",
                     "warn",
                 )
             return

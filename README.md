@@ -50,6 +50,33 @@ loaded, and it is a no-op when `qcomtee` is already loaded. Do not `rmmod` a
 live `qsee_fingerpr`. One listener registration per boot. Do not program or
 erase the RPMB key.
 
+## RPMB writes
+
+The session serves the trustlet's RPMB listener with real SCSI SECURITY
+PROTOCOL OUT/IN on `/dev/bsg/0:0:0:49476`. RPMB data writes cannot be
+undone: each one changes the replay-protected data and advances the write
+counter for good. So the session **refuses RPMB data writes by default**:
+
+- Refused unless enabled: authenticated data writes (`req_resp` 3), single
+  or multi frame. The trustlet gets `-EIO`, the same answer it gets when the
+  RPMB device cannot be reached, and the log says `RPMB refuse WRITE ...`.
+- Always allowed: GET_INFO, write-counter reads, data reads and result
+  reads.
+- Always refused, even with writes on: key programming (listener command
+  `0x101`, `req_resp` 1).
+
+To allow writes (needed for Enroll to save through RPMB), pass
+`--allow-rpmb-write` anywhere on the session command line, or set
+`FP5_QTEE_RPMB_WRITE=1` in the session's environment (`sudo` drops the
+environment by default, so the flag is easier). The session prints a loud
+`!!! RPMB WRITES ENABLED` banner at startup when writes are on.
+
+In the Finger app, tick **Allow RPMB writes (needed to save a finger)**
+before tapping Enroll. It is off by default. Launching the app with
+`FP5_QTEE_RPMB_WRITE=1` ticks it in advance. The app passes
+`--allow-rpmb-write` to the session; it does not rely on `sudo` keeping the
+environment.
+
 ## Build
 
 On the phone, Alpine gcc is enough. pthread is in musl, so there is no
@@ -76,6 +103,8 @@ It stays idle until Enroll or Match is tapped. Hold about a second on PRESS.
 - Treat authenticate-command rc 0 as a finger match.
 - Unlink the secure-storage segment. A real unlink destroys it.
 - Program or erase the RPMB key (`req_resp=1`, listener command `0x101`).
+- Turn on RPMB writes (`--allow-rpmb-write`) unless you mean to save a
+  template. Writes advance the RPMB write counter permanently.
 
 ## License
 

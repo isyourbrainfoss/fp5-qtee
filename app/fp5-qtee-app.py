@@ -41,6 +41,9 @@ LOAD_SCRIPT = Path("/home/user/fp5-qtee-keep/load-qcomtee.sh")
 FIRMWARE = "/lib/firmware/qsee"
 LOG_DIR = Path("/home/user/fp5-qtee-keep/logs")
 OLD_DRIVER = Path("/sys/module/qsee_fingerpr")
+# The session refuses RPMB data writes unless asked. sudo drops the
+# environment, so the app turns this into --allow-rpmb-write.
+RPMB_WRITE_ENV = "FP5_QTEE_RPMB_WRITE"
 
 CSS = """
 window { background-color: #101418; }
@@ -120,6 +123,10 @@ class FingerWindow(Adw.ApplicationWindow):
 
         bar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         bar.add_css_class("btn-bar")
+        # Off unless FP5_QTEE_RPMB_WRITE=1. Enroll needs it to save.
+        self._rpmb = Gtk.CheckButton(label="Allow RPMB writes (needed to save a finger)")
+        self._rpmb.set_active(os.environ.get(RPMB_WRITE_ENV) == "1")
+        bar.append(self._rpmb)
         self._enroll = Gtk.Button(label="Enroll")
         self._enroll.add_css_class("suggested-action")
         self._enroll.add_css_class("pill")
@@ -147,7 +154,8 @@ class FingerWindow(Adw.ApplicationWindow):
         self._coach.begin(mode)
         self._paint()
         self._buttons(running=True)
-        threading.Thread(target=self._job, args=(mode,), daemon=True).start()
+        rpmb_write = self._rpmb.get_active()
+        threading.Thread(target=self._job, args=(mode, rpmb_write), daemon=True).start()
 
     def stop(self) -> None:
         with self._lock:
@@ -174,6 +182,7 @@ class FingerWindow(Adw.ApplicationWindow):
     def _buttons(self, running: bool) -> None:
         self._enroll.set_sensitive(not running)
         self._match.set_sensitive(not running)
+        self._rpmb.set_sensitive(not running)
         self._stop.set_sensitive(running)
 
     def _paint(self) -> None:
@@ -213,13 +222,13 @@ class FingerWindow(Adw.ApplicationWindow):
 
         GLib.timeout_add(2000, later)
 
-    def _job(self, mode: str) -> None:
+    def _job(self, mode: str, rpmb_write: bool = False) -> None:
         rc = 0
         try:
             if not self._cancelled():
                 self._preflight()
             if not self._cancelled():
-                rc = self._run(mode)
+                rc = self._run(mode, rpmb_write)
         except Exception as exc:
             if self._cancelled():
                 self._ui(lambda: self._finish(rc))
@@ -265,7 +274,7 @@ class FingerWindow(Adw.ApplicationWindow):
             text = (proc.stdout + proc.stderr).strip()
             raise RuntimeError(text or "The reader service did not start.")
 
-    def _run(self, mode: str) -> int:
+    def _run(self, mode: str, rpmb_write: bool = False) -> int:
         binary = session_bin()
         if binary is None:
             raise RuntimeError("The reader program is not on this phone.")
@@ -275,19 +284,22 @@ class FingerWindow(Adw.ApplicationWindow):
         limit = "1500" if mode == "enroll" else "400"
         self._log_path = path
         self._ui(self._paint_only)
+        argv = [
+            "sudo",
+            "-n",
+            "timeout",
+            "-k",
+            "15",
+            limit,
+            str(binary),
+        ]
+        if rpmb_write:
+            argv.append("--allow-rpmb-write")
+        argv += [mode, FIRMWARE]
         with path.open("w", encoding="utf-8") as log:
+            log.write(f"app rpmb_write={int(rpmb_write)}\n")
             proc = subprocess.Popen(
-                [
-                    "sudo",
-                    "-n",
-                    "timeout",
-                    "-k",
-                    "15",
-                    limit,
-                    str(binary),
-                    mode,
-                    FIRMWARE,
-                ],
+                argv,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
