@@ -16,11 +16,17 @@ On 2026-10-08 the Finger app enrolled a finger (samples-remaining 0, template
 written) and matched it. After a reboot the same finger still matched:
 template id 1403494260, a real finger-down (`itype` `0x2`), and
 `auth success`. Other presses on both boots returned fid 0 and
-`authentication failed`. Phosh unlock is not wired up.
+`authentication failed`.
+
+Phosh does not ask PAM until a PIN is submitted, so the finger is not a PAM
+module. While the lock screen is showing and the panel is on, `fp5-qtee-unlock`
+runs one match (`unlock` mode, a single press). A real hit calls
+`loginctl unlock-session` on the Phosh session. The panel being off does not
+listen. A miss does not unlock. PIN still works.
 
 Log scans, the time-listener reply, and the group-path buffer stop at the
 buffer they were given. A group path that does not fit is refused before it
-is sent. The phone is still running the 2026-10-08 session binary.
+is sent. The phone session includes those checks and a one-press `unlock` mode.
 
 Match sends authenticate first, then arms chip wait-touch (work mode 1).
 It captures only an exact finger-down. A hit is an image report that

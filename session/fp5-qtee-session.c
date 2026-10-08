@@ -2093,6 +2093,17 @@ int main(int argc, char **argv)
 		b = auth_once(&s, 2);
 		logf("auth pair %d %d", a, b);
 		rc = (a == 0 && b == 0) ? 0 : 2;
+	} else if (!strcmp(mode, "unlock")) {
+		/* One press for the Phosh lock screen. Match still asks twice. */
+		int a;
+
+		if (set_group(&s, group_path())) {
+			rc = 1;
+			goto done;
+		}
+		a = auth_once(&s, 1);
+		logf("unlock once %d", a);
+		rc = a == 0 ? 0 : (a < 0 ? 1 : 2);
 	} else {
 		logf("unknown mode %s", mode);
 		rc = 1;

@@ -1,0 +1,12 @@
+[Unit]
+Description=FP5 fingerprint unlock for Phosh
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/fp5-qtee-unlock
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

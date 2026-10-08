@@ -1,0 +1,9 @@
+#!/bin/sh
+# Phosh lock watcher. One finger match, then logind unlock. Does not enroll.
+export PYTHONUNBUFFERED=1
+APP_DIR=/home/user/.local/share/fp5-qtee
+export PYTHONPATH="${APP_DIR}${PYTHONPATH:+:$PYTHONPATH}"
+if [ -z "$XDG_RUNTIME_DIR" ] && [ -d /run/user/10000 ]; then
+  export XDG_RUNTIME_DIR=/run/user/10000
+fi
+exec python3 "$APP_DIR/fp5_qtee_unlock.py"
