@@ -1577,15 +1577,19 @@ static const char *group_path(void)
 	return "";
 }
 
-static void set_group(struct svc *s, const char *path)
+static int set_group(struct svc *s, const char *path)
 {
-	uint8_t g[128];
-	size_t n = strlen(path);
+	uint8_t g[FP5_GROUP_CAP];
+	int n = fp5_build_group(g, sizeof(g), path);
 
-	memset(g, 0, sizeof(g));
-	memcpy(g + 4, path, n + 1);
-	send_cmd(s, fp5_op_set_group(), (uint32_t)(4 + n + 1), g, "SET_GROUP");
-	send_cmd(s, fp5_op_enum(), 0, NULL, "ENUM");
+	if (n < 0) {
+		logf("SET_GROUP path too long (%zu bytes, max %zu)",
+		     path ? strlen(path) : (size_t)0, sizeof(g) - 5);
+		return -1;
+	}
+	if (send_cmd(s, fp5_op_set_group(), (uint32_t)n, g, "SET_GROUP"))
+		return -1;
+	return send_cmd(s, fp5_op_enum(), 0, NULL, "ENUM");
 }
 
 static int open_enroll(struct svc *s)
@@ -1765,7 +1769,8 @@ static int enroll_finger(struct svc *s)
 			wrote = (valid && cmd == 0x103 && result == 0) || tmpl;
 			logf("SAVE ms=%ld rpmb_cmd=0x%x rpmb_result=0x%x valid=%d template=%d name=%s",
 			     save_ms, cmd, result, valid, tmpl, s->template_name);
-			set_group(s, group_path());
+			if (set_group(s, group_path()))
+				return -1;
 		}
 		if (lift_rearm(s, &irq))
 			return -1;
@@ -1923,8 +1928,7 @@ int main(int argc, char **argv)
 		const char *path = argc > 3 ? argv[3] : group_path();
 
 		logf("reopen path '%s'", path);
-		set_group(&s, path);
-		rc = 0;
+		rc = set_group(&s, path) ? 1 : 0;
 	} else if (!strcmp(mode, "begin")) {
 		rc = open_enroll(&s);
 		if (rc == 0 && s.last_rc != 0)
@@ -1982,7 +1986,10 @@ int main(int argc, char **argv)
 		int ms;
 		uint8_t z[4] = { 0 };
 
-		set_group(&s, group_path());
+		if (set_group(&s, group_path())) {
+			rc = 1;
+			goto done;
+		}
 		logf("ARM1 before irq=%u mode=%u", irq0, wmode);
 		if (send_cmd(&s, fp5_op_wmode(), 4, &wmode, "WMODE_TOUCH")) {
 			rc = 1;
@@ -2012,7 +2019,10 @@ int main(int argc, char **argv)
 		uint8_t hat[0x4a];
 
 		fp5_hat_auth(hat);
-		set_group(&s, group_path());
+		if (set_group(&s, group_path())) {
+			rc = 1;
+			goto done;
+		}
 		logf("AUTHARM plen=0x%x", fp5_auth_plen());
 		if (send_cmd(&s, fp5_op_auth(), fp5_auth_plen(), hat, "AUTH_ARM"))
 			rc = 1;
@@ -2023,7 +2033,10 @@ int main(int argc, char **argv)
 	} else if (!strcmp(mode, "auth")) {
 		int a, b;
 
-		set_group(&s, group_path());
+		if (set_group(&s, group_path())) {
+			rc = 1;
+			goto done;
+		}
 		a = auth_once(&s, 1);
 		b = auth_once(&s, 2);
 		logf("auth pair %d %d", a, b);
