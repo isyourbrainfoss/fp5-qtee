@@ -24,7 +24,8 @@ Sync config sends `preferred_device_id` 37777, which is focal32 profile
 table, so a template enrolled under 37841 has no feature pointers. Enroll
 again on this session before matching. `algorithm_log_level` is 2 so the
 trustlet can print the subtemplate distance. A match of the enrolled finger
-against a different finger has not been witnessed from this tree.
+against a different finger has not been witnessed from this tree. See
+[Cross-finger test](#cross-finger-test) to measure it.
 
 The signed `focal32` image is not in this repository. Copy `focal32.mdt` and
 `focal32.bXX` from a Fairphone Android vendor image to `/lib/firmware/qsee/`.
@@ -68,6 +69,47 @@ Install the session where the app already looks:
 
 The app is `app/fp5-qtee-app.py`, launched by `app/fp5-qtee-finger`.
 It stays idle until Enroll or Match is tapped. Hold about a second on PRESS.
+
+## Cross-finger test
+
+`app/fp5_qtee_crossfinger.py` checks that a different finger is rejected.
+Finger A is the enrolled finger, finger B any other finger. It runs the
+session once per press in the new `auth1` mode (one auth per run, logs
+`auth single <rc>`), the same way the app does (`sudo -n timeout ...
+<session> auth1 /lib/firmware/qsee`). It prompts in the terminal: get ready,
+`PRESS now` when the reader is armed, then `LIFT`. No finger, empty and error
+runs are logged but not counted, and that press is asked for again.
+
+```sh
+# finger A already enrolled with the app (or add --enroll)
+python3 app/fp5_qtee_crossfinger.py --phase pre-reboot      # 50 x A, then 50 x B
+sudo reboot
+python3 app/fp5_qtee_crossfinger.py --phase post-reboot     # compares with the newest pre-reboot run
+python3 app/fp5_qtee_crossfinger.py --analyze ~/fp5-qtee-keep/logs/crossfinger-...-pre-reboot.jsonl
+```
+
+Each run writes `~/fp5-qtee-keep/logs/crossfinger-<stamp>-<phase>.jsonl` and
+`.csv` (label, HIT/FAIL, scores, timestamp per press), `-summary.json`, and
+the raw session output in `-session.txt`.
+
+Verdict (exit 0 PASS, 1 FAIL, 2 INCONCLUSIVE). Every threshold is an option:
+
+- FAIL if B hits more than `max(1, round(N_B/50))` times (`--max-b-hits`).
+- FAIL if B scores are not clearly worse than A scores. Each press is scored
+  by its closest `FtVerifySubTemplate() score`. Scores are read as distances,
+  lower is closer, as the coach reads them (`--score-direction similarity`
+  flips that). Distance 0 means no features and is dropped
+  (`--keep-zero-scores` keeps it). Median B must be above median A plus
+  `--margin` (default 0), and the closest B press must be above median A
+  (`--no-best-b-check` skips this).
+- INCONCLUSIVE if either finger has fewer than `--min-presses` (10) scored
+  presses, if A hits less than `--min-a-hit-rate` (50%) of the time (a reader
+  that rejects everything also rejects B), or if there are no scores
+  (`--no-score-check` judges on hits only).
+
+`-n` sets the presses per finger, `--order alternate` interleaves A and B,
+and `--session-arg ARG` passes extra session flags. Host tests, with
+synthetic log lines only: `python3 app/test_fp5_qtee_crossfinger.py`.
 
 ## Do not
 
