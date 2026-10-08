@@ -13,11 +13,10 @@ Status: **experimental**. Not an official Fairphone or distribution package.
 ## Where this stands
 
 On 2026-10-08 the Finger app enrolled a finger (samples-remaining 0, template
-written, hero SAVED) and then matched it. The enrolled finger returned
-template id 1657488200 with a real finger-down (`itype` `0x2`) and
-`auth success`. Other presses on the same boot returned fid 0,
-`authentication failed`, and hero NO MATCH. Phosh unlock is not wired up.
-Reboot persistence of that template was not checked.
+written) and matched it. After a reboot the same finger still matched:
+template id 1403494260, a real finger-down (`itype` `0x2`), and
+`auth success`. Other presses on both boots returned fid 0 and
+`authentication failed`. Phosh unlock is not wired up.
 
 Log scans, the time-listener reply, and the group-path buffer stop at the
 buffer they were given. A group path that does not fit is refused before it
