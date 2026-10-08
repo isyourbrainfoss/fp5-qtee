@@ -950,6 +950,7 @@ static size_t qsee_len;
 static size_t qsee_delta_len;
 static int qsee_armed;
 static int qsee_log_warned;
+#define WATCH_DIR "/tmp/fp5-qtee"
 static int watch_stop;
 static int watch_on;
 static pthread_t watch_thr;
@@ -991,15 +992,32 @@ static void *qsee_watch_main(void *arg)
 	uint8_t *buf;
 	uint32_t off = 0, wrap = 0;
 	int armed = 0;
-	FILE *out;
+	int fd;
+	FILE *out = NULL;
 	(void)arg;
 
 	buf = calloc(1, 65536);
-	out = fopen("/tmp/fp5-qtee/watch.txt", "w");
-	if (!buf || !out) {
+	if (!buf) {
+		logl("qsee watch: out of memory");
+		return NULL;
+	}
+	/* 0755, not 0700: the app looks for the session binary in this
+	 * directory as the desktop user, and this runs as root. */
+	if (mkdir(WATCH_DIR, 0755) && errno != EEXIST) {
+		logf("qsee watch: mkdir %s: %s", WATCH_DIR, strerror(errno));
 		free(buf);
-		if (out)
-			fclose(out);
+		return NULL;
+	}
+	/* Root writes here, so do not follow a planted symlink in /tmp. */
+	fd = open(WATCH_DIR "/watch.txt",
+		  O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0644);
+	if (fd >= 0)
+		out = fdopen(fd, "w");
+	if (!out) {
+		logf("qsee watch: open %s/watch.txt: %s", WATCH_DIR, strerror(errno));
+		if (fd >= 0)
+			close(fd);
+		free(buf);
 		return NULL;
 	}
 	while (!watch_stop) {
