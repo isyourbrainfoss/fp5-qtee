@@ -47,6 +47,7 @@ struct svc {
 	uint64_t listener_svc[4];
 	int nls;
 	int bsg;
+	int allow_rpmb_write; /* --allow-rpmb-write or FP5_QTEE_RPMB_WRITE=1 */
 	uint32_t last_rpmb_cmd;
 	uint16_t last_rpmb_result;
 	int last_rpmb_valid;
@@ -499,6 +500,21 @@ static void serve_rpmb(struct svc *s, uint8_t *sb, size_t len)
 	if (plan.kind == FP5_RPMB_FAIL) {
 		fp5_rpmb_reply_err(sb, (uint32_t)(-EIO));
 		logf("RPMB cmd=0x%x no frame", plan.cmd);
+		note_rpmb(s, plan.cmd, 0xffff, 0, 0);
+		return;
+	}
+	fp5_rpmb_gate_write(&plan, s->allow_rpmb_write);
+	if (plan.kind == FP5_RPMB_WRITE_OFF) {
+		/*
+		 * Same -EIO the trustlet gets when the RPMB device cannot be
+		 * reached (bsg missing or a failed SG_IO). No fake result
+		 * frame: an "authentication failure" result could look like a
+		 * key problem, and a fake success would lie about the counter.
+		 */
+		logf("RPMB refuse WRITE cmd=0x%x rr=%u frames=%u: RPMB writes are off "
+		     "(use --allow-rpmb-write or FP5_QTEE_RPMB_WRITE=1)",
+		     plan.cmd, plan.rr, plan.out_n ? plan.out_n : 1);
+		fp5_rpmb_reply_err(sb, (uint32_t)(-EIO));
 		note_rpmb(s, plan.cmd, 0xffff, 0, 0);
 		return;
 	}
@@ -1872,12 +1888,35 @@ static int alloc_bufs(struct svc *s)
 
 int main(int argc, char **argv)
 {
-	const char *mode = argc > 1 ? argv[1] : "enroll";
-	const char *dir = argc > 2 ? argv[2] : "/lib/firmware/qsee";
+	const char *mode;
+	const char *dir;
+	const char *env_rpmb = getenv("FP5_QTEE_RPMB_WRITE");
+	int allow_rpmb_write = env_rpmb && !strcmp(env_rpmb, "1");
 	struct svc s;
-	int rc;
+	int rc, i, pos;
+
+	/* Options may appear anywhere; the rest stay positional. */
+	for (i = 1, pos = 1; i < argc; i++) {
+		if (!strcmp(argv[i], "--allow-rpmb-write")) {
+			allow_rpmb_write = 1;
+			continue;
+		}
+		argv[pos++] = argv[i];
+	}
+	argc = pos;
+	mode = argc > 1 ? argv[1] : "enroll";
+	dir = argc > 2 ? argv[2] : "/lib/firmware/qsee";
 
 	setvbuf(stdout, NULL, _IOLBF, 0);
+	if (allow_rpmb_write) {
+		logl("!!! RPMB WRITES ENABLED: authenticated data writes go to "
+		     "/dev/bsg/0:0:0:49476 and advance the RPMB write counter !!!");
+		logl("!!! (--allow-rpmb-write or FP5_QTEE_RPMB_WRITE=1). Key "
+		     "programming stays refused. !!!");
+	} else {
+		logl("RPMB writes off (default). Reads allowed. Pass "
+		     "--allow-rpmb-write to let enroll save through RPMB.");
+	}
 	{
 		struct sigaction sa;
 
@@ -1888,6 +1927,7 @@ int main(int argc, char **argv)
 	memset(&s, 0, sizeof(s));
 	s.tee.fd = -1;
 	s.bsg = -1;
+	s.allow_rpmb_write = allow_rpmb_write;
 	pthread_mutex_init(&s.mu, NULL);
 	if (mount_persist() || sensor_on())
 		return 1;
