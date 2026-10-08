@@ -26,8 +26,57 @@ again on this session before matching. `algorithm_log_level` is 2 so the
 trustlet can print the subtemplate distance. A match of the enrolled finger
 against a different finger has not been witnessed from this tree.
 
-The signed `focal32` image is not in this repository. Copy `focal32.mdt` and
-`focal32.bXX` from a Fairphone Android vendor image to `/lib/firmware/qsee/`.
+The signed `focal32` image is not in this repository. See
+[Firmware](#firmware) for how to install it.
+
+## Firmware
+
+The session loads `focal32.mdt` and `focal32.b00` … `focal32.b07` from
+`/lib/firmware/qsee` (or the directory given as its second argument; the
+Finger app passes `/lib/firmware/qsee`). The files are signed proprietary
+blobs. They are not in this repository and must never be committed
+(`.gitignore` blocks `*.mdt`, `*.bNN` and `*.mbn`).
+
+`scripts/fetch-focal32-firmware.sh` finds them in a Fairphone 5 stock image,
+checks them, and copies them in:
+
+```sh
+scripts/fetch-focal32-firmware.sh --dry-run FP5-XXXX-factory.zip
+sudo scripts/fetch-focal32-firmware.sh FP5-XXXX-factory.zip
+sudo scripts/fetch-focal32-firmware.sh --dest /some/dir /path/to/extracted/vendor
+```
+
+The source can be an extracted directory, a `.zip`/`.tar*` archive, or a
+FAT (modem/NON-HLOS), ext4, EROFS, Android sparse or super image. Images
+inside an archive are opened too. On Qualcomm vendor images the trustlets
+usually live in `/vendor/firmware_mnt/image` (the modem partition's `image/`
+directory) or `/vendor/firmware`. Opening an image needs the matching tool:
+mtools or 7z, e2fsprogs (`debugfs`), erofs-utils (`fsck.erofs`), `simg2img`,
+`lpunpack`. The script names the one it is missing.
+
+Fairphone publishes the FP5 factory packages on its
+[manual install page](https://support.fairphone.com/hc/en-us/articles/18896094650513).
+The postmarketOS `firmware-fairphone-fp5` package (built from
+[FairBlobs/FP5-firmware](https://github.com/FairBlobs/FP5-firmware)) carries
+the modem, DSP, GPU and similar firmware, but not `focal32`.
+
+**Checksums (trust on first use).** Every file is checked against
+`scripts/focal32.sha256` before anything is copied. The script refuses to
+install when an entry is missing or a hash differs. The committed file has
+**no real hashes yet**, only placeholders, so the script refuses until it is
+filled in. Fill it in from a copy you trust, either:
+
+- run `sha256sum focal32.mdt focal32.b0[0-7]` in `/lib/firmware/qsee` on a
+  phone where focal32 already loads and enrolls, and paste the nine lines;
+  or
+- run the script once with `--record` against a source you trust. It writes
+  the nine hashes into the file (only while it has no real entries) and
+  installs. Review and commit the result.
+
+After that, any other source has to match those hashes.
+
+Install with `sudo` when the destination is `/lib/firmware/qsee`. Host test,
+with synthetic files only: `scripts/test_fetch_focal32_firmware.sh`.
 
 ## Repository layout
 
