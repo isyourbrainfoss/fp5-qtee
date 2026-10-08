@@ -1080,11 +1080,21 @@ static ssize_t qsee_log_load(void)
 	int fd;
 	ssize_t n;
 
-	if (!qsee_buf) {
-		qsee_buf = calloc(1, QSEE_LOG_CAP);
-		qsee_delta = calloc(1, QSEE_LOG_CAP);
-		if (!qsee_buf || !qsee_delta)
+	if (!qsee_buf || !qsee_delta) {
+		/* Both or neither: qsee_copy_new writes qsee_delta whenever
+		 * qsee_buf is set. */
+		uint8_t *b = calloc(1, QSEE_LOG_CAP);
+		uint8_t *d = calloc(1, QSEE_LOG_CAP);
+
+		if (!b || !d) {
+			free(b);
+			free(d);
 			return -1;
+		}
+		free(qsee_buf);
+		free(qsee_delta);
+		qsee_buf = b;
+		qsee_delta = d;
 	}
 	fd = open("/dev/qsee_log", O_RDONLY);
 	if (fd < 0) {
