@@ -47,6 +47,7 @@ struct svc {
 	uint64_t listener_svc[4];
 	int nls;
 	int bsg;
+	uint32_t device_id; /* preferred_device_id sent in SYNC_CFG */
 	uint32_t last_rpmb_cmd;
 	uint16_t last_rpmb_result;
 	int last_rpmb_valid;
@@ -1496,6 +1497,38 @@ static int open_and_load(struct svc *s, const char *dir)
 	return rc == 0 ? 0 : -1;
 }
 
+/*
+ * The PROBE/CHIP reply layout is not known from this tree. Log the reply
+ * header and the first payload bytes once, and where the detected id
+ * 0x93D1 or the profile id 0x9391 appears in them, if anywhere.
+ */
+static void log_id_reply(struct svc *s, const char *tag)
+{
+	static const uint16_t ids[] = { 0x93d1, 0x9391 };
+	const uint8_t *pay = s->req + FP5_PAY_OFF;
+	size_t span = 0x100;
+	char hex[3 * 48 + 1];
+	size_t k;
+	unsigned i;
+
+	hex[0] = 0;
+	for (k = 0; k < 48; k++)
+		snprintf(hex + k * 3, 4, "%02x ", pay[k]);
+	logf("%s reply cmd=0x%x plen=0x%x rc=%d pay[0..47] %s", tag,
+	     fp5_req_cmd(s->req), (unsigned)s->req[4] | (unsigned)s->req[5] << 8 |
+	     (unsigned)s->req[6] << 16 | (unsigned)s->req[7] << 24,
+	     (int)fp5_req_rc(s->req), hex);
+	for (i = 0; i < sizeof(ids) / sizeof(ids[0]); i++) {
+		long le = fp5_find_u16(pay, span, ids[i], 0);
+		long be = fp5_find_u16(pay, span, ids[i], 1);
+
+		if (le >= 0 || be >= 0)
+			logf("%s id 0x%04x (%u) seen at pay+0x%lx le / pay+0x%lx be "
+			     "(-1 = absent; offset not confirmed)",
+			     tag, ids[i], ids[i], le, be);
+	}
+}
+
 static int setup_ta(struct svc *s, int native)
 {
 	uint8_t ver[4] = { 2, 0, 0, 0 };
@@ -1509,7 +1542,7 @@ static int setup_ta(struct svc *s, int native)
 		return -1;
 	if (send_cmd(s, fp5_op_set_km(), 0, NULL, "SET_KM"))
 		return -1;
-	n = fp5_sync_config(cfg, sizeof(cfg), native);
+	n = fp5_sync_config(cfg, sizeof(cfg), native, s->device_id);
 	if (n < 0 || send_cmd(s, fp5_op_sync(), (uint32_t)n + 1, cfg, "SYNC"))
 		return -1;
 	if (send_cmd(s, fp5_op_init_spi(), 0, NULL, "INIT_SPI"))
@@ -1518,6 +1551,7 @@ static int setup_ta(struct svc *s, int native)
 		return -1;
 	if (send_cmd(s, fp5_op_probe(), 1, zero, "PROBE"))
 		return -1;
+	log_id_reply(s, "PROBE");
 	if (send_cmd(s, fp5_op_probe(), 1, zero, "PROBE2"))
 		return -1;
 	if (send_cmd(s, fp5_op_init_dev(), 0, NULL, "INIT_DEV"))
@@ -1525,6 +1559,7 @@ static int setup_ta(struct svc *s, int native)
 	note_serial(s);
 	if (send_cmd(s, fp5_op_chip(), 0, NULL, "CHIP"))
 		return -1;
+	log_id_reply(s, "CHIP");
 	if (send_cmd(s, fp5_op_init(), 0, NULL, "INIT"))
 		return -1;
 	if (send_cmd(s, fp5_op_calib(), 0, NULL, "CALIB"))
@@ -1598,7 +1633,7 @@ static int open_enroll(struct svc *s)
 	char cfg[2048];
 	int n;
 
-	n = fp5_sync_config(cfg, sizeof(cfg), 1);
+	n = fp5_sync_config(cfg, sizeof(cfg), 1, s->device_id);
 	if (n > 0)
 		send_cmd(s, fp5_op_sync(), (uint32_t)n + 1, cfg, "SYNC_ENROLL");
 	logf("PRE_ENROLL opcode=0x%x", fp5_op_pre_enroll());
@@ -1872,12 +1907,50 @@ static int alloc_bufs(struct svc *s)
 
 int main(int argc, char **argv)
 {
-	const char *mode = argc > 1 ? argv[1] : "enroll";
-	const char *dir = argc > 2 ? argv[2] : "/lib/firmware/qsee";
+	const char *mode;
+	const char *dir;
+	const char *id_arg = NULL, *id_from = "default";
+	const char *id_env = getenv("FP5_QTEE_DEVICE_ID");
+	uint32_t device_id = FP5_DEVICE_ID_DEFAULT;
 	struct svc s;
-	int rc;
+	int rc, i, pos;
 
 	setvbuf(stdout, NULL, _IOLBF, 0);
+	/* Options may appear anywhere; the rest stay positional. */
+	for (i = 1, pos = 1; i < argc; i++) {
+		if (!strcmp(argv[i], "--device-id")) {
+			if (i + 1 >= argc) {
+				logl("--device-id needs a value");
+				return 1;
+			}
+			id_arg = argv[++i];
+			continue;
+		}
+		if (!strncmp(argv[i], "--device-id=", 12)) {
+			id_arg = argv[i] + 12;
+			continue;
+		}
+		argv[pos++] = argv[i];
+	}
+	argc = pos;
+	mode = argc > 1 ? argv[1] : "enroll";
+	dir = argc > 2 ? argv[2] : "/lib/firmware/qsee";
+	/* The command line wins over the environment. */
+	if (id_arg) {
+		if (fp5_parse_device_id(id_arg, &device_id)) {
+			logf("bad --device-id '%s' (decimal or 0x hex, 1..65535)", id_arg);
+			return 1;
+		}
+		id_from = "--device-id";
+	} else if (id_env && *id_env) {
+		if (fp5_parse_device_id(id_env, &device_id)) {
+			logf("bad FP5_QTEE_DEVICE_ID '%s' (decimal or 0x hex, 1..65535)",
+			     id_env);
+			return 1;
+		}
+		id_from = "FP5_QTEE_DEVICE_ID";
+	}
+	logf("preferred_device_id %u (0x%04x) from %s", device_id, device_id, id_from);
 	{
 		struct sigaction sa;
 
@@ -1888,6 +1961,7 @@ int main(int argc, char **argv)
 	memset(&s, 0, sizeof(s));
 	s.tee.fd = -1;
 	s.bsg = -1;
+	s.device_id = device_id;
 	pthread_mutex_init(&s.mu, NULL);
 	if (mount_persist() || sensor_on())
 		return 1;

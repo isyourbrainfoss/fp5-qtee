@@ -22,12 +22,40 @@ failure, fid 0, and the poison ids are misses.
 Sync config sends `preferred_device_id` 37777, which is focal32 profile
 `0x9391` (the Android config). The detected id 37841 is not in that profile
 table, so a template enrolled under 37841 has no feature pointers. Enroll
-again on this session before matching. `algorithm_log_level` is 2 so the
+again on this session before matching. See [Sensor id](#sensor-id) to
+change the id. `algorithm_log_level` is 2 so the
 trustlet can print the subtemplate distance. A match of the enrolled finger
 against a different finger has not been witnessed from this tree.
 
 The signed `focal32` image is not in this repository. Copy `focal32.mdt` and
 `focal32.bXX` from a Fairphone Android vendor image to `/lib/firmware/qsee/`.
+
+## Sensor id
+
+The sensor on the test phone reports id **37841 (`0x93D1`)**. The trustlet
+profile the session asks for is **37777 (`0x9391`)**, the
+`preferred_device_id` from the Android config. The default stays 37777, so
+behaviour does not change unless you override it:
+
+```sh
+fp5-qtee-session --device-id 37841 enroll /lib/firmware/qsee   # or 0x93D1
+FP5_QTEE_DEVICE_ID=0x93D1 fp5-qtee-session enroll               # env, if sudo keeps it
+```
+
+`--device-id` wins over `FP5_QTEE_DEVICE_ID`. Both take decimal or `0x` hex
+in 1..65535; a bad value stops the session before it touches the sensor.
+The session logs the id it sends (`preferred_device_id ... from ...`).
+After PROBE and CHIP it logs the reply header, the first 48 payload bytes,
+and any offset where `0x93D1` or `0x9391` appears. The reply layout is not
+known yet, so those offsets are hints, not a decoded field.
+
+The Finger app passes `FP5_QTEE_DEVICE_ID` from its own environment on as
+`--device-id` (sudo drops the environment).
+
+Before relying on 37841, check the stock FocalTech HAL config from the
+Fairphone vendor image for a `0x93D1` profile. A template enrolled under
+one id is not expected to match under the other, so enroll again after
+changing it.
 
 ## Repository layout
 

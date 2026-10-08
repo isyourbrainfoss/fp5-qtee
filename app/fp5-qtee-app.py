@@ -41,6 +41,9 @@ LOAD_SCRIPT = Path("/home/user/fp5-qtee-keep/load-qcomtee.sh")
 FIRMWARE = "/lib/firmware/qsee"
 LOG_DIR = Path("/home/user/fp5-qtee-keep/logs")
 OLD_DRIVER = Path("/sys/module/qsee_fingerpr")
+# Optional preferred_device_id override. sudo drops the environment, so
+# the app passes it on as --device-id. The session validates the value.
+DEVICE_ID_ENV = "FP5_QTEE_DEVICE_ID"
 
 CSS = """
 window { background-color: #101418; }
@@ -275,19 +278,22 @@ class FingerWindow(Adw.ApplicationWindow):
         limit = "1500" if mode == "enroll" else "400"
         self._log_path = path
         self._ui(self._paint_only)
+        argv = [
+            "sudo",
+            "-n",
+            "timeout",
+            "-k",
+            "15",
+            limit,
+            str(binary),
+        ]
+        device_id = os.environ.get(DEVICE_ID_ENV, "").strip()
+        if device_id:
+            argv += ["--device-id", device_id]
+        argv += [mode, FIRMWARE]
         with path.open("w", encoding="utf-8") as log:
             proc = subprocess.Popen(
-                [
-                    "sudo",
-                    "-n",
-                    "timeout",
-                    "-k",
-                    "15",
-                    limit,
-                    str(binary),
-                    mode,
-                    FIRMWARE,
-                ],
+                argv,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
