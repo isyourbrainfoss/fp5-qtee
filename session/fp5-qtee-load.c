@@ -70,52 +70,55 @@ int main(int argc, char **argv)
 	struct fp5_seg segs[8];
 	uint8_t *raw[8] = { 0 };
 	size_t raw_len[8] = { 0 };
-	struct fp5_tee tee;
+	struct fp5_tee tee = { .fd = -1 };
 	uint64_t env = 0, loader = 0, app = 0;
 	uint32_t qret = 0;
 	char dist[128];
-	int i, rc;
+	int i, rc, ret = 1;
 
 	snprintf(path, sizeof(path), "%s/%s.mdt", dir, name);
 	if (read_file(path, &mdt, &mdt_len))
-		return 1;
+		goto out;
 	for (i = 0; i < 8; i++) {
 		snprintf(path, sizeof(path), "%s/%s.b0%d", dir, name, i);
 		if (read_file(path, &raw[i], &raw_len[i]))
-			return 1;
+			goto out;
 		segs[i].data = raw[i];
 		segs[i].len = raw_len[i];
 	}
 	rc = fp5_mbn_from_mdt(mdt, mdt_len, segs, 8, &img, &img_len);
 	if (rc) {
 		fprintf(stderr, "mbn assemble rc=%d\n", rc);
-		return 1;
+		goto out;
 	}
 	printf("image bytes=%zu mdt=%zu\n", img_len, mdt_len);
 
 	if (fp5_tee_open(&tee, "/dev/tee0")) {
 		fprintf(stderr, "open /dev/tee0: %s\n", strerror(errno));
-		return 1;
+		goto out;
 	}
 	rc = fp5_tee_client_env(&tee, &env, &qret);
 	printf("client_env ioctl_rc=%d qret=%u env=%llu\n", rc, qret,
 	       (unsigned long long)env);
 	if (rc)
-		return 1;
+		goto out;
 	rc = fp5_tee_open_service(&tee, env, 122, &loader, &qret);
 	printf("open_loader ioctl_rc=%d qret=%u loader=%llu\n", rc, qret,
 	       (unsigned long long)loader);
 	if (rc)
-		return 1;
+		goto out;
 	memset(dist, 0, sizeof(dist));
 	rc = fp5_tee_load_buffer(&tee, loader, img, img_len, name, strlen(name),
 				 dist, sizeof(dist), &app, &qret);
 	printf("loadFromBuffer ioctl_rc=%d qret=%u %s dist='%s' app=%llu errno=%d\n",
 	       rc, qret, verdict(qret), dist, (unsigned long long)app, errno);
+	ret = (rc == 0 && qret == 0) ? 0 : 2;
+out:
+	/* One exit path, so a failed segment read does not leak the others. */
 	fp5_tee_close(&tee);
 	free(img);
 	free(mdt);
 	for (i = 0; i < 8; i++)
 		free(raw[i]);
-	return (rc == 0 && qret == 0) ? 0 : 2;
+	return ret;
 }

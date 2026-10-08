@@ -52,13 +52,20 @@ erase the RPMB key.
 
 ## Build
 
-On the phone, Alpine gcc is enough. pthread is in musl, so there is no
-`-lpthread`. `logf` and `logl` warn against libm; leave those names.
+On the phone, Alpine gcc is enough. pthread is in musl; the Makefile still
+passes `-pthread`, which is harmless there. `logf` and `logl` clash with libm
+builtins; leave those names (the Makefile passes `-fno-builtin-logf
+-fno-builtin-logl`).
+
+The build uses `-Wall -Wextra -Werror`. If a newer compiler adds a warning,
+build with `make WERROR=` and report it. `CFLAGS` only sets optimisation and
+debug flags; the warning flags stay on when you override it.
 
 ```sh
-make -C session
+make -C session            # fp5-qtee-session and fp5-qtee-load
 python3 app/test_fp5_qtee_coach.py
 make -C session test
+make -C session test-asan  # host only: tests under ASan/UBSan
 ```
 
 Install the session where the app already looks:
