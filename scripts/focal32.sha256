@@ -1,0 +1,27 @@
+# SHA256 checksums for the signed focal32 trustlet, used by
+# scripts/fetch-focal32-firmware.sh. Format: sha256sum ("<hash>  <file>").
+# Lines starting with # are ignored.
+#
+# PLACEHOLDER: no real hashes are recorded yet. The blobs are not in this
+# repository, and their hashes must come from a copy known to work (the
+# files on a phone where focal32 already loads and enrolls), not from
+# guesswork. Until all nine entries below are filled in, the fetch script
+# refuses to install.
+#
+# To fill this in, either:
+#   sha256sum /lib/firmware/qsee/focal32.mdt /lib/firmware/qsee/focal32.b0[0-7]
+# on the known-good phone and paste the nine lines here (file names
+# without directories), or run once with a source you trust:
+#   scripts/fetch-focal32-firmware.sh --record <source>
+# which writes the lines below this header (trust on first use).
+#
+# Expected entries (one line each, replace the placeholder with the hash):
+#   <sha256>  focal32.mdt
+#   <sha256>  focal32.b00
+#   <sha256>  focal32.b01
+#   <sha256>  focal32.b02
+#   <sha256>  focal32.b03
+#   <sha256>  focal32.b04
+#   <sha256>  focal32.b05
+#   <sha256>  focal32.b06
+#   <sha256>  focal32.b07
