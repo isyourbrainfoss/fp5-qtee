@@ -299,6 +299,30 @@ static int sensor_on(void)
 	return 0;
 }
 
+/* Reverse of sensor_on: listen, spiclk, then vdd. Best effort.
+ * FP5_QTEE_KEEP_POWER=1 leaves the sensor powered for debugging. */
+static void sensor_off(void)
+{
+	static const char *const attr[] = { "listen", "spiclk", "vdd" };
+	const char *base = "/sys/class/focaltech_fp/focaltech_fp";
+	const char *keep = getenv("FP5_QTEE_KEEP_POWER");
+	char path[128];
+	unsigned i;
+
+	if (keep && !strcmp(keep, "1")) {
+		logl("sensor off skipped (FP5_QTEE_KEEP_POWER=1)");
+		return;
+	}
+	if (access(base, F_OK) != 0)
+		return;
+	for (i = 0; i < sizeof(attr) / sizeof(attr[0]); i++) {
+		snprintf(path, sizeof(path), "%s/%s", base, attr[i]);
+		if (sysfs_write(path, "0\n"))
+			logf("sensor off %s: %s", attr[i], strerror(errno));
+	}
+	logl("sensor off");
+}
+
 static int rpmb_xfer(int fd, void *buf, uint32_t len, int send)
 {
 	uint8_t cdb[12];
@@ -1381,11 +1405,15 @@ static int reg_listener(struct svc *s, uint64_t env, uint32_t id, size_t sz)
 	p[2].b = FP5_OBJ_MEM;
 	if (fp5_tee_invoke(&s->tee, sobj, 0, p, 3, &qret)) {
 		logf("listener 0x%x invoke errno=%d qret=%u", id, errno, qret);
+		fp5_tee_shm_free(&ls->shm);
 		return -1;
 	}
 	logf("listener 0x%x bytes=%zu qret=%u", id, ls->shm.size, qret);
-	if (qret && qret != 99)
+	if (qret && qret != 99) {
+		/* The next registration reuses this slot. Do not leak the map. */
+		fp5_tee_shm_free(&ls->shm);
 		return -1;
+	}
 	/* Releasing this service object drops the callback. Keep it. */
 	s->listener_svc[s->nls] = sobj;
 	s->nls++;
@@ -1889,6 +1917,18 @@ static int auth_once(struct svc *s, int which)
 	return 2;
 }
 
+static void free_bufs(struct svc *s)
+{
+	free(s->req);
+	free(s->rsp);
+	free(s->req_out);
+	free(s->rsp_out);
+	s->req = s->rsp = s->req_out = s->rsp_out = NULL;
+	if (s->bsg >= 0)
+		close(s->bsg);
+	s->bsg = -1;
+}
+
 static int alloc_bufs(struct svc *s)
 {
 	s->req = calloc(1, REQ_SZ);
@@ -1908,7 +1948,7 @@ int main(int argc, char **argv)
 	const char *mode = argc > 1 ? argv[1] : "enroll";
 	const char *dir = argc > 2 ? argv[2] : "/lib/firmware/qsee";
 	struct svc s;
-	int rc;
+	int rc, i;
 
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	{
@@ -1926,12 +1966,21 @@ int main(int argc, char **argv)
 		return 1;
 	if (fp5_tee_open(&s.tee, "/dev/tee0")) {
 		logf("open /dev/tee0: %s", strerror(errno));
+		sensor_off();
 		return 1;
 	}
-	if (alloc_bufs(&s))
+	if (alloc_bufs(&s)) {
+		logl("out of memory for session buffers");
+		free_bufs(&s);
+		fp5_tee_close(&s.tee);
+		sensor_off();
 		return 1;
+	}
 	if (pthread_create(&s.thr, NULL, supp_main, &s)) {
 		logl("supp thread failed");
+		free_bufs(&s);
+		fp5_tee_close(&s.tee);
+		sensor_off();
 		return 1;
 	}
 	watch_on = pthread_create(&watch_thr, NULL, qsee_watch_main, NULL) == 0;
@@ -2081,8 +2130,15 @@ done:
 	pthread_join(s.thr, NULL);
 	if (watch_on)
 		pthread_join(watch_thr, NULL);
-	if (s.bsg >= 0)
-		close(s.bsg);
+	/* Both threads are gone, so nothing touches these any more. */
+	for (i = 0; i < s.nls; i++)
+		fp5_tee_shm_free(&s.ls[i].shm);
+	free(qsee_buf);
+	free(qsee_delta);
+	qsee_buf = NULL;
+	qsee_delta = NULL;
+	free_bufs(&s);
+	sensor_off();
 	logf("session_exit:%d", rc);
 	return rc == 0 ? 0 : 1;
 }
