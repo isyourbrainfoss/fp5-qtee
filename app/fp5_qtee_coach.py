@@ -83,6 +83,15 @@ class Coach:
                 "idle",
             )
             return
+        if line.startswith("firmware missing: focal32 needs"):
+            self.detail = line
+            self._set(
+                "FAILED",
+                "The focal32 firmware is not on this phone. "
+                "Install it with scripts/fetch-focal32-firmware.sh.",
+                "warn",
+            )
+            return
         if line.startswith("open /dev/tee0") or line.startswith("ENROLL rejected"):
             self.detail = line
             self._set("FAILED", line, "warn")

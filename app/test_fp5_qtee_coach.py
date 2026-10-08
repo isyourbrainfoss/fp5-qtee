@@ -75,6 +75,20 @@ class CoachTest(unittest.TestCase):
         self.assertEqual(c.hero, "NOT SAVED")
         self.assertFalse(c.ok)
 
+    def test_missing_firmware_names_the_fetch_script(self) -> None:
+        c = play(
+            "enroll",
+            [
+                "firmware missing: cannot read /lib/firmware/qsee/focal32.mdt (No such file or directory)",
+                "firmware missing: focal32 needs focal32.mdt and focal32.b00..focal32.b07 in /lib/firmware/qsee",
+                "firmware missing: copy them from a Fairphone 5 stock image with scripts/fetch-focal32-firmware.sh (see README, Firmware)",
+                "session_exit:1",
+            ],
+        )
+        self.assertEqual(c.hero, "FAILED")
+        self.assertIn("fetch-focal32-firmware.sh", c.sub)
+        self.assertFalse(c.ok)
+
     def test_template_write_is_saved(self) -> None:
         c = play(
             "enroll",

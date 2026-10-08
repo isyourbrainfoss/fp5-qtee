@@ -1377,6 +1377,16 @@ static const char *verdict_name(uint32_t r)
 	}
 }
 
+static void firmware_missing(const char *path, const char *dir)
+{
+	logf("firmware missing: cannot read %s (%s)", path,
+	     errno ? strerror(errno) : "empty, over 8 MiB, or short read");
+	logf("firmware missing: focal32 needs focal32.mdt and focal32.b00..focal32.b07 in %s",
+	     dir);
+	logl("firmware missing: copy them from a Fairphone 5 stock image with "
+	     "scripts/fetch-focal32-firmware.sh (see README, Firmware)");
+}
+
 static int load_once(struct svc *s, uint64_t loader, const char *dir, uint64_t *app,
 		     uint32_t *qret_out)
 {
@@ -1389,14 +1399,16 @@ static int load_once(struct svc *s, uint64_t loader, const char *dir, uint64_t *
 	int i, rc;
 
 	snprintf(path, sizeof(path), "%s/focal32.mdt", dir);
+	errno = 0;
 	if (read_whole(path, &mdt, &mdt_len)) {
-		logf("open %s failed", path);
+		firmware_missing(path, dir);
 		return -1;
 	}
 	for (i = 0; i < 8; i++) {
 		snprintf(path, sizeof(path), "%s/focal32.b%02d", dir, i);
+		errno = 0;
 		if (read_whole(path, &raw[i], &raw_len[i])) {
-			logf("open %s failed", path);
+			firmware_missing(path, dir);
 			rc = -1;
 			goto out;
 		}
