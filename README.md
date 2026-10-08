@@ -12,19 +12,22 @@ Status: **experimental**. Not an official Fairphone or distribution package.
 
 ## Where this stands
 
-Enroll can reach samples-remaining 0, and the same trustlet can reopen that
-template on the same boot. Match sends authenticate first, then arms chip
-wait-touch (work mode 1). It captures only an exact finger-down
-(`itype` `0x2`, not an ESD or leftover). A hit is an image report that
+On 2026-10-08 the Finger app enrolled a finger (samples-remaining 0, template
+written, hero SAVED) and then matched it. The enrolled finger returned
+template id 1657488200 with a real finger-down (`itype` `0x2`) and
+`auth success`. Other presses on the same boot returned fid 0,
+`authentication failed`, and hero NO MATCH. Phosh unlock is not wired up.
+Reboot persistence of that template was not checked.
+
+Match sends authenticate first, then arms chip wait-touch (work mode 1).
+It captures only an exact finger-down. A hit is an image report that
 succeeds with a real template id. Authenticate-command success, report
 failure, fid 0, and the poison ids are misses.
 
 Sync config sends `preferred_device_id` 37777, which is focal32 profile
 `0x9391` (the Android config). The detected id 37841 is not in that profile
-table, so a template enrolled under 37841 has no feature pointers. Enroll
-again on this session before matching. `algorithm_log_level` is 2 so the
-trustlet can print the subtemplate distance. A match of the enrolled finger
-against a different finger has not been witnessed from this tree.
+table, so a template enrolled under 37841 has no feature pointers.
+`algorithm_log_level` is 2 so the trustlet can print the subtemplate distance.
 
 The signed `focal32` image is not in this repository. Copy `focal32.mdt` and
 `focal32.bXX` from a Fairphone Android vendor image to `/lib/firmware/qsee/`.
