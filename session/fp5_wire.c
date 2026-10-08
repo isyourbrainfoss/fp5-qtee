@@ -301,18 +301,66 @@ void fp5_scan_log(const uint8_t *buf, size_t n, struct fp5_log *out)
 	}
 }
 
+int fp5_parse_device_id(const char *s, uint32_t *out)
+{
+	uint32_t v = 0;
+	int base = 10, digits = 0;
+
+	if (!s || !out)
+		return -1;
+	if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+		base = 16;
+		s += 2;
+	}
+	for (; *s; s++) {
+		uint32_t d;
+
+		if (*s >= '0' && *s <= '9')
+			d = (uint32_t)(*s - '0');
+		else if (base == 16 && *s >= 'a' && *s <= 'f')
+			d = (uint32_t)(*s - 'a' + 10);
+		else if (base == 16 && *s >= 'A' && *s <= 'F')
+			d = (uint32_t)(*s - 'A' + 10);
+		else
+			return -1;
+		v = v * (uint32_t)base + d;
+		if (v > FP5_DEVICE_ID_MAX)
+			return -1;
+		digits++;
+	}
+	if (!digits || v == 0)
+		return -1;
+	*out = v;
+	return 0;
+}
+
+long fp5_find_u16(const uint8_t *buf, size_t n, uint16_t id, int be)
+{
+	uint8_t hi = (uint8_t)(id >> 8), lo = (uint8_t)id;
+	size_t i;
+
+	if (!buf)
+		return -1;
+	for (i = 0; i + 1 < n; i++) {
+		if (be ? (buf[i] == hi && buf[i + 1] == lo) :
+			 (buf[i] == lo && buf[i + 1] == hi))
+			return (long)i;
+	}
+	return -1;
+}
+
 #include <stdio.h>
 
-int fp5_sync_config(char *dst, size_t cap, int native_log)
+int fp5_sync_config(char *dst, size_t cap, int native_log, uint32_t device_id)
 {
 	int n;
 
-	/* 37777 (0x9391) is the focal32 profile that sets the feature
+	/* Default 37777 (0x9391) is the focal32 profile that sets the feature
 	   preprocessor. Detected id 37841 is not in that table. */
 	n = snprintf(dst, cap,
 		     "{\"driver\":{\"enable_spidev\":false,\"spi_bus_num\":14,"
 		     "\"spi_c_s_num\":0,\"spi_on_demand\":true},"
-		     "\"device\":{\"preferred_device_id\":37777,"
+		     "\"device\":{\"preferred_device_id\":%u,"
 		     "\"spi_default_bps\":4000000,\"spi_mode\":0,"
 		     "\"spi_capture_bps\":8030000,"
 		     "\"vio_is_1p8\":true,\"enable_re_power_b4_probing\":true,"
@@ -344,7 +392,7 @@ int fp5_sync_config(char *dst, size_t cap, int native_log)
 		     "\"enable_logcat_trustlet\":true,"
 		     "\"enable_trustlet_native_log\":%s,"
 		     "\"enable_logcat_spi_data\":false}}",
-		     native_log ? "true" : "false");
+		     (unsigned)device_id, native_log ? "true" : "false");
 	if (n < 0 || (size_t)n >= cap)
 		return -1;
 	return n;

@@ -259,7 +259,8 @@ static void test_time_and_config(void)
 	expect(*(uint32_t *)(sb + 20) == 0, "mon");
 	expect(*(uint32_t *)(sb + 24) == 70, "year");
 
-	expect(fp5_sync_config(cfg, sizeof(cfg), 0) > 0, "config");
+	expect(fp5_sync_config(cfg, sizeof(cfg), 0, FP5_DEVICE_ID_DEFAULT) > 0,
+	       "config");
 	expect(strstr(cfg, "\"enable_trusted_enrollment\":false") != NULL, "trusted off");
 	expect(strstr(cfg, "\"framework_log_level\":1") != NULL, "log level 1");
 	expect(strstr(cfg, "\"firmware_log_level\":3") != NULL, "fw log 3");
@@ -272,6 +273,44 @@ static void test_time_and_config(void)
 	       "chip profile 37777");
 	expect(strstr(cfg, "37841") == NULL, "unknown chip id is not sent");
 	expect(strstr(cfg, "0x2001") == NULL, "config has no HL enroll");
+	expect(strstr(cfg, "\"enable_trustlet_native_log\":false") != NULL,
+	       "native log off");
+
+	expect(fp5_sync_config(cfg, sizeof(cfg), 1, 37841) > 0, "config 37841");
+	expect(strstr(cfg, "\"preferred_device_id\":37841,") != NULL,
+	       "configured chip profile 37841");
+	expect(strstr(cfg, "37777") == NULL, "default id not sent when configured");
+	expect(strstr(cfg, "\"enable_trustlet_native_log\":true") != NULL,
+	       "native log on");
+	expect(fp5_sync_config(cfg, 64, 1, 37841) == -1, "short config buffer");
+}
+
+static void test_device_id(void)
+{
+	uint32_t v = 0;
+	uint8_t buf[8] = { 0, 0xd1, 0x93, 0, 0x93, 0x91, 0, 0 };
+
+	expect(FP5_DEVICE_ID_DEFAULT == 0x9391, "default is 0x9391");
+	expect(fp5_parse_device_id("37841", &v) == 0 && v == 37841, "decimal id");
+	expect(fp5_parse_device_id("0x93D1", &v) == 0 && v == 0x93d1, "hex id");
+	expect(fp5_parse_device_id("0x9391", &v) == 0 && v == 37777, "hex default");
+	expect(fp5_parse_device_id("65535", &v) == 0 && v == 65535, "max id");
+	v = 7;
+	expect(fp5_parse_device_id("65536", &v) == -1 && v == 7, "over 16 bits");
+	expect(fp5_parse_device_id("0", &v) == -1, "zero id");
+	expect(fp5_parse_device_id("", &v) == -1, "empty id");
+	expect(fp5_parse_device_id("0x", &v) == -1, "bare 0x");
+	expect(fp5_parse_device_id("-1", &v) == -1, "negative id");
+	expect(fp5_parse_device_id("378x", &v) == -1, "trailing junk");
+	expect(fp5_parse_device_id("93D1", &v) == -1, "hex without 0x");
+	expect(fp5_parse_device_id(" 37841", &v) == -1, "leading space");
+	expect(fp5_parse_device_id("99999999999999999999", &v) == -1, "huge id");
+	expect(fp5_parse_device_id(NULL, &v) == -1, "null id");
+
+	expect(fp5_find_u16(buf, sizeof(buf), 0x93d1, 0) == 1, "le16 0x93d1");
+	expect(fp5_find_u16(buf, sizeof(buf), 0x9391, 1) == 4, "be16 0x9391");
+	expect(fp5_find_u16(buf, sizeof(buf), 0x9391, 0) == -1, "le16 0x9391 absent");
+	expect(fp5_find_u16(buf, 2, 0x93d1, 0) == -1, "search stays in n");
 }
 
 int main(void)
@@ -281,6 +320,7 @@ int main(void)
 	test_gpfile();
 	test_rpmb();
 	test_time_and_config();
+	test_device_id();
 	if (fails) {
 		fprintf(stderr, "%d failed\n", fails);
 		return 1;

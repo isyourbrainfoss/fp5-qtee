@@ -83,8 +83,23 @@ struct fp5_log {
 
 void fp5_scan_log(const uint8_t *buf, size_t n, struct fp5_log *out);
 
-/* Nested SYNC_CFG JSON. native_log is the trustlet native-log bool. */
-int fp5_sync_config(char *dst, size_t cap, int native_log);
+/*
+ * preferred_device_id sent in SYNC_CFG. 37777 (0x9391) is the focal32
+ * profile from the Android config. The sensor on the test phone reports
+ * 37841 (0x93D1), which is not in that profile table.
+ */
+#define FP5_DEVICE_ID_DEFAULT 37777u
+#define FP5_DEVICE_ID_MAX 0xffffu
+/* Decimal or 0x hex, 1..FP5_DEVICE_ID_MAX, nothing trailing.
+ * Returns 0 and sets *out, or -1 (out untouched). */
+int fp5_parse_device_id(const char *s, uint32_t *out);
+/* First offset of id as a 16-bit little-endian (be=0) or big-endian (be=1)
+ * value in buf, or -1. */
+long fp5_find_u16(const uint8_t *buf, size_t n, uint16_t id, int be);
+
+/* Nested SYNC_CFG JSON. native_log is the trustlet native-log bool.
+ * device_id is the preferred_device_id (FP5_DEVICE_ID_DEFAULT normally). */
+int fp5_sync_config(char *dst, size_t cap, int native_log, uint32_t device_id);
 
 /* 1 when the line is the subtemplate distance diary. */
 int fp5_log_is_score(const char *line);
