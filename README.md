@@ -2,8 +2,8 @@
 
 Userspace session for the signed `focal32` trustlet on Fairphone 5
 (Qualcomm SM7325 / sc7280, postmarketOS). A small Finger app enrolls and
-matches through `/dev/tee0`. It does not load `qsee_fingerpr` and it does
-not unlock Phosh.
+matches through `/dev/tee0`. It does not load `qsee_fingerpr`. Phosh
+unlock is a separate watcher, not this app.
 
 The older in-kernel Register path is
 [fp5-fingerprint](https://github.com/isyourbrainfoss/fp5-fingerprint).
@@ -22,7 +22,8 @@ Phosh does not ask PAM until a PIN is submitted, so the finger is not a PAM
 module. While the lock screen is showing and the panel is on, `fp5-qtee-unlock`
 runs one match (`unlock` mode, a single press). A real hit calls
 `loginctl unlock-session` on the Phosh session. The panel being off does not
-listen. A miss does not unlock. PIN still works.
+listen. A miss does not unlock. PIN still works. On 2026-10-08 the user
+confirmed that this dismisses the Phosh lock screen.
 
 Log scans, the time-listener reply, and the group-path buffer stop at the
 buffer they were given. A group path that does not fit is refused before it
