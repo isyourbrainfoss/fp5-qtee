@@ -215,15 +215,16 @@ int fp5_auth_match(uint32_t itype, int esd, uint32_t avgv, int32_t report_rc,
 	return 1;
 }
 
-static uint32_t parse_hex(const char *p)
+/* Parsers stop at end so a token at the end of the buffer is not over-read. */
+static uint32_t parse_hex(const char *p, const char *end)
 {
 	uint32_t v = 0;
 
 	if (!p)
 		return 0;
-	if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X'))
+	if (end - p >= 2 && p[0] == '0' && (p[1] == 'x' || p[1] == 'X'))
 		p += 2;
-	while (*p) {
+	while (p < end && *p) {
 		uint32_t d;
 
 		if (*p >= '0' && *p <= '9')
@@ -240,65 +241,99 @@ static uint32_t parse_hex(const char *p)
 	return v;
 }
 
-static uint32_t parse_u(const char *p)
+static uint32_t parse_u(const char *p, const char *end)
 {
 	uint32_t v = 0;
 
-	while (*p == ' ' || *p == '\t')
+	while (p < end && (*p == ' ' || *p == '\t'))
 		p++;
-	while (*p >= '0' && *p <= '9') {
+	while (p < end && *p >= '0' && *p <= '9') {
 		v = v * 10u + (uint32_t)(*p - '0');
 		p++;
 	}
 	return v;
 }
 
+#define LOG_ITYPE "interrupt type"
+#define LOG_QES "query event state: ["
+#define LOG_ESD "esd]"
+#define LOG_AVG_SP "avgv ="
+#define LOG_AVG "avgv="
+#define LIT_LEN(s) (sizeof(s) - 1)
+
+/* 1 when the literal fits in the bytes left at p and matches there. */
+static int at_lit(const char *p, const char *end, const char *lit, size_t len)
+{
+	return (size_t)(end - p) >= len && !memcmp(p, lit, len);
+}
+
 void fp5_scan_log(const uint8_t *buf, size_t n, struct fp5_log *out)
 {
 	size_t i;
+	const char *base = (const char *)buf;
+	const char *end = base + n;
 	const char *last_itype = NULL;
 	const char *last_qes = NULL;
 	const char *last_avg = NULL;
 
 	memset(out, 0, sizeof(*out));
-	for (i = 0; i + 16 < n; i++) {
-		const char *s = (const char *)buf + i;
+	if (!buf)
+		return;
+	for (i = 0; i < n; i++) {
+		const char *s = base + i;
 
-		if (!memcmp(s, "interrupt type", 14))
+		if (at_lit(s, end, LOG_ITYPE, LIT_LEN(LOG_ITYPE)))
 			last_itype = s;
-		else if (!memcmp(s, "query event state: [", 20))
+		else if (at_lit(s, end, LOG_QES, LIT_LEN(LOG_QES)))
 			last_qes = s;
-		else if (!memcmp(s, "avgv =", 6) || !memcmp(s, "avgv=", 5))
+		else if (at_lit(s, end, LOG_AVG_SP, LIT_LEN(LOG_AVG_SP)) ||
+			 at_lit(s, end, LOG_AVG, LIT_LEN(LOG_AVG)))
 			last_avg = s;
 	}
 	if (last_itype) {
 		const char *hx = NULL;
-		size_t k;
+		size_t k, left = (size_t)(end - last_itype);
 
-		for (k = 0; k + 2 < 48 && last_itype[k] && last_itype[k] != '\n'; k++) {
+		for (k = 0; k + 2 < 48 && k + 1 < left && last_itype[k] &&
+			    last_itype[k] != '\n'; k++) {
 			if (last_itype[k] == '0' &&
 			    (last_itype[k + 1] == 'x' || last_itype[k + 1] == 'X')) {
 				hx = last_itype + k;
 				break;
 			}
 		}
-		out->itype = parse_hex(hx);
+		out->itype = parse_hex(hx, end);
 		out->saw_itype = hx != NULL;
 		if (out->itype & 0x400u)
 			out->esd = 1;
 	}
-	if (last_qes && !memcmp(last_qes + 20, "esd]", 4))
+	if (last_qes && at_lit(last_qes + LIT_LEN(LOG_QES), end, LOG_ESD,
+			       LIT_LEN(LOG_ESD)))
 		out->esd = 1;
 	if (last_avg) {
 		const char *p = last_avg;
 
-		if (!memcmp(p, "avgv =", 6))
-			p += 6;
+		if (at_lit(p, end, LOG_AVG_SP, LIT_LEN(LOG_AVG_SP)))
+			p += LIT_LEN(LOG_AVG_SP);
 		else
-			p += 5;
-		out->avgv = parse_u(p);
+			p += LIT_LEN(LOG_AVG);
+		out->avgv = parse_u(p, end);
 		out->saw_avgv = 1;
 	}
+}
+
+int fp5_build_group(uint8_t *dst, size_t cap, const char *path)
+{
+	size_t n;
+
+	if (!dst || !path || cap < 5)
+		return -1;
+	n = strlen(path);
+	if (n > cap - 5)
+		return -1;
+	memset(dst, 0, cap);
+	memcpy(dst + 4, path, n + 1);
+	return (int)(4 + n + 1);
 }
 
 #include <stdio.h>
@@ -651,10 +686,12 @@ void fp5_time_apply(uint8_t *sb, size_t len, int64_t sec, int32_t nsec)
 	int wday;
 	uint32_t year, mon, mday, hour, min, ssec;
 
+	/* Replies write at most 40 bytes. Clear the 64-byte reply area, but
+	 * never past the listener buffer the caller handed us. */
 	if (!sb || len < 48)
 		return;
 	cmd = rd32(sb);
-	memset(sb, 0, 64);
+	memset(sb, 0, len < 64 ? len : 64);
 	if (sec < 0)
 		sec = 0;
 	switch (cmd) {
