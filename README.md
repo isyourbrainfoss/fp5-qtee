@@ -19,6 +19,10 @@ template id 1657488200 with a real finger-down (`itype` `0x2`) and
 `authentication failed`, and hero NO MATCH. Phosh unlock is not wired up.
 Reboot persistence of that template was not checked.
 
+Log scans, the time-listener reply, and the group-path buffer stop at the
+buffer they were given. A group path that does not fit is refused before it
+is sent. The phone is still running the 2026-10-08 session binary.
+
 Match sends authenticate first, then arms chip wait-touch (work mode 1).
 It captures only an exact finger-down. A hit is an image report that
 succeeds with a real template id. Authenticate-command success, report

@@ -950,6 +950,7 @@ static size_t qsee_len;
 static size_t qsee_delta_len;
 static int qsee_armed;
 static int qsee_log_warned;
+#define WATCH_DIR "/tmp/fp5-qtee"
 static int watch_stop;
 static int watch_on;
 static pthread_t watch_thr;
@@ -991,15 +992,32 @@ static void *qsee_watch_main(void *arg)
 	uint8_t *buf;
 	uint32_t off = 0, wrap = 0;
 	int armed = 0;
-	FILE *out;
+	int fd;
+	FILE *out = NULL;
 	(void)arg;
 
 	buf = calloc(1, 65536);
-	out = fopen("/tmp/fp5-qtee/watch.txt", "w");
-	if (!buf || !out) {
+	if (!buf) {
+		logl("qsee watch: out of memory");
+		return NULL;
+	}
+	/* 0755, not 0700: the app looks for the session binary in this
+	 * directory as the desktop user, and this runs as root. */
+	if (mkdir(WATCH_DIR, 0755) && errno != EEXIST) {
+		logf("qsee watch: mkdir %s: %s", WATCH_DIR, strerror(errno));
 		free(buf);
-		if (out)
-			fclose(out);
+		return NULL;
+	}
+	/* Root writes here, so do not follow a planted symlink in /tmp. */
+	fd = open(WATCH_DIR "/watch.txt",
+		  O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0644);
+	if (fd >= 0)
+		out = fdopen(fd, "w");
+	if (!out) {
+		logf("qsee watch: open %s/watch.txt: %s", WATCH_DIR, strerror(errno));
+		if (fd >= 0)
+			close(fd);
+		free(buf);
 		return NULL;
 	}
 	while (!watch_stop) {
@@ -1080,11 +1098,21 @@ static ssize_t qsee_log_load(void)
 	int fd;
 	ssize_t n;
 
-	if (!qsee_buf) {
-		qsee_buf = calloc(1, QSEE_LOG_CAP);
-		qsee_delta = calloc(1, QSEE_LOG_CAP);
-		if (!qsee_buf || !qsee_delta)
+	if (!qsee_buf || !qsee_delta) {
+		/* Both or neither: qsee_copy_new writes qsee_delta whenever
+		 * qsee_buf is set. */
+		uint8_t *b = calloc(1, QSEE_LOG_CAP);
+		uint8_t *d = calloc(1, QSEE_LOG_CAP);
+
+		if (!b || !d) {
+			free(b);
+			free(d);
 			return -1;
+		}
+		free(qsee_buf);
+		free(qsee_delta);
+		qsee_buf = b;
+		qsee_delta = d;
 	}
 	fd = open("/dev/qsee_log", O_RDONLY);
 	if (fd < 0) {
@@ -1353,11 +1381,15 @@ static int reg_listener(struct svc *s, uint64_t env, uint32_t id, size_t sz)
 	p[2].b = FP5_OBJ_MEM;
 	if (fp5_tee_invoke(&s->tee, sobj, 0, p, 3, &qret)) {
 		logf("listener 0x%x invoke errno=%d qret=%u", id, errno, qret);
+		fp5_tee_shm_free(&ls->shm);
 		return -1;
 	}
 	logf("listener 0x%x bytes=%zu qret=%u", id, ls->shm.size, qret);
-	if (qret && qret != 99)
+	if (qret && qret != 99) {
+		/* The next registration reuses this slot. Do not leak the map. */
+		fp5_tee_shm_free(&ls->shm);
 		return -1;
+	}
 	/* Releasing this service object drops the callback. Keep it. */
 	s->listener_svc[s->nls] = sobj;
 	s->nls++;
@@ -1577,15 +1609,21 @@ static const char *group_path(void)
 	return "";
 }
 
-static void set_group(struct svc *s, const char *path)
+static int set_group(struct svc *s, const char *path)
 {
-	uint8_t g[128];
-	size_t n = strlen(path);
+	uint8_t g[FP5_GROUP_CAP];
+	int n = fp5_build_group(g, sizeof(g), path);
 
-	memset(g, 0, sizeof(g));
-	memcpy(g + 4, path, n + 1);
-	send_cmd(s, fp5_op_set_group(), (uint32_t)(4 + n + 1), g, "SET_GROUP");
-	send_cmd(s, fp5_op_enum(), 0, NULL, "ENUM");
+	if (n < 0) {
+		logf("SET_GROUP path too long (%zu bytes, max %zu)",
+		     path ? strlen(path) : (size_t)0, sizeof(g) - 5);
+		return -1;
+	}
+	/* send_cmd fails on the invoke, not on the trustlet status word.
+	 * SET_GROUP rc -2 (no share template) still returns 0 here. */
+	if (send_cmd(s, fp5_op_set_group(), (uint32_t)n, g, "SET_GROUP"))
+		return -1;
+	return send_cmd(s, fp5_op_enum(), 0, NULL, "ENUM");
 }
 
 static int open_enroll(struct svc *s)
@@ -1765,7 +1803,8 @@ static int enroll_finger(struct svc *s)
 			wrote = (valid && cmd == 0x103 && result == 0) || tmpl;
 			logf("SAVE ms=%ld rpmb_cmd=0x%x rpmb_result=0x%x valid=%d template=%d name=%s",
 			     save_ms, cmd, result, valid, tmpl, s->template_name);
-			set_group(s, group_path());
+			if (set_group(s, group_path()))
+				return -1;
 		}
 		if (lift_rearm(s, &irq))
 			return -1;
@@ -1856,6 +1895,18 @@ static int auth_once(struct svc *s, int which)
 	return 2;
 }
 
+static void free_bufs(struct svc *s)
+{
+	free(s->req);
+	free(s->rsp);
+	free(s->req_out);
+	free(s->rsp_out);
+	s->req = s->rsp = s->req_out = s->rsp_out = NULL;
+	if (s->bsg >= 0)
+		close(s->bsg);
+	s->bsg = -1;
+}
+
 static int alloc_bufs(struct svc *s)
 {
 	s->req = calloc(1, REQ_SZ);
@@ -1875,7 +1926,7 @@ int main(int argc, char **argv)
 	const char *mode = argc > 1 ? argv[1] : "enroll";
 	const char *dir = argc > 2 ? argv[2] : "/lib/firmware/qsee";
 	struct svc s;
-	int rc;
+	int rc, i;
 
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	{
@@ -1895,10 +1946,16 @@ int main(int argc, char **argv)
 		logf("open /dev/tee0: %s", strerror(errno));
 		return 1;
 	}
-	if (alloc_bufs(&s))
+	if (alloc_bufs(&s)) {
+		logl("out of memory for session buffers");
+		free_bufs(&s);
+		fp5_tee_close(&s.tee);
 		return 1;
+	}
 	if (pthread_create(&s.thr, NULL, supp_main, &s)) {
 		logl("supp thread failed");
+		free_bufs(&s);
+		fp5_tee_close(&s.tee);
 		return 1;
 	}
 	watch_on = pthread_create(&watch_thr, NULL, qsee_watch_main, NULL) == 0;
@@ -1923,8 +1980,7 @@ int main(int argc, char **argv)
 		const char *path = argc > 3 ? argv[3] : group_path();
 
 		logf("reopen path '%s'", path);
-		set_group(&s, path);
-		rc = 0;
+		rc = set_group(&s, path) ? 1 : 0;
 	} else if (!strcmp(mode, "begin")) {
 		rc = open_enroll(&s);
 		if (rc == 0 && s.last_rc != 0)
@@ -1982,7 +2038,10 @@ int main(int argc, char **argv)
 		int ms;
 		uint8_t z[4] = { 0 };
 
-		set_group(&s, group_path());
+		if (set_group(&s, group_path())) {
+			rc = 1;
+			goto done;
+		}
 		logf("ARM1 before irq=%u mode=%u", irq0, wmode);
 		if (send_cmd(&s, fp5_op_wmode(), 4, &wmode, "WMODE_TOUCH")) {
 			rc = 1;
@@ -2012,7 +2071,10 @@ int main(int argc, char **argv)
 		uint8_t hat[0x4a];
 
 		fp5_hat_auth(hat);
-		set_group(&s, group_path());
+		if (set_group(&s, group_path())) {
+			rc = 1;
+			goto done;
+		}
 		logf("AUTHARM plen=0x%x", fp5_auth_plen());
 		if (send_cmd(&s, fp5_op_auth(), fp5_auth_plen(), hat, "AUTH_ARM"))
 			rc = 1;
@@ -2023,7 +2085,10 @@ int main(int argc, char **argv)
 	} else if (!strcmp(mode, "auth")) {
 		int a, b;
 
-		set_group(&s, group_path());
+		if (set_group(&s, group_path())) {
+			rc = 1;
+			goto done;
+		}
 		a = auth_once(&s, 1);
 		b = auth_once(&s, 2);
 		logf("auth pair %d %d", a, b);
@@ -2040,8 +2105,13 @@ done:
 	pthread_join(s.thr, NULL);
 	if (watch_on)
 		pthread_join(watch_thr, NULL);
-	if (s.bsg >= 0)
-		close(s.bsg);
+	for (i = 0; i < s.nls; i++)
+		fp5_tee_shm_free(&s.ls[i].shm);
+	free(qsee_buf);
+	free(qsee_delta);
+	qsee_buf = NULL;
+	qsee_delta = NULL;
+	free_bufs(&s);
 	logf("session_exit:%d", rc);
 	return rc == 0 ? 0 : 1;
 }

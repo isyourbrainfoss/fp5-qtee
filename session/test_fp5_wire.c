@@ -2,6 +2,7 @@
 
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int fails;
@@ -274,6 +275,118 @@ static void test_time_and_config(void)
 	expect(strstr(cfg, "0x2001") == NULL, "config has no HL enroll");
 }
 
+/* Short TIME listener buffers: nothing past len may change. */
+static void test_time_short_buffer(void)
+{
+	static const uint32_t cmds[] = { 0x302, 0x303, 0x304, 0x305, 0x306, 0x999 };
+	uint8_t buf[96];
+	size_t len, k;
+	unsigned c;
+
+	for (c = 0; c < sizeof(cmds) / sizeof(cmds[0]); c++) {
+		for (len = 48; len < 64; len++) {
+			int ok = 1;
+
+			memset(buf, 0xcc, sizeof(buf));
+			memcpy(buf, &cmds[c], 4);
+			fp5_time_apply(buf, len, 86400 * 365, 7);
+			for (k = len; k < sizeof(buf); k++) {
+				if (buf[k] != 0xcc)
+					ok = 0;
+			}
+			expect(ok, "time reply stays inside len");
+		}
+	}
+	memset(buf, 0xcc, sizeof(buf));
+	*(uint32_t *)buf = 0x302;
+	fp5_time_apply(buf, 48, 5, 0);
+	expect(*(uint32_t *)(buf + 4) == 5, "short buffer still answered");
+	expect(buf[47] == 0 && buf[48] == 0xcc, "short buffer cleared to len only");
+	memset(buf, 0xcc, sizeof(buf));
+	*(uint32_t *)buf = 0x302;
+	fp5_time_apply(buf, 47, 5, 0);
+	expect(buf[4] == 0xcc, "under 48 bytes is left alone");
+}
+
+/* Copy text to the very end of an exact-size heap buffer and scan it. */
+static void scan_tail(const char *text, struct fp5_log *out)
+{
+	size_t n = strlen(text);
+	uint8_t *b = malloc(n);
+
+	if (!b) {
+		expect(0, "malloc");
+		memset(out, 0, sizeof(*out));
+		return;
+	}
+	memcpy(b, text, n);
+	fp5_scan_log(b, n, out);
+	free(b);
+}
+
+static void test_scan_log_tail(void)
+{
+	struct fp5_log sl;
+
+	scan_tail("....query event state: [", &sl);
+	expect(!sl.esd && !sl.saw_itype && !sl.saw_avgv, "qes needle at end");
+	scan_tail("query event state: [es", &sl);
+	expect(!sl.esd, "truncated esd tag");
+	scan_tail("query event state: [esd]", &sl);
+	expect(sl.esd, "esd tag at end");
+	scan_tail("query event sta", &sl);
+	expect(!sl.esd, "truncated qes needle");
+	scan_tail("xx avgv = 123", &sl);
+	expect(sl.saw_avgv && sl.avgv == 123, "avgv at end");
+	scan_tail("avgv=7", &sl);
+	expect(sl.saw_avgv && sl.avgv == 7, "short avgv at end");
+	scan_tail("avgv", &sl);
+	expect(!sl.saw_avgv, "truncated avgv");
+	scan_tail("interrupt type: 0x2", &sl);
+	expect(sl.saw_itype && sl.itype == 0x2, "itype at end");
+	scan_tail("interrupt type: 0", &sl);
+	expect(!sl.saw_itype, "itype cut before x");
+	scan_tail("interrupt typ", &sl);
+	expect(!sl.saw_itype, "truncated itype needle");
+	fp5_scan_log(NULL, 0, &sl);
+	expect(!sl.saw_itype && !sl.saw_avgv, "null log");
+}
+
+static void test_group(void)
+{
+	uint8_t g[FP5_GROUP_CAP + 8];
+	char path[FP5_GROUP_CAP + 8];
+	int n;
+
+	memset(g, 0xcc, sizeof(g));
+	n = fp5_build_group(g, FP5_GROUP_CAP, "");
+	expect(n == 5, "empty group length");
+	expect(g[0] == 0 && g[4] == 0 && g[FP5_GROUP_CAP - 1] == 0,
+	       "empty group zeroed");
+	expect(g[FP5_GROUP_CAP] == 0xcc, "group stays in cap");
+
+	n = fp5_build_group(g, FP5_GROUP_CAP, "/data/fp");
+	expect(n == 4 + 8 + 1 && !memcmp(g + 4, "/data/fp", 9), "group path");
+
+	memset(path, 'a', sizeof(path));
+	path[FP5_GROUP_CAP - 5] = 0; /* 123 bytes: the longest that fits */
+	memset(g, 0xcc, sizeof(g));
+	n = fp5_build_group(g, FP5_GROUP_CAP, path);
+	expect(n == FP5_GROUP_CAP, "longest group path fits");
+	expect(g[FP5_GROUP_CAP - 1] == 0 && g[FP5_GROUP_CAP] == 0xcc,
+	       "longest group path NUL inside cap");
+
+	path[FP5_GROUP_CAP - 5] = 'a';
+	path[FP5_GROUP_CAP - 4] = 0; /* 124 bytes */
+	memset(g, 0xcc, sizeof(g));
+	expect(fp5_build_group(g, FP5_GROUP_CAP, path) == -1, "124-byte path refused");
+	expect(g[0] == 0xcc && g[FP5_GROUP_CAP] == 0xcc, "refused path writes nothing");
+	path[FP5_GROUP_CAP + 7] = 0;
+	expect(fp5_build_group(g, FP5_GROUP_CAP, path) == -1, "long path refused");
+	expect(fp5_build_group(g, FP5_GROUP_CAP, NULL) == -1, "null path refused");
+	expect(fp5_build_group(g, 4, "") == -1, "tiny cap refused");
+}
+
 int main(void)
 {
 	test_opcodes();
@@ -281,6 +394,9 @@ int main(void)
 	test_gpfile();
 	test_rpmb();
 	test_time_and_config();
+	test_time_short_buffer();
+	test_scan_log_tail();
+	test_group();
 	if (fails) {
 		fprintf(stderr, "%d failed\n", fails);
 		return 1;

@@ -83,6 +83,12 @@ struct fp5_log {
 
 void fp5_scan_log(const uint8_t *buf, size_t n, struct fp5_log *out);
 
+/* SET_GROUP payload: a zero word, then the NUL-terminated group path. */
+#define FP5_GROUP_CAP 128
+/* Fills dst (cap bytes). Returns the payload length, or -1 when path is
+ * NULL or does not fit with its NUL. dst is unchanged on -1. */
+int fp5_build_group(uint8_t *dst, size_t cap, const char *path);
+
 /* Nested SYNC_CFG JSON. native_log is the trustlet native-log bool. */
 int fp5_sync_config(char *dst, size_t cap, int native_log);
 
