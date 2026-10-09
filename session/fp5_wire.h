@@ -84,6 +84,16 @@ int fp5_auth_match(uint32_t itype, int esd, uint32_t avgv, int32_t report_rc,
  */
 int fp5_auth_burst(uint32_t itype, int esd, const uint32_t *avgv, int n,
 		   int32_t report_rc, uint32_t fid);
+/* 1 while this press is still down. An unchanged irq_count is still down.
+ * An edge with no classified type, or any type other than exact 0x2, has
+ * lifted. Do not treat that edge as a new finger-down.
+ */
+int fp5_finger_held(unsigned base, unsigned now, int saw_itype,
+		    uint32_t itype, int esd);
+/* 1 to capture another burst. Stops at 3, and when the finger has lifted. */
+int fp5_retry_more(int bursts_done, int held);
+/* One press is one strike, however many scored bursts missed. */
+int fp5_press_strikes(int scored_misses);
 
 struct fp5_log {
 	uint32_t itype;

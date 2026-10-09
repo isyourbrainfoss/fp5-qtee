@@ -258,6 +258,30 @@ int fp5_auth_burst(uint32_t itype, int esd, const uint32_t *avgv, int n,
 	return 1;
 }
 
+int fp5_finger_held(unsigned base, unsigned now, int saw_itype,
+		    uint32_t itype, int esd)
+{
+	if (now == base)
+		return 1;
+	if (!saw_itype)
+		return 0;
+	return fp5_real_down(itype, esd);
+}
+
+int fp5_retry_more(int bursts_done, int held)
+{
+	if (!held)
+		return 0;
+	if (bursts_done < 1 || bursts_done >= 3)
+		return 0;
+	return 1;
+}
+
+int fp5_press_strikes(int scored_misses)
+{
+	return scored_misses > 0 ? 1 : 0;
+}
+
 /* Parsers stop at end so a token at the end of the buffer is not over-read. */
 static uint32_t parse_hex(const char *p, const char *end)
 {

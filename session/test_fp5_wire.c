@@ -156,6 +156,20 @@ static void test_decisions(void)
 	       "second poison is not a match");
 	expect(!fp5_auth_match(0x2, 0, 300, -11, 1253023920u),
 	       "report -11 is not a match");
+	expect(fp5_finger_held(4, 4, 0, 0, 0), "unchanged irq is still down");
+	expect(fp5_finger_held(4, 5, 1, 0x2, 0), "another exact down is held");
+	expect(!fp5_finger_held(4, 5, 0, 0x2, 0), "unclassified edge stops");
+	expect(!fp5_finger_held(4, 5, 1, 0x4, 0), "lift stops the retry");
+	expect(!fp5_finger_held(4, 5, 1, 0x212, 0), "leftover edge stops");
+	expect(!fp5_finger_held(4, 5, 1, 0x2, 1), "esd on the edge stops");
+	expect(!fp5_retry_more(0, 1), "no burst yet is not a retry");
+	expect(fp5_retry_more(1, 1), "retry after the first burst");
+	expect(fp5_retry_more(2, 1), "retry after the second burst");
+	expect(!fp5_retry_more(3, 1), "three bursts is the limit");
+	expect(!fp5_retry_more(1, 0), "a lift stops the retry");
+	expect(!fp5_press_strikes(0), "no scored miss is no strike");
+	expect(fp5_press_strikes(1) == 1, "one scored miss is one strike");
+	expect(fp5_press_strikes(3) == 1, "three scored misses are one strike");
 	expect(fp5_log_is_score(
 		       "FtVerifySubTemplate() score = 40, matchCnts = 2"),
 	       "score diary");

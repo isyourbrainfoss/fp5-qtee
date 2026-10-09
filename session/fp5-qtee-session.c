@@ -1944,6 +1944,133 @@ static int enroll_finger(struct svc *s)
 	return 2;
 }
 
+/*
+ * 1 while the finger from this press is still down, 0 once it has lifted,
+ * -1 if the interrupt query failed. An unchanged irq_count needs no query.
+ * A new edge is classified with QEV and is not passed to fp5_att_irq, so a
+ * lift cannot look like another finger-down of this attempt.
+ */
+static int finger_held(struct svc *s, unsigned *irq)
+{
+	unsigned now = read_irq();
+	unsigned base = *irq;
+	int held;
+	uint8_t z[4] = { 0 };
+
+	if (now == base)
+		return 1;
+	if (send_cmd(s, fp5_op_query(), 4, z, "QEV"))
+		return -1;
+	held = fp5_finger_held(base, now, s->last.saw_itype, s->last.itype,
+			       s->last.esd);
+	if (s->last.saw_itype)
+		*irq = now;
+	return held;
+}
+
+/*
+ * Up to three 3-frame bursts while the finger stays down. The first hit
+ * returns at once. Scored misses share one AUTH FAIL, so the watcher adds
+ * one strike. Bursts with no in-range frame are not reported; if every
+ * burst was like that, one AUTH empty is printed and it is not a strike.
+ * Cancel before any scored report returns cancelled and prints no FAIL.
+ */
+static int auth_press(struct svc *s, int which, unsigned *irq,
+		      uint32_t itype, int esd)
+{
+	int burst, scored = 0, saw_empty = 0, cut = 0;
+	uint32_t empty_av[3] = { 0, 0, 0 };
+	uint32_t miss_avgv = 0, miss_fid = 0;
+	int miss_rc = 0;
+
+	for (burst = 0; burst < 3 && !cut; burst++) {
+		uint32_t av[3] = { 0, 0, 0 };
+		uint32_t fid = 0;
+		int fi, matched, verdict, held;
+
+		if (burst > 0) {
+			if (serve_on && serve_poll_cmds()) {
+				if (!scored) {
+					logf("AUTH %d cancelled", which);
+					return FP5_ATT_CANCELLED;
+				}
+				break;
+			}
+			held = finger_held(s, irq);
+			if (held < 0)
+				return -1;
+			if (!fp5_retry_more(burst, held))
+				break;
+		}
+		for (fi = 0; fi < 3; fi++) {
+			fp5_capture_fill(s->req + FP5_PAY_OFF, 3, (uint32_t)fi,
+					 fp5_hal_flag_enroll());
+			if (send_cmd(s, fp5_op_capture(), 0x24, NULL, "CAP"))
+				return -1;
+			av[fi] = s->last.avgv;
+			if (serve_on && serve_poll_cmds()) {
+				if (!scored) {
+					logf("AUTH %d cancelled during capture", which);
+					return FP5_ATT_CANCELLED;
+				}
+				cut = 1;
+				break;
+			}
+		}
+		if (cut)
+			break;
+		if (!fp5_burst_ok(av, 3)) {
+			saw_empty = 1;
+			empty_av[0] = av[0];
+			empty_av[1] = av[1];
+			empty_av[2] = av[2];
+			continue;
+		}
+		/*
+		 * All three captures are already in the trustlet. Report the
+		 * burst as a whole, including a frame with avgv >= 600.
+		 */
+		logf("AUTH %d burst avgv=%u,%u,%u", which, av[0], av[1], av[2]);
+		arm_report(s, 5);
+		if (send_cmd(s, fp5_op_report(), 0x2e0, NULL, "REPORT_EV5"))
+			return -1;
+		qsee_dump_delta("REPORT_EV5");
+		memcpy(&fid, s->req + FP5_PAY_OFF + 0x10, 4);
+		logf("AUTH %d report rc=%d fid=%u", which, (int)s->last_rc, fid);
+		if (serve_on)
+			serve_poll_cmds();
+		matched = fp5_auth_burst(itype, esd, av, 3, s->last_rc, fid);
+		verdict = matched ? FP5_ATT_HIT : FP5_ATT_MISS;
+		if (serve_on)
+			verdict = fp5_att_finish(&serve_att, matched);
+		if (verdict == FP5_ATT_HIT) {
+			logf("AUTH HIT %d itype=0x%x avgv=%u fid=%u rc=%d", which,
+			     itype, fp5_burst_pick(av, 3), fid, (int)s->last_rc);
+			return 0;
+		}
+		if (verdict == FP5_ATT_CANCELLED) {
+			/* Matched, but the watcher cancelled. Never say HIT. */
+			logf("AUTH %d cancelled after match", which);
+			return FP5_ATT_CANCELLED;
+		}
+		scored++;
+		miss_avgv = fp5_burst_pick(av, 3);
+		miss_fid = fid;
+		miss_rc = (int)s->last_rc;
+	}
+	if (fp5_press_strikes(scored)) {
+		logf("AUTH FAIL %d itype=0x%x esd=%d avgv=%u fid=%u rc=%d",
+		     which, itype, esd, miss_avgv, miss_fid, miss_rc);
+		return 2;
+	}
+	if (saw_empty) {
+		logf("AUTH %d empty avgv=%u,%u,%u", which, empty_av[0],
+		     empty_av[1], empty_av[2]);
+		return 2;
+	}
+	return 2;
+}
+
 static int auth_once(struct svc *s, int which)
 {
 	unsigned irq = read_irq();
@@ -1954,14 +2081,11 @@ static int auth_once(struct svc *s, int which)
 	 * enroll command already has the chip scanning.
 	 */
 	uint32_t mode = fp5_wmode_touch();
-	uint32_t av[3], avsel;
 	uint32_t itype = 0;
-	int esd = 0, fi, down = 0;
+	int esd = 0, down = 0;
 	int left = 90000;
 	uint8_t hat[0x4a];
 	uint8_t z[4] = { 0 };
-	uint32_t fid = 0;
-	int verdict;
 
 	/*
 	 * 0x2008 stores operation mode 2 (do_authenticate) and returns 0
@@ -2020,53 +2144,7 @@ static int auth_once(struct svc *s, int which)
 		return FP5_ATT_CANCELLED;
 	}
 	logf("AUTH %d REAL DOWN itype=0x%x", which, itype);
-	for (fi = 0; fi < 3; fi++) {
-		fp5_capture_fill(s->req + FP5_PAY_OFF, 3, (uint32_t)fi,
-				 fp5_hal_flag_enroll());
-		if (send_cmd(s, fp5_op_capture(), 0x24, NULL, "CAP"))
-			return -1;
-		av[fi] = s->last.avgv;
-		if (serve_on && serve_poll_cmds()) {
-			logf("AUTH %d cancelled during capture", which);
-			return FP5_ATT_CANCELLED;
-		}
-	}
-	if (!fp5_burst_ok(av, 3)) {
-		logf("AUTH %d empty avgv=%u,%u,%u", which, av[0], av[1], av[2]);
-		return 2;
-	}
-	/*
-	 * All three captures are already in the trustlet. Report the burst
-	 * as a whole, including a frame with avgv >= 600. The in-range pick
-	 * is only for the log line.
-	 */
-	logf("AUTH %d burst avgv=%u,%u,%u", which, av[0], av[1], av[2]);
-	avsel = fp5_burst_pick(av, 3);
-	arm_report(s, 5);
-	if (send_cmd(s, fp5_op_report(), 0x2e0, NULL, "REPORT_EV5"))
-		return -1;
-	qsee_dump_delta("REPORT_EV5");
-	memcpy(&fid, s->req + FP5_PAY_OFF + 0x10, 4);
-	logf("AUTH %d report rc=%d fid=%u", which, (int)s->last_rc, fid);
-	if (serve_on)
-		serve_poll_cmds();	/* last look before the verdict */
-	verdict = fp5_auth_burst(itype, esd, av, 3, s->last_rc, fid) ?
-		  FP5_ATT_HIT : FP5_ATT_MISS;
-	if (serve_on)
-		verdict = fp5_att_finish(&serve_att, verdict == FP5_ATT_HIT);
-	if (verdict == FP5_ATT_CANCELLED) {
-		/* Matched, but the watcher cancelled. Never say HIT. */
-		logf("AUTH %d cancelled after match", which);
-		return FP5_ATT_CANCELLED;
-	}
-	if (verdict == FP5_ATT_HIT) {
-		logf("AUTH HIT %d itype=0x%x avgv=%u fid=%u rc=%d", which, itype,
-		     avsel, fid, (int)s->last_rc);
-		return 0;
-	}
-	logf("AUTH FAIL %d itype=0x%x esd=%d avgv=%u fid=%u rc=%d", which, itype,
-	     esd, avsel, fid, (int)s->last_rc);
-	return 2;
+	return auth_press(s, which, &irq, itype, esd);
 }
 
 /*
