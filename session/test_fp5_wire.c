@@ -97,8 +97,36 @@ static void test_decisions(void)
 	expect(!fp5_score_sample(0), "avgv 0");
 	expect(!fp5_score_sample(600), "avgv 600");
 	expect(fp5_burst_ok(avg, 3), "three good frames");
+	expect(fp5_burst_full(avg, 3), "enroll: three good frames");
 	avg[2] = 900;
-	expect(!fp5_burst_ok(avg, 3), "one empty frame");
+	expect(!fp5_burst_full(avg, 3), "enroll: one empty frame rejects");
+	expect(fp5_burst_ok(avg, 3), "auth: two good frames are scored");
+	expect(fp5_burst_pick(avg, 3) == 280, "auth: picks last in-range frame");
+	{
+		uint32_t light[3] = { 966, 412, 0 };
+		uint32_t none[3] = { 0, 966, 600 };
+		uint32_t first[3] = { 250, 0, 0 };
+
+		expect(fp5_burst_ok(light, 3), "light tap: one good frame");
+		expect(fp5_burst_pick(light, 3) == 412, "light tap: uses 412");
+		expect(fp5_burst_ok(first, 3), "only first frame good");
+		expect(fp5_burst_pick(first, 3) == 250, "only first frame picked");
+		expect(!fp5_burst_ok(none, 3), "no in-range frame rejects");
+		expect(fp5_burst_pick(none, 3) == 0, "no in-range frame picks 0");
+		expect(!fp5_burst_ok(light, 2) || fp5_burst_pick(light, 2) == 412,
+		       "short burst only looks at n frames");
+		expect(!fp5_burst_ok(first + 1, 2), "two empty frames reject");
+		expect(!fp5_burst_full(light, 3), "light tap never enrolls");
+		/* The pick is in range, but the trustlet still decides. */
+		expect(!fp5_auth_match(0x2, 0, fp5_burst_pick(light, 3), -1,
+				       1253023920u), "light tap: trustlet miss");
+		expect(!fp5_auth_match(0x2, 0, fp5_burst_pick(light, 3), 0, 0),
+		       "light tap: fid 0 is not a match");
+		expect(!fp5_auth_match(0x2, 0, fp5_burst_pick(none, 3), 0,
+				       1253023920u), "no frame: never a match");
+		expect(fp5_auth_match(0x2, 0, fp5_burst_pick(light, 3), 0,
+				      1253023920u), "light tap: trustlet hit");
+	}
 	expect(fp5_auth_plen() == 0xe, "auth plen");
 	expect(fp5_auth_match(0x2, 0, 300, 0, 1253023920u), "match");
 	expect(!fp5_auth_match(0x212, 0, 300, 0, 1253023920u), "leftover is not a match");
