@@ -2035,11 +2035,13 @@ static int auth_once(struct svc *s, int which)
 		logf("AUTH %d empty avgv=%u,%u,%u", which, av[0], av[1], av[2]);
 		return 2;
 	}
-	/* Score with an in-range frame only; a light tap may have just one. */
+	/*
+	 * All three captures are already in the trustlet. Report the burst
+	 * as a whole, including a frame with avgv >= 600. The in-range pick
+	 * is only for the log line.
+	 */
+	logf("AUTH %d burst avgv=%u,%u,%u", which, av[0], av[1], av[2]);
 	avsel = fp5_burst_pick(av, 3);
-	if (!fp5_burst_full(av, 3))
-		logf("AUTH %d light avgv=%u,%u,%u use=%u", which, av[0], av[1],
-		     av[2], avsel);
 	arm_report(s, 5);
 	if (send_cmd(s, fp5_op_report(), 0x2e0, NULL, "REPORT_EV5"))
 		return -1;
@@ -2048,7 +2050,7 @@ static int auth_once(struct svc *s, int which)
 	logf("AUTH %d report rc=%d fid=%u", which, (int)s->last_rc, fid);
 	if (serve_on)
 		serve_poll_cmds();	/* last look before the verdict */
-	verdict = fp5_auth_match(itype, esd, avsel, s->last_rc, fid) ?
+	verdict = fp5_auth_burst(itype, esd, av, 3, s->last_rc, fid) ?
 		  FP5_ATT_HIT : FP5_ATT_MISS;
 	if (serve_on)
 		verdict = fp5_att_finish(&serve_att, verdict == FP5_ATT_HIT);

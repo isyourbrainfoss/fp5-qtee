@@ -149,6 +149,8 @@ class MissTest(unittest.TestCase):
         self.assertIsNone(miss_kind("AUTH 1 no finger"))
         self.assertIsNone(miss_kind("AUTH HIT 1 itype=0x2 avgv=304 fid=1403494260 rc=0"))
         self.assertIsNone(miss_kind("AUTH 1 REAL DOWN itype=0x2"))
+        # The burst log is not a verdict. One AUTH FAIL later is the strike.
+        self.assertIsNone(miss_kind("AUTH 1 burst avgv=328,521,638"))
 
     def test_feedback_args(self) -> None:
         self.assertEqual(

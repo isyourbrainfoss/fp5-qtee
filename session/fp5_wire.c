@@ -205,11 +205,9 @@ int fp5_burst_full(const uint32_t *avgv, int n)
 
 /*
  * Authentication: score the burst when at least one frame is in range.
- * A light tap often gives one or two good frames; requiring all three made
- * such a tap impossible to match. This is only a host-side quality gate:
- * the trustlet still does the match and decides the template id, and
- * fp5_auth_match still demands rc 0 and a real fid. A burst with no frame
- * in range is still rejected.
+ * Android always captures three frames and sends every one of them, including
+ * a frame with avgv >= 600, when another frame is in range. A burst with no
+ * frame in range is still not sent. The trustlet does the match.
  */
 int fp5_burst_ok(const uint32_t *avgv, int n)
 {
@@ -238,6 +236,20 @@ int fp5_auth_match(uint32_t itype, int esd, uint32_t avgv, int32_t report_rc,
 	if (!fp5_real_down(itype, esd))
 		return 0;
 	if (!fp5_score_sample(avgv))
+		return 0;
+	if (report_rc != 0)
+		return 0;
+	if (fid == 0 || fid == 0xaaaaaaaau || fid == 0xa5a5a5a5u)
+		return 0;
+	return 1;
+}
+
+int fp5_auth_burst(uint32_t itype, int esd, const uint32_t *avgv, int n,
+		   int32_t report_rc, uint32_t fid)
+{
+	if (!fp5_real_down(itype, esd))
+		return 0;
+	if (!fp5_burst_ok(avgv, n))
 		return 0;
 	if (report_rc != 0)
 		return 0;

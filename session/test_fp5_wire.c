@@ -126,6 +126,24 @@ static void test_decisions(void)
 				       1253023920u), "no frame: never a match");
 		expect(fp5_auth_match(0x2, 0, fp5_burst_pick(light, 3), 0,
 				      1253023920u), "light tap: trustlet hit");
+		/* Android 22:23:38: one frame at 638, and the TA still scored it. */
+		{
+			uint32_t mixed[3] = { 328, 521, 638 };
+
+			expect(fp5_burst_ok(mixed, 3), "mixed burst is scored");
+			expect(!fp5_burst_full(mixed, 3), "mixed burst does not enroll");
+			expect(fp5_burst_pick(mixed, 3) == 521, "mixed pick skips 638");
+			expect(fp5_auth_burst(0x2, 0, mixed, 3, 0, 1253023920u),
+			       "mixed burst: trustlet hit");
+			expect(!fp5_auth_burst(0x2, 0, mixed, 3, -2, 1253023920u),
+			       "mixed burst: trustlet miss");
+			expect(!fp5_auth_burst(0x2, 0, mixed, 3, 0, 0),
+			       "mixed burst: fid 0");
+			expect(!fp5_auth_burst(0x212, 0, mixed, 3, 0, 1253023920u),
+			       "mixed burst: leftover is not a hit");
+			expect(!fp5_auth_match(0x2, 0, 638, 0, 1253023920u),
+			       "a lone hot frame is not a match");
+		}
 	}
 	expect(fp5_auth_plen() == 0xe, "auth plen");
 	expect(fp5_auth_match(0x2, 0, 300, 0, 1253023920u), "match");
