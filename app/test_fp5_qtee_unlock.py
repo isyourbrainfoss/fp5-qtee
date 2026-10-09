@@ -25,6 +25,8 @@ from fp5_qtee_unlock import (
     lockout_state_for,
     miss_kind,
     parse_locked,
+
+    notify_args,
     pump_lines,
     screen_is_on,
 )
@@ -147,6 +149,15 @@ class MissTest(unittest.TestCase):
             ["fbcli", "-A", "org.fp5.qtee", "-E", "bell-terminal"],
         )
         self.assertIsNone(feedback_args(""))
+
+    def test_notice_text_is_the_summary(self) -> None:
+        # Phosh's lock screen shows only the summary; the sentence must be it.
+        args = notify_args(fp5_qtee_unlock.MISS_TEXT["nomatch"], 2500, transient=True)
+        self.assertEqual(args[0], "notify-send")
+        self.assertEqual(args[-1], fp5_qtee_unlock.MISS_TEXT["nomatch"])
+        self.assertNotIn("Fingerprint", args[-2:])
+        self.assertIn("boolean:transient:true", args)
+        self.assertEqual(notify_args("hi", 6000)[-1], "hi")
 
 
 class PolicyTest(unittest.TestCase):

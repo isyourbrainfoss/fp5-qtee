@@ -300,6 +300,18 @@ class UnlockPolicy:
         return None
 
 
+def notify_args(text: str, timeout_ms: int, transient: bool = False) -> list[str]:
+    """notify-send command that puts the message in the summary.
+
+    The Phosh lock screen shows only the summary of a notification, so the
+    sentence itself must be the summary. No body is passed.
+    """
+    args = ["notify-send", "-a", "Fingerprint", "-t", str(timeout_ms)]
+    if transient:
+        args += ["-h", "boolean:transient:true"]
+    return args + [text]
+
+
 def pump_lines(stream: Iterable[str], out: "queue.Queue[str | None]") -> None:
     """Copy each line into the queue, then None at end of stream."""
     try:
@@ -492,7 +504,7 @@ class UnlockWatcher:
     def notify(self, text: str) -> None:
         try:
             subprocess.run(
-                ["notify-send", "-t", "6000", "Fingerprint", text],
+                notify_args(text, 6000),
                 check=False,
                 timeout=3,
             )
@@ -525,10 +537,7 @@ class UnlockWatcher:
         self.note(f"miss {kind}")
         self.feedback(MISS_EVENT)
         # Transient, so misses do not pile up in the notification list.
-        self._background(
-            ["notify-send", "-h", "boolean:transient:true", "-t", "2500",
-             "-a", "Fingerprint", "Fingerprint", MISS_TEXT[kind]]
-        )
+        self._background(notify_args(MISS_TEXT[kind], 2500, transient=True))
 
     def session_id(self) -> str | None:
         sid = self._sid.get()
