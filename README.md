@@ -52,6 +52,38 @@ The watcher follows Android's rules for when a finger may unlock:
 While one of these applies the sensor is not armed at all, and one
 notification says why.
 
+### Warm mode (opt-in, `FP5_QTEE_WARM=1`)
+
+By default every attempt starts a new `fp5-qtee-session unlock`: mount,
+sensor power-up and reset, `/dev/tee0`, four listener registrations, the
+trustlet load from `focal32.mdt`/`.bXX`, 13 setup commands, then
+SET_GROUP/ENUM. Only then is the sensor armed. That is the wait after
+waking the screen, and it is paid again after every miss.
+
+`fp5-qtee-session serve` does that setup once and then takes line
+commands on stdin: `auth`, `cancel`, `quit` (EOF is `quit`). It prints
+`SERVE ready`, then `SERVE idle` whenever it waits for a command and
+`SERVE result <rc>` after each `auth`. Idle is a blocking read; there is no
+polling and no sensor command. A finger wait also watches stdin, so
+`cancel` ends it at once (`AUTH <n> cancelled`, result 3). Serve mode does
+not start the `/dev/qsee_log` watch thread.
+
+With `FP5_QTEE_WARM=1` the watcher starts one serve session when it sees
+the session locked, including in the 10 s after the panel goes off, so
+the load happens while the screen is dark. On wake it sends `auth` at
+once and confirms the lock within a second. After a miss it re-arms
+straight away. Panel off sends `cancel`. An unlock (finger or PIN) quits
+the session, which frees the sensor for the Finger app. A hit still has
+to pass the panel, logind and lockout checks.
+
+Enable it with a drop-in:
+
+```sh
+systemctl --user edit fp5-qtee-unlock.service
+# [Service]
+# Environment=FP5_QTEE_WARM=1
+```
+
 Log scans, the time-listener reply, and the group-path buffer stop at the
 buffer they were given. A group path that does not fit is refused before it
 is sent. The phone session includes those checks and a one-press `unlock` mode.
@@ -72,7 +104,7 @@ The signed `focal32` image is not in this repository. Copy `focal32.mdt` and
 ## Repository layout
 
 ```
-session/   fp5-qtee-session, wire helpers, and their host tests
+session/   fp5-qtee-session, wire and serve-command helpers, and their host tests
 app/       Phosh "Finger" app (idle until Enroll or Match)
 scripts/   load-qcomtee.sh for the test phone
 ```

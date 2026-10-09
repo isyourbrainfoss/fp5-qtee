@@ -1,9 +1,11 @@
+#include "fp5_cmd.h"
 #include "fp5_image.h"
 #include "fp5_tee.h"
 #include "fp5_wire.h"
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <pthread.h>
 #include <sys/ioctl.h>
 #include <scsi/sg.h>
@@ -138,20 +140,106 @@ static int sysfs_write(const char *path, const char *text)
 	return n > 0 ? 0 : -1;
 }
 
+#define IRQ_COUNT "/sys/class/focaltech_fp/focaltech_fp/irq_count"
+
+/*
+ * serve mode keeps one session open and takes commands on stdin
+ * (fp5_cmd.h). A wait for a finger also watches stdin, so "cancel"
+ * ends it at once. irq_fd stays open there so the wait can poll it.
+ */
+static int serve_on;
+static volatile int serve_cancel;
+static int serve_quit;
+static int irq_fd = -1;
+static struct fp5_cmdbuf serve_in;
+
 static unsigned read_irq(void)
 {
 	char b[32];
 	int fd, n;
 
-	fd = open("/sys/class/focaltech_fp/focaltech_fp/irq_count", O_RDONLY);
-	if (fd < 0)
-		return 0;
-	n = (int)read(fd, b, sizeof(b) - 1);
-	close(fd);
+	if (irq_fd >= 0) {
+		/* pread also re-arms sysfs poll for the next change. */
+		n = (int)pread(irq_fd, b, sizeof(b) - 1, 0);
+	} else {
+		fd = open(IRQ_COUNT, O_RDONLY);
+		if (fd < 0)
+			return 0;
+		n = (int)read(fd, b, sizeof(b) - 1);
+		close(fd);
+	}
 	if (n <= 0)
 		return 0;
 	b[n] = 0;
 	return (unsigned)strtoul(b, NULL, 10);
+}
+
+/* Next command from stdin. FP5_CMD_NONE when timeout_ms passes first. */
+static int serve_read_cmd(int timeout_ms)
+{
+	char line[FP5_CMD_LINE];
+	char chunk[FP5_CMD_LINE];
+
+	for (;;) {
+		struct pollfd p = { .fd = 0, .events = POLLIN };
+		ssize_t n;
+		int r;
+
+		if (fp5_cmd_next(&serve_in, line, sizeof(line)))
+			return fp5_cmd_parse(line);
+		r = poll(&p, 1, timeout_ms);
+		if (r < 0) {
+			if (errno == EINTR)
+				continue;
+			return FP5_CMD_QUIT;
+		}
+		if (r == 0)
+			return FP5_CMD_NONE;
+		n = read(0, chunk, sizeof(chunk));
+		if (n < 0) {
+			if (errno == EINTR || errno == EAGAIN)
+				continue;
+			return FP5_CMD_QUIT;
+		}
+		if (n == 0)
+			return FP5_CMD_QUIT;	/* the watcher went away */
+		fp5_cmd_push(&serve_in, chunk, (size_t)n);
+		/* Take any whole line now, but do not block on a partial one. */
+		timeout_ms = 0;
+	}
+}
+
+/*
+ * One 20 ms step of a finger wait in serve mode. Returns 1 when the
+ * wait should end because of a command. If the driver calls
+ * sysfs_notify on irq_count, POLLPRI ends the step early. If it does
+ * not, the step simply times out, as usleep did.
+ */
+static int serve_wait_step(int ms)
+{
+	struct pollfd p[2];
+	int np = 1;
+
+	p[0].fd = 0;
+	p[0].events = POLLIN;
+	p[0].revents = 0;
+	if (irq_fd >= 0) {
+		p[1].fd = irq_fd;
+		p[1].events = POLLPRI | POLLERR;
+		p[1].revents = 0;
+		np = 2;
+	}
+	if (poll(p, (nfds_t)np, ms) > 0 && (p[0].revents & (POLLIN | POLLHUP))) {
+		int cmd = serve_read_cmd(0);
+
+		if (cmd == FP5_CMD_QUIT) {
+			serve_quit = 1;
+			serve_cancel = 1;
+		} else if (cmd == FP5_CMD_CANCEL) {
+			serve_cancel = 1;
+		}
+	}
+	return serve_cancel;
 }
 
 static int wait_irq(unsigned *prev, int ms)
@@ -163,7 +251,12 @@ static int wait_irq(unsigned *prev, int ms)
 			*prev = now;
 			return 1;
 		}
-		usleep(20 * 1000);
+		if (serve_on) {
+			if (serve_wait_step(20))
+				return 0;
+		} else {
+			usleep(20 * 1000);
+		}
 		ms -= 20;
 	}
 	return 0;
@@ -1864,6 +1957,10 @@ static int auth_once(struct svc *s, int which)
 		logf("skip leftover itype=0x%x esd=%d", itype, esd);
 	}
 	if (!down) {
+		if (serve_cancel) {
+			logf("AUTH %d cancelled", which);
+			return 3;
+		}
 		logf("AUTH %d no finger", which);
 		return 2;
 	}
@@ -1893,6 +1990,52 @@ static int auth_once(struct svc *s, int which)
 	logf("AUTH FAIL %d itype=0x%x esd=%d avgv=%u fid=%u rc=%d", which, itype,
 	     esd, av[2], fid, (int)s->last_rc);
 	return 2;
+}
+
+/*
+ * Stay loaded and wait for commands, so a match does not pay for the
+ * trustlet load and setup every time. Idle here is a blocking read on
+ * stdin: no polling, no sensor commands.
+ *
+ *   in:  auth | cancel | quit   (EOF is quit)
+ *   out: "SERVE ready" once, "SERVE idle" before each wait for a
+ *        command, "SERVE result <auth_once rc>" after each auth. A
+ *        cancelled auth prints "AUTH <n> cancelled" and result 3.
+ */
+static int serve_loop(struct svc *s)
+{
+	int n = 0, rc = 0;
+
+	irq_fd = open(IRQ_COUNT, O_RDONLY | O_CLOEXEC);
+	serve_on = 1;
+	if (set_group(s, group_path())) {
+		rc = 1;
+		goto out;
+	}
+	logl("SERVE ready");
+	while (!serve_quit) {
+		int cmd, a;
+
+		logl("SERVE idle");
+		do {
+			cmd = serve_read_cmd(-1);
+		} while (cmd != FP5_CMD_AUTH && cmd != FP5_CMD_QUIT);
+		if (cmd == FP5_CMD_QUIT)
+			break;
+		serve_cancel = 0;
+		a = auth_once(s, ++n);
+		logf("SERVE result %d", a);
+		if (a < 0) {
+			rc = 1;
+			break;
+		}
+	}
+out:
+	serve_on = 0;
+	if (irq_fd >= 0)
+		close(irq_fd);
+	irq_fd = -1;
+	return rc;
 }
 
 static void free_bufs(struct svc *s)
@@ -1958,7 +2101,10 @@ int main(int argc, char **argv)
 		fp5_tee_close(&s.tee);
 		return 1;
 	}
-	watch_on = pthread_create(&watch_thr, NULL, qsee_watch_main, NULL) == 0;
+	/* The watch thread reads /dev/qsee_log every 30 ms for a debug
+	 * file. A serve session can idle for hours, so it goes without. */
+	if (strcmp(mode, "serve"))
+		watch_on = pthread_create(&watch_thr, NULL, qsee_watch_main, NULL) == 0;
 	while (!s.ready)
 		usleep(1000);
 	usleep(20 * 1000);
@@ -2104,6 +2250,8 @@ int main(int argc, char **argv)
 		a = auth_once(&s, 1);
 		logf("unlock once %d", a);
 		rc = a == 0 ? 0 : (a < 0 ? 1 : 2);
+	} else if (!strcmp(mode, "serve")) {
+		rc = serve_loop(&s);
 	} else {
 		logf("unknown mode %s", mode);
 		rc = 1;
