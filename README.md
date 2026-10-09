@@ -100,7 +100,15 @@ LockedHint again and only then sends `auth` (one loginctl call, so arming
 waits for it). After a miss it re-arms straight away, again after a fresh
 LockedHint. Panel off sends `cancel`. An unknown LockedHint cancels and
 does not arm. An unlock (finger or PIN) quits the session, which frees the
-sensor for the Finger app. A hit unlocks only if it is from the `auth` sent
+sensor for the Finger app; nothing holds the sensor while unlocked. The
+next lock starts a new serve session at once, so it is warm again before
+the next wake: the watcher follows logind's lock signals through one idle
+`gdbus monitor --system --dest org.freedesktop.login1` process (a hint
+only; the state is still read with loginctl), so a lock with the panel on,
+or long after the panel went off, preloads straight away. With the
+signals, an unlocked phone with the panel on is asked LockedHint only
+every 15 s instead of every second. Without `gdbus`, a dark unlocked
+phone is asked every 10 s until a session is loaded. A hit unlocks only if it is from the `auth` sent
 in this panel-on period and not cancelled (no hit after `cancel`, after
 panel-off, or after that attempt's `SERVE result`), and it still has to
 pass the panel, logind and lockout checks. A scored non-match counts as a

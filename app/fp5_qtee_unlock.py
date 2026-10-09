@@ -83,6 +83,13 @@ WARM = os.environ.get("FP5_QTEE_WARM", "0") == "1"
 # so the session can load while the screen is dark. Then stay quiet.
 OFF_LOCK_CHECKS = 10
 WARM_RETRY_S = 5.0
+# With logind's LockedHint signal, an unlocked phone with the panel on is
+# asked only this often (a safety net); the signal makes a lock seen at
+# once. Without the signal, a dark phone is asked this often until the
+# session is loaded, so a late lock still preloads before the next wake.
+UNLOCKED_LOCK_POLL_S = 15.0
+DARK_LOCK_POLL_S = 10.0
+_LOCK_SIGNAL = re.compile(r"LockedHint|\.Session\.(Lock|Unlock) ")
 MISS_TEXT = {
     "nomatch": "Not recognized. Try again, or use your PIN.",
     "partial": "Finger not read. Cover the whole sensor and hold still.",
@@ -118,6 +125,75 @@ def wake_press(down_at: float, panel_on_at: float | None,
     if panel_on_at is None or grace_s <= 0:
         return False
     return down_at <= panel_on_at + grace_s
+
+
+def lock_signal(line: str) -> bool:
+    """A gdbus monitor line saying a session's lock state changed."""
+    return _LOCK_SIGNAL.search(line) is not None
+
+
+class LockSignals:
+    """logind lock changes, from one idle `gdbus monitor` process.
+
+    Only a hint to ask LockedHint now; the lock state itself is always read
+    with loginctl. If gdbus is missing or exits, alive is False and the
+    loop falls back to polling.
+    """
+
+    def __init__(self, argv: list[str] | None = None) -> None:
+        self.lines: queue.Queue[str | None] = queue.Queue()
+        self.alive = False
+        self.proc: subprocess.Popen[str] | None = None
+        try:
+            self.proc = subprocess.Popen(
+                argv or ["gdbus", "monitor", "--system",
+                         "--dest", "org.freedesktop.login1"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                bufsize=1,
+            )
+        except OSError:
+            return
+        self.alive = True
+        assert self.proc.stdout is not None
+        threading.Thread(
+            target=pump_lines, args=(self.proc.stdout, self.lines), daemon=True
+        ).start()
+
+    def poll(self) -> bool:
+        """True if a lock change was signalled since the last poll."""
+        seen = False
+        while True:
+            try:
+                line = self.lines.get_nowait()
+            except queue.Empty:
+                break
+            if line is None:
+                self.alive = False
+                break
+            if lock_signal(line):
+                seen = True
+        return seen
+
+    def close(self) -> None:
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(timeout=2)
+        if self.proc is not None:
+            if self.proc.returncode is None:
+                self.proc.wait(timeout=2)
+            if self.proc.stdout is not None:
+                try:
+                    self.proc.stdout.close()
+                except (OSError, ValueError):
+                    pass
+        self.alive = False
 
 
 def miss_kind(line: str) -> str | None:
@@ -775,13 +851,17 @@ class UnlockWatcher:
 
     def run_warm(self) -> None:
         self.note("watcher start (warm)")
-        loop = WarmLoop(self)
+        signals = LockSignals()
+        if not signals.alive:
+            self.note("no logind signals; polling LockedHint")
+        loop = WarmLoop(self, signals=signals)
         try:
             while True:
                 loop.step()
                 time.sleep(PANEL_POLL_S)
         finally:
             loop.stop()
+            signals.close()
 
     def run(self) -> None:
         """Idle cheaply until the panel is on, then ask logind.
@@ -937,7 +1017,9 @@ class WarmLoop:
       lock state from before the panel went off. After each result the
       session says "SERVE idle" and can be armed again.
     - Panel off: send cancel. Unlocked: quit the session, which frees the
-      sensor for the Finger app. LockedHint unknown (loginctl timed out,
+      sensor for the Finger app. The next lock (a logind LockedHint
+      signal, or a poll) starts a new session at once, while unlocked
+      screen-on or dark, so it is warm again before the next wake. LockedHint unknown (loginctl timed out,
       failed, or printed nothing): cancel, keep the session, do not arm.
     A hit unlocks only if it belongs to the auth we sent in this panel-on
     period and was not cancelled, the panel is on, logind says locked
@@ -948,8 +1030,10 @@ class WarmLoop:
     def __init__(self, watcher: "UnlockWatcher",
                  panel: Callable[[], bool] = panel_on,
                  is_locked: Callable[[str], bool | None] = locked,
-                 clock: Callable[[], float] = time.monotonic) -> None:
+                 clock: Callable[[], float] = time.monotonic,
+                 signals: "LockSignals | None" = None) -> None:
         self.w = watcher
+        self.signals = signals
         self.panel = panel
         self.is_locked = is_locked
         self.clock = clock
@@ -966,6 +1050,17 @@ class WarmLoop:
         self.sid: str | None = None
         self._step_no = 0
         self._asked_step = -1
+        self.dark_ask_at = 0.0
+        # When the panel was last seen going off -> on, and when the
+        # current press went down. For the wake-press grace.
+        self.panel_on_at: float | None = None
+        self.down_at: float | None = None
+
+    def _signalled(self) -> bool:
+        return self.signals is not None and self.signals.poll()
+
+    def _have_signals(self) -> bool:
+        return self.signals is not None and self.signals.alive
 
     def start(self) -> None:
         if self.warm is not None or self.clock() < self.retry_at:
@@ -1021,12 +1116,22 @@ class WarmLoop:
             if line.startswith("SERVE reject"):
                 self.w.note(f"warm session: {line.strip()}")
                 continue
+            if is_down(line):
+                self.down_at = self.clock()
+                continue
             fid = hit_fid(line)
             if fid is not None:
+                self.down_at = None
                 self.on_hit(fid, panel)
                 continue
             kind = miss_kind(line)
             if kind is not None:
+                at = self.clock() if self.down_at is None else self.down_at
+                self.down_at = None
+                if wake_press(at, self.panel_on_at):
+                    # The power-key press that woke the panel. Not a try.
+                    self.w.note(f"miss {kind} ignored: wake press")
+                    continue
                 # A real press was scored for an auth we sent. It counts
                 # even if the panel went off or we cancelled meanwhile.
                 if kind == "nomatch":
@@ -1083,6 +1188,9 @@ class WarmLoop:
         self._step_no += 1
         now = self.clock()
         panel = self.panel()
+        signalled = self._signalled()
+        if panel and self.prev_panel is False:
+            self.panel_on_at = now
         self.drain(panel)
         if not panel:
             self.cancel()
@@ -1090,9 +1198,20 @@ class WarmLoop:
                 self.off_checks = OFF_LOCK_CHECKS
                 self.next_lock_ask = now
             self.prev_panel = False
-            if self.off_checks and self.warm is None and now >= self.next_lock_ask:
+            if self.warm is not None:
+                return
+            due = False
+            if signalled:
+                # Locked (or unlocked) while dark: look now.
+                due = True
+            elif self.off_checks and now >= self.next_lock_ask:
                 self.off_checks -= 1
                 self.next_lock_ask = now + 1.0
+                due = True
+            elif not self._have_signals() and now >= self.dark_ask_at:
+                due = True
+            if due:
+                self.dark_ask_at = now + DARK_LOCK_POLL_S
                 if self.ask_lock() is True:
                     self.believed_locked = True
                     self.off_checks = 0
@@ -1103,8 +1222,13 @@ class WarmLoop:
             # off is not enough to arm on.
             self.next_lock_ask = now
         self.prev_panel = True
+        if signalled:
+            self.next_lock_ask = now
         if now >= self.next_lock_ask:
-            self.next_lock_ask = now + LOCK_POLL_S
+            # Locked: every LOCK_POLL_S, as before. Unlocked with logind
+            # signals: a slow safety poll only.
+            slow = not self.believed_locked and self._have_signals()
+            self.next_lock_ask = now + (UNLOCKED_LOCK_POLL_S if slow else LOCK_POLL_S)
             state = self.ask_lock()
             if state is None:
                 self.believed_locked = False
