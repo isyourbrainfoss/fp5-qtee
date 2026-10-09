@@ -168,7 +168,7 @@ The signed `focal32` image is not in this repository. Copy `focal32.mdt` and
 ```
 session/   fp5-qtee-session, wire and serve-command helpers, and their host tests
 app/       Phosh "Finger" app (idle until Enroll or Match)
-scripts/   load-qcomtee.sh for the test phone
+scripts/   load-qcomtee.sh and fp5-qtee-load.service (not installed)
 ```
 
 ## Kernel
@@ -180,9 +180,17 @@ type). That module binary and its patch against mainline `drivers/tee/qcomtee`
 are not in this tree.
 
 `scripts/load-qcomtee.sh` refuses to load when `qsee_fingerpr` is already
-loaded, and it is a no-op when `qcomtee` is already loaded. Do not `rmmod` a
-live `qsee_fingerpr`. One listener registration per boot. Do not program or
-erase the RPMB key.
+loaded, and it is a no-op when `qcomtee` is already loaded. As root it does
+not call `sudo` (a boot unit has no tty). Any other caller still uses
+`sudo -n`. Any kernel other than `7.2.0-nfc-test+` still exits 1. Do not
+`rmmod` a live `qsee_fingerpr`. One listener registration per boot. Do not
+program or erase the RPMB key.
+
+`scripts/fp5-qtee-load.service` runs that script once at boot so
+`/dev/tee0` exists without a manual `insmod`. It is a system unit in this
+repository only: it is not installed and not enabled. Copy it to
+`/etc/systemd/system/` on the phone after the script at
+`/home/user/fp5-qtee-keep/load-qcomtee.sh` is this copy.
 
 ## Build
 
