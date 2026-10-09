@@ -17,8 +17,10 @@ from fp5_qtee_unlock import (
     UnlockWatcher,
     armed,
     choose_phosh,
+    feedback_args,
     hit_fid,
     is_locked,
+    miss_kind,
     pump_lines,
     screen_is_on,
 )
@@ -86,6 +88,26 @@ class UnlockDecisionTest(unittest.TestCase):
         self.assertFalse(is_locked("LockedHint=no\n"))
 
 
+class MissTest(unittest.TestCase):
+    def test_miss_kind(self) -> None:
+        self.assertEqual(
+            miss_kind("AUTH FAIL 1 itype=0x2 esd=0 avgv=291 fid=0 rc=-11"), "nomatch"
+        )
+        self.assertEqual(miss_kind("AUTH 1 empty avgv=0,0,612"), "partial")
+        # The arm command failing is not a press.
+        self.assertIsNone(miss_kind("AUTH FAIL 1 itype=0x0 esd=0 avgv=0 rc=-1 fid=0"))
+        self.assertIsNone(miss_kind("AUTH 1 no finger"))
+        self.assertIsNone(miss_kind("AUTH HIT 1 itype=0x2 avgv=304 fid=1403494260 rc=0"))
+        self.assertIsNone(miss_kind("AUTH 1 REAL DOWN itype=0x2"))
+
+    def test_feedback_args(self) -> None:
+        self.assertEqual(
+            feedback_args("bell-terminal"),
+            ["fbcli", "-A", "org.fp5.qtee", "-E", "bell-terminal"],
+        )
+        self.assertIsNone(feedback_args(""))
+
+
 class PumpAndThrottleTest(unittest.TestCase):
     def test_pump_ends_with_none(self) -> None:
         q: queue.Queue[str | None] = queue.Queue()
@@ -125,6 +147,9 @@ class FollowTest(unittest.TestCase):
         self.unlocked: list[tuple[str, int]] = []
         self.w.unlock = lambda sid, fid: self.unlocked.append((sid, fid))  # type: ignore[method-assign]
         self.w._stop = lambda proc: proc.stop()  # type: ignore[method-assign,assignment]
+        self.misses: list[str] = []
+        self.w.tell_miss = lambda kind: self.misses.append(kind)  # type: ignore[method-assign]
+        self.w.feedback = lambda event: None  # type: ignore[method-assign]
 
     @staticmethod
     def _close_procs() -> None:
@@ -181,6 +206,13 @@ class FollowTest(unittest.TestCase):
         out = self.w.follow("c4", proc, lambda: True, poll_s=0.01)  # type: ignore[arg-type]
         self.assertEqual(out, "miss")
         self.assertEqual(self.unlocked, [])
+        self.assertEqual(self.misses, ["nomatch"])
+
+    def test_partial_press_is_told(self) -> None:
+        proc = FakeProc(["AUTH 1 empty avgv=0,0,0\n", "session_exit:2\n"], then_exit=True)
+        out = self.w.follow("c4", proc, lambda: True, poll_s=0.01)  # type: ignore[arg-type]
+        self.assertEqual(out, "miss")
+        self.assertEqual(self.misses, ["partial"])
 
     def test_lock_hint_is_throttled(self) -> None:
         asks = []
