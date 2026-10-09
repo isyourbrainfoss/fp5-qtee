@@ -25,6 +25,11 @@ runs one match (`unlock` mode, a single press). A real hit calls
 listen. A miss does not unlock. PIN still works. On 2026-10-08 the user
 confirmed that this dismisses the Phosh lock screen.
 
+The watcher reads the panel state from sysfs every 0.2 s and asks logind
+only while the panel is on. While a match waits for a finger it keeps
+checking: panel off, or an unlock with the PIN, stops the session at once.
+A hit is checked once more before `unlock-session`.
+
 Log scans, the time-listener reply, and the group-path buffer stop at the
 buffer they were given. A group path that does not fit is refused before it
 is sent. The phone session includes those checks and a one-press `unlock` mode.
