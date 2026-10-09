@@ -26,10 +26,11 @@ listen unless `FP5_QTEE_DARK_ARM=1`. A miss does not unlock and does not
 wake the screen. Only a hit can unlock. PIN still works. On 2026-10-08 the
 user confirmed that this dismisses the Phosh lock screen.
 
-The watcher reads the panel state from sysfs every 0.2 s and asks logind
-only while the panel is on. While a match waits for a finger it keeps
-checking: panel off, or an unlock with the PIN, stops the session at once.
-A hit is checked once more before `unlock-session`.
+The watcher reads the panel state from sysfs every 0.2 s and, unless
+`FP5_QTEE_DARK_ARM=1`, asks logind only while the panel is on. While a
+match waits for a finger it keeps checking: panel off, or an unlock with
+the PIN, stops the session at once. A hit is checked once more before
+`unlock-session`.
 
 A real press that does not unlock gives feedback straight away: two
 30 ms pulses, 130 ms from the start of one to the start of the next, at
@@ -58,9 +59,11 @@ The watcher follows Android's rules for when a finger may unlock:
   this off.
 - 5 rejected fingers in a row lock fingerprint unlock for 30 seconds,
   20 until the PIN is used. A match resets the count. A partial press
-  ("Finger not read") does not count. A light tap is still scored when at
-  least one of its three frames is in range (the trustlet still does the
-  match); enrollment still needs all three. The power key is the sensor,
+  ("Finger not read") does not count. A burst is scored when at least one
+  of its three frames is in range, and all three frames are sent, including
+  one with avgv 600 or more. While the finger stays down a miss is tried
+  again, up to three bursts, and then one reject is one strike. Enrollment
+  still needs all three frames in range. The power key is the sensor,
   so a no-match from the press that wakes the panel (down within
   `FP5_QTEE_WAKE_GRACE_MS`, default 400 ms, of panel-on) is ignored: no
   strike, no buzz, no notice. A hit from that press still unlocks. A scored non-match counts even if
@@ -91,8 +94,9 @@ polling and no sensor command. A finger wait also watches stdin, so
 before every interrupt check, after the finger-down query, after each
 capture and before the verdict, so a cancelled attempt never prints
 `AUTH HIT`, even if the finger was already down or had matched
-(`AUTH <n> cancelled after match`). A scored non-match is still printed as
-`AUTH FAIL` so it counts as a strike. Each `auth` starts from the
+(`AUTH <n> cancelled after match`). A scored non-match is still one
+`AUTH FAIL` for the whole press, after up to three bursts, so it counts as
+one strike. Each `auth` starts from the
 interrupt count read when it is armed, so a press while cancelled or dark
 does not carry into it. An `auth` sent while one runs gets
 `SERVE reject auth busy`, an unknown line `SERVE reject unknown`. Serve
@@ -103,8 +107,9 @@ the session locked, including in the 10 s after the panel goes off, so
 the load happens while the screen is dark. On wake it reads the panel and
 LockedHint again and only then sends `auth` (one loginctl call, so arming
 waits for it). After a miss it re-arms straight away, again after a fresh
-LockedHint. Panel off sends `cancel`. An unknown LockedHint cancels and
-does not arm. An unlock (finger or PIN) quits the session, which frees the
+LockedHint. Panel off sends `cancel`, unless `FP5_QTEE_DARK_ARM=1`.
+An unknown LockedHint cancels and does not arm. An unlock (finger or PIN)
+quits the session, which frees the
 sensor for the Finger app; nothing holds the sensor while unlocked. The
 next lock starts a new serve session at once, so it is warm again before
 the next wake: the watcher follows logind's lock signals through one idle
@@ -198,9 +203,11 @@ On the phone, Alpine gcc is enough. pthread is in musl, so there is no
 `-lpthread`. `logf` and `logl` warn against libm; leave those names.
 
 ```sh
-make -C session
-python3 app/test_fp5_qtee_coach.py
 make -C session test
+python3 app/test_fp5_qtee_unlock.py
+python3 app/test_fp5_qtee_coach.py
+python3 app/test_fp5_qtee_haptic.py
+python3 app/test_fp5_qtee_boot.py
 ```
 
 Install the session where the app already looks:
@@ -218,6 +225,57 @@ It stays idle until Enroll or Match is tapped. Hold about a second on PRESS.
 - Treat authenticate-command rc 0 as a finger match.
 - Unlink the secure-storage segment. A real unlink destroys it.
 - Program or erase the RPMB key (`req_resp=1`, listener command `0x101`).
+
+## Android parity
+
+Compared with the Android 14 capture on this phone (2026-10-09). The
+screen was off for the dark presses. Integration time was 144 or 128.
+Both matched.
+
+What matches:
+
+- Authentication captures three frames and sends all three when at least
+  one is in range, including a sibling with avgv 600 or more. A burst
+  with no in-range frame is not scored. Enrollment still requires all
+  three frames in range.
+- A miss is retried while the finger stays down, up to three bursts, and
+  then one reject is one strike. A short press that lifts sooner stops
+  early. An empty press is not a strike.
+- A match vibrates once for about 20 ms. A miss vibrates twice for 30 ms,
+  130 ms from the start of one pulse to the start of the next, at the
+  same amplitude. The silent profile plays nothing. A counted enroll
+  sample uses the match click. Lockout adds no extra vibration.
+- Five misses in a row show "Too many attempts" and lock fingerprint
+  unlock for 30 seconds. Twenty misses lock it until the PIN is used.
+  The PIN clears the lockout immediately. The notice text is the
+  notification summary, which is the line Phosh's lock screen shows.
+- A miss never wakes the screen. Only a hit can unlock. The no-match
+  from the press that turns the panel on, within 400 ms, is not a strike.
+  A hit from that press still unlocks.
+
+What does not match yet:
+
+- The focaltech IRQ (gpio 34) is not a wakeup source.
+  `enable_irq_wake()` on that IRQ is the kernel change that would let a
+  finger resume s2idle. It is not in this tree. Screen-off arming is
+  `FP5_QTEE_DARK_ARM=1` and defaults off. With the flag on, a hit only
+  asks a running panel to unblank; it cannot wake a suspended CPU.
+- There is no proximity veto. The Android capture did not gate
+  authentication on the front proximity sensor. Add one only if a real
+  match starts happening in a pocket.
+- The finger enrolled on Android (template id 1250370140) is not the
+  postmarketOS finger. The watcher uses the id the session prints.
+- The haptic timings are not confirmed on the phone. `fbcli` cannot pass
+  a custom waveform. The sysfs player (`duration`, then `activate`) is
+  what produces the milliseconds above. `app/fp5-qtee-feedback.json`
+  plays nothing until it is merged into the installed feedbackd theme.
+- `scripts/fp5-qtee-load.service` is not installed. After a reboot
+  `/dev/tee0` is still missing until that unit, or `load-qcomtee.sh`,
+  has been run on the phone.
+- The capture integration time is unchanged (Android used 144 and 128).
+  Android's detect client is not used. The 30 second lockout is the
+  length kept here; that capture did not measure the timed lockout
+  expiring on its own.
 
 ## Acknowledgement
 
