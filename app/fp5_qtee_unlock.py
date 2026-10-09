@@ -59,6 +59,9 @@ LOCKOUT_S = 30.0
 LOCKOUT_PERMANENT = 20
 # Android also wants the PIN after a restart and at least every 72 h.
 PIN_MAX_AGE_S = 72 * 3600.0
+# A locked->unlocked change this soon after our own unlock-session is ours,
+# not the PIN. Phosh clears LockedHint a little after logind unlocks.
+OUR_UNLOCK_GRACE_S = 10.0
 REQUIRE_PIN = os.environ.get("FP5_QTEE_REQUIRE_PIN_AFTER_BOOT", "1") != "0"
 POLICY_TEXT = {
     "pin-after-boot": "Unlock with your PIN once to turn on fingerprint unlock.",
@@ -115,27 +118,109 @@ def default_pin_marker() -> Path | None:
     return Path(run) / "fp5-qtee-pin-ok"
 
 
+def lockout_state_for(marker: Path | None) -> Path | None:
+    """The lockout state lives next to the PIN marker, on the same tmpfs."""
+    if marker is None:
+        return None
+    return marker.with_name("fp5-qtee-lockout")
+
+
+def _write_atomic(path: Path, text: str) -> None:
+    """Write a 0600 file so a crash mid-write never leaves half of it."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 class UnlockPolicy:
     """When a finger may unlock. Pure state, so it can be tested.
 
-    - The PIN (any unlock that was not ours) must have been used once
-      this boot, and within the last 72 h. It is remembered in a file in
-      XDG_RUNTIME_DIR, which is a tmpfs, so a reboot forgets it. The file
-      holds CLOCK_BOOTTIME, so a wall-clock jump does not change the age.
+    - The PIN must have been used once this boot, and within the last
+      72 h. It is remembered in a file in XDG_RUNTIME_DIR, which is a
+      tmpfs, so a reboot forgets it. The file holds CLOCK_BOOTTIME, so a
+      wall-clock jump does not change the age.
+    - Only a confirmed locked -> unlocked change between two LockedHint
+      samples of the same session counts as the PIN. An unknown sample
+      (loginctl timed out, failed, or printed nothing) is never an unlock
+      and breaks the chain. The first sample is never evidence of the PIN.
+      A change within OUR_UNLOCK_GRACE_S of our own unlock is ours.
     - 5 rejected fingers in a row: 30 s lockout. 20: until the PIN.
+      The count and the lockout end are kept in a state file next to the
+      PIN marker, so a watcher crash or restart does not clear them.
+      A state file that cannot be read, or a miss that cannot be saved,
+      locks fingerprint unlock until the PIN (fail closed).
     - Only a scored non-match counts. A partial press does not.
     """
 
     def __init__(self, require_pin: bool = REQUIRE_PIN,
                  marker: Path | None = None,
-                 clock: Callable[[], float] = boottime) -> None:
+                 clock: Callable[[], float] = boottime,
+                 state: Path | None = None) -> None:
         self.require_pin = require_pin
         self.marker = marker
+        self.state = state
         self.clock = clock
         self.failed = 0
         self.locked_until = 0.0
         self.prev_locked: bool | None = None
         self._pin_at: float | None = None
+        self._our_unlock_at: float | None = None
+        # True while the newest strike count is not on disk.
+        self._unsaved = False
+        self._load_state()
+
+    # -- persistence -------------------------------------------------
+
+    def _load_state(self) -> None:
+        if self.state is None:
+            return
+        try:
+            text = self.state.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            # No strikes saved. A PIN this boot writes the file, so a
+            # PIN marker without it means it was removed: fail closed.
+            if self.marker is not None and self.marker.exists():
+                self.failed = LOCKOUT_PERMANENT
+            return
+        except OSError:
+            self.failed = LOCKOUT_PERMANENT
+            return
+        parts = text.split()
+        try:
+            failed = int(parts[0])
+            until = float(parts[1])
+        except (IndexError, ValueError):
+            self.failed = LOCKOUT_PERMANENT
+            return
+        if failed < 0:
+            failed = LOCKOUT_PERMANENT
+        self.failed = failed
+        # Never wait longer than one timed lockout from now.
+        self.locked_until = min(until, self.clock() + LOCKOUT_S)
+
+    def _save_state(self) -> None:
+        if self.state is None:
+            self._unsaved = False
+            return
+        try:
+            _write_atomic(self.state, f"{self.failed} {self.locked_until:.3f}\n")
+        except OSError:
+            self._unsaved = True
+            return
+        self._unsaved = False
+
+    # -- PIN ---------------------------------------------------------
 
     def pin_at(self) -> float | None:
         if self.marker is not None:
@@ -154,34 +239,47 @@ class UnlockPolicy:
         self._pin_at = now
         self.failed = 0
         self.locked_until = 0.0
+        self._save_state()
         if self.marker is not None:
             try:
-                self.marker.write_text(f"{now:.3f}\n", encoding="utf-8")
+                _write_atomic(self.marker, f"{now:.3f}\n")
             except OSError:
                 pass
 
-    def observe_lock(self, is_locked: bool) -> None:
-        """Feed LockedHint. An unlock that was not ours means the PIN."""
+    def forget_session(self) -> None:
+        """A different (or unknown) session: no transition carries over."""
+        self.prev_locked = None
+
+    def observe_lock(self, is_locked: bool | None) -> None:
+        """Feed one LockedHint sample: True, False, or None for unknown."""
         was = self.prev_locked
         self.prev_locked = is_locked
-        if is_locked:
+        if is_locked is None or is_locked:
             return
-        if was is False:
+        # Unlocked now. Only a confirmed locked sample right before it
+        # makes this an unlock we saw happen.
+        if was is not True:
             return
-        # Unlocked now, and locked before (or first look). on_hit already
-        # marked our own unlock as unlocked, so this one was the PIN.
+        ours_at = self._our_unlock_at
+        self._our_unlock_at = None
+        if ours_at is not None and self.clock() - ours_at <= OUR_UNLOCK_GRACE_S:
+            return
         self._pin_seen()
+
+    # -- fingers -----------------------------------------------------
 
     def on_hit(self) -> None:
         """Our unlock. It must not count as the PIN."""
         self.failed = 0
         self.locked_until = 0.0
-        self.prev_locked = False
+        self._our_unlock_at = self.clock()
+        self._save_state()
 
     def on_miss(self) -> None:
         self.failed += 1
         if self.failed % LOCKOUT_EVERY == 0:
             self.locked_until = self.clock() + LOCKOUT_S
+        self._save_state()
 
     def why_not(self) -> str | None:
         """None when a finger may unlock now, else the reason."""
@@ -193,6 +291,9 @@ class UnlockPolicy:
             if now - at > PIN_MAX_AGE_S:
                 return "pin-72h"
         if self.failed >= LOCKOUT_PERMANENT:
+            return "lockout-permanent"
+        if self._unsaved and self.failed:
+            # A restart would forget this strike. Do not risk it.
             return "lockout-permanent"
         if now < self.locked_until:
             return "lockout"
@@ -255,7 +356,18 @@ def choose_phosh(props: dict[str, dict[str, str]]) -> str | None:
 
 
 def is_locked(show_text: str) -> bool:
-    return "LockedHint=yes" in show_text
+    return parse_locked(show_text) is True
+
+
+def parse_locked(show_text: str) -> bool | None:
+    """LockedHint from loginctl output: True, False, or None if absent."""
+    for line in show_text.splitlines():
+        line = line.strip()
+        if line == "LockedHint=yes":
+            return True
+        if line == "LockedHint=no":
+            return False
+    return None
 
 
 def session_bin() -> Path | None:
@@ -323,12 +435,20 @@ def panel_on() -> bool:
     return screen_is_on(read_dpms(), read_bl_power())
 
 
-def locked(sid: str) -> bool:
+def locked(sid: str) -> bool | None:
+    """LockedHint of sid. None when unknown: loginctl timed out, failed
+    (for example a stale session id), or printed no LockedHint. Callers
+    must treat None as neither locked nor unlocked."""
     try:
-        text = _run(["loginctl", "show-session", sid, "-p", "LockedHint"])
-    except subprocess.TimeoutExpired:
-        return False
-    return is_locked(text)
+        proc = subprocess.run(
+            ["loginctl", "show-session", sid, "-p", "LockedHint"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return parse_locked(proc.stdout)
 
 
 def other_session_running(our_pid: int | None) -> bool:
@@ -354,7 +474,9 @@ class UnlockWatcher:
         self._log = None
         self._sid = Throttle(SESSION_ID_TTL_S, phosh_session_id)
         self._told_this_lock = False
-        self.policy = UnlockPolicy(marker=default_pin_marker())
+        marker = default_pin_marker()
+        self.policy = UnlockPolicy(marker=marker, state=lockout_state_for(marker))
+        self._policy_sid: str | None = None
         self._told_reason: str | None = None
 
     def note(self, text: str) -> None:
@@ -413,7 +535,20 @@ class UnlockWatcher:
         if sid is None:
             # Phosh may just have registered. Ask again next time.
             self._sid.forget()
+        if sid != self._policy_sid:
+            # LockedHint changes of another session say nothing about
+            # this one.
+            self._policy_sid = sid  # type: ignore[assignment]
+            self.policy.forget_session()
         return sid  # type: ignore[return-value]
+
+    def lock_state(self, sid: str) -> bool | None:
+        """locked(sid), feeding the policy. Unknown re-reads the session id."""
+        state = locked(sid)
+        self.policy.observe_lock(state)
+        if state is None:
+            self._sid.forget()
+        return state
 
     def still_wanted(self, sid: str, lock_check: Throttle) -> bool:
         """Checked while a session waits for a finger.
@@ -425,7 +560,8 @@ class UnlockWatcher:
             return False
         if not panel_on():
             return False
-        return bool(lock_check.get())
+        # Unknown (None) is not locked: stop rather than guess.
+        return lock_check.get() is True
 
     def unlock(self, sid: str, fid: int) -> None:
         self.note(f"unlock session {sid} fid {fid}")
@@ -537,10 +673,13 @@ class UnlockWatcher:
                     self.unlock(sid, fid)
                     break
                 kind = miss_kind(line)
-                if kind is not None and wanted():
+                if kind is not None:
+                    # A scored non-match is a strike even if the panel
+                    # went off meanwhile; only the feedback is skipped.
                     if kind == "nomatch":
                         self.policy.on_miss()
-                    self.tell_miss(kind)
+                    if wanted():
+                        self.tell_miss(kind)
                     if self.policy.why_not() is not None:
                         outcome = "stop"
                         break
@@ -591,12 +730,15 @@ class UnlockWatcher:
             sid = self.session_id()
             if sid is None:
                 continue
-            if not locked(sid):
-                self.policy.observe_lock(False)
+            state = self.lock_state(sid)
+            if state is None:
+                # loginctl hung, failed, or the id is stale. Neither an
+                # unlock nor a reason to listen.
+                continue
+            if not state:
                 self._told_this_lock = False
                 self._told_reason = None
                 continue
-            self.policy.observe_lock(True)
             reason = self.policy.why_not()
             if reason is not None:
                 # The sensor is not armed at all, so nothing is spent.

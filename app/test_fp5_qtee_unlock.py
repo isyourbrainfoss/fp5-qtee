@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import queue
+import subprocess
 import tempfile
 import time
 import unittest
@@ -21,7 +22,9 @@ from fp5_qtee_unlock import (
     feedback_args,
     hit_fid,
     is_locked,
+    lockout_state_for,
     miss_kind,
+    parse_locked,
     pump_lines,
     screen_is_on,
 )
@@ -87,6 +90,43 @@ class UnlockDecisionTest(unittest.TestCase):
     def test_locked_hint(self) -> None:
         self.assertTrue(is_locked("LockedHint=yes\n"))
         self.assertFalse(is_locked("LockedHint=no\n"))
+        self.assertTrue(parse_locked("LockedHint=yes\n"))
+        self.assertFalse(parse_locked("LockedHint=no\n"))
+        self.assertIsNone(parse_locked(""))
+        self.assertIsNone(parse_locked("Failed to get session\n"))
+
+
+class LockedTriStateTest(unittest.TestCase):
+    """locked() must say "unknown", never "unlocked", when loginctl fails."""
+
+    def _run(self, rc: int = 0, out: str = "", exc: BaseException | None = None):
+        def fake(*args, **kwargs):
+            if exc is not None:
+                raise exc
+            return subprocess.CompletedProcess(args[0], rc, out, "")
+        return mock.patch.object(fp5_qtee_unlock.subprocess, "run", fake)
+
+    def test_timeout_is_unknown(self) -> None:
+        with self._run(exc=subprocess.TimeoutExpired("loginctl", 5)):
+            self.assertIsNone(fp5_qtee_unlock.locked("c4"))
+
+    def test_empty_stdout_is_unknown(self) -> None:
+        with self._run(out=""):
+            self.assertIsNone(fp5_qtee_unlock.locked("c4"))
+
+    def test_stale_session_id_is_unknown(self) -> None:
+        with self._run(rc=1, out=""):
+            self.assertIsNone(fp5_qtee_unlock.locked("c99"))
+
+    def test_missing_loginctl_is_unknown(self) -> None:
+        with self._run(exc=FileNotFoundError("loginctl")):
+            self.assertIsNone(fp5_qtee_unlock.locked("c4"))
+
+    def test_real_answers(self) -> None:
+        with self._run(out="LockedHint=yes\n"):
+            self.assertTrue(fp5_qtee_unlock.locked("c4"))
+        with self._run(out="LockedHint=no\n"):
+            self.assertIs(fp5_qtee_unlock.locked("c4"), False)
 
 
 class MissTest(unittest.TestCase):
@@ -121,14 +161,70 @@ class PolicyTest(unittest.TestCase):
         pol.observe_lock(False)  # PIN
         self.assertIsNone(pol.why_not())
 
-    def test_starting_unlocked_counts_as_pin(self) -> None:
+    def test_first_sample_is_not_pin(self) -> None:
         pol, _ = self.make()
+        pol.observe_lock(False)
+        self.assertEqual(pol.why_not(), "pin-after-boot")
+        pol.observe_lock(False)
+        self.assertEqual(pol.why_not(), "pin-after-boot")
+        pol.observe_lock(True)
         pol.observe_lock(False)
         self.assertIsNone(pol.why_not())
 
+    def test_unknown_is_never_an_unlock(self) -> None:
+        pol, _ = self.make()
+        pol.observe_lock(None)
+        self.assertEqual(pol.why_not(), "pin-after-boot")
+        pol.observe_lock(True)
+        pol.observe_lock(None)
+        pol.observe_lock(False)  # no confirmed locked sample right before
+        self.assertEqual(pol.why_not(), "pin-after-boot")
+
+    def test_loginctl_timeout_does_not_clear_lockout(self) -> None:
+        pol, now = self.make()
+        pol.observe_lock(True)
+        pol.observe_lock(False)  # PIN
+        for _ in range(20):
+            pol.on_miss()
+            now[0] += 31
+        self.assertEqual(pol.why_not(), "lockout-permanent")
+        pol.observe_lock(True)
+        for _ in range(5):
+            pol.observe_lock(None)  # loginctl stuck
+        pol.observe_lock(False)
+        self.assertEqual(pol.why_not(), "lockout-permanent")
+        self.assertEqual(pol.failed, 20)
+
+    def test_session_change_is_not_pin(self) -> None:
+        pol, _ = self.make()
+        pol.observe_lock(True)
+        pol.forget_session()
+        pol.observe_lock(False)
+        self.assertEqual(pol.why_not(), "pin-after-boot")
+
+    def test_our_unlock_with_lagging_hint_is_not_pin(self) -> None:
+        pol, now = self.make()
+        pol.observe_lock(True)
+        pol.observe_lock(False)  # PIN
+        pin = pol.pin_at()
+        now[0] += 100
+        pol.observe_lock(True)
+        pol.on_hit()
+        now[0] += 0.5
+        pol.observe_lock(True)  # Phosh has not cleared LockedHint yet
+        now[0] += 0.5
+        pol.observe_lock(False)
+        self.assertEqual(pol.pin_at(), pin)
+        # A later PIN unlock still counts.
+        pol.observe_lock(True)
+        now[0] += 1
+        pol.observe_lock(False)
+        self.assertNotEqual(pol.pin_at(), pin)
+
     def test_finger_unlock_is_not_pin(self) -> None:
         pol, now = self.make()
-        pol.observe_lock(False)
+        pol.observe_lock(True)
+        pol.observe_lock(False)  # PIN
         pol.observe_lock(True)
         now[0] += 71 * 3600
         pol.on_hit()
@@ -171,6 +267,7 @@ class PolicyTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             marker = Path(tmp) / "pin-ok"
             pol, now = self.make(marker=marker)
+            pol.observe_lock(True)
             pol.observe_lock(False)
             again, _ = self.make(marker=marker)
             self.assertIsNone(again.why_not())
@@ -178,6 +275,61 @@ class PolicyTest(unittest.TestCase):
             self.assertEqual(again.why_not(), "pin-after-boot")
             marker.write_text("junk\n")
             self.assertEqual(again.why_not(), "pin-after-boot")
+
+    def test_restart_keeps_lockout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "fp5-qtee-pin-ok"
+            state = lockout_state_for(marker)
+            now = [1000.0]
+            clock = lambda: now[0]
+            pol = UnlockPolicy(require_pin=True, marker=marker, clock=clock, state=state)
+            pol.observe_lock(True)
+            pol.observe_lock(False)  # PIN
+            for _ in range(5):
+                pol.on_miss()
+            self.assertEqual(pol.why_not(), "lockout")
+            # Crash and Restart=on-failure: a new policy from the files.
+            again = UnlockPolicy(require_pin=True, marker=marker, clock=clock, state=state)
+            self.assertEqual(again.failed, 5)
+            self.assertEqual(again.why_not(), "lockout")
+            now[0] += 31
+            self.assertIsNone(again.why_not())
+            for _ in range(15):
+                again.on_miss()
+                now[0] += 31
+            third = UnlockPolicy(require_pin=True, marker=marker, clock=clock, state=state)
+            self.assertEqual(third.why_not(), "lockout-permanent")
+            # Only a PIN clears it, and that is saved too.
+            third.observe_lock(True)
+            third.observe_lock(False)
+            fourth = UnlockPolicy(require_pin=True, marker=marker, clock=clock, state=state)
+            self.assertIsNone(fourth.why_not())
+            self.assertEqual(oct(state.stat().st_mode & 0o777), "0o600")
+
+    def test_lockout_state_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "fp5-qtee-pin-ok"
+            state = lockout_state_for(marker)
+            clock = lambda: 1000.0
+            marker.write_text("500.0\n")
+            # PIN marker but no state file: it was removed.
+            pol = UnlockPolicy(require_pin=True, marker=marker, clock=clock, state=state)
+            self.assertEqual(pol.why_not(), "lockout-permanent")
+            state.write_text("garbage\n")
+            pol = UnlockPolicy(require_pin=True, marker=marker, clock=clock, state=state)
+            self.assertEqual(pol.why_not(), "lockout-permanent")
+            # A lockout end far in the future is clamped to one lockout.
+            state.write_text("5 999999.0\n")
+            pol = UnlockPolicy(require_pin=True, marker=marker, clock=clock, state=state)
+            self.assertEqual(pol.locked_until, 1000.0 + fp5_qtee_unlock.LOCKOUT_S)
+
+    def test_unsaved_strike_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "missing-dir" / "fp5-qtee-lockout"
+            pol = UnlockPolicy(require_pin=False, marker=None, clock=lambda: 1000.0, state=state)
+            self.assertIsNone(pol.why_not())
+            pol.on_miss()
+            self.assertEqual(pol.why_not(), "lockout-permanent")
 
     def test_opt_out(self) -> None:
         pol, _ = self.make(require_pin=False)
@@ -301,6 +453,32 @@ class FollowTest(unittest.TestCase):
         self.w.follow("c4", proc, lambda: True, poll_s=0.01)  # type: ignore[arg-type]
         self.assertEqual(self.w.policy.failed, 4)
         self.assertIsNone(self.w.policy.why_not())
+
+    def test_miss_counts_even_after_panel_off(self) -> None:
+        proc = FakeProc(
+            ["AUTH FAIL 1 itype=0x2 esd=0 avgv=291 fid=0 rc=-11\n", "session_exit:2\n"],
+            then_exit=True,
+        )
+        self.w.follow("c4", proc, lambda: False, poll_s=0.01)  # type: ignore[arg-type]
+        self.assertEqual(self.w.policy.failed, 1)
+        self.assertEqual(self.misses, [])
+
+    def test_unknown_lock_state_stops(self) -> None:
+        lock = Throttle(60.0, lambda: None)
+        with mock.patch.object(fp5_qtee_unlock, "panel_on", lambda: True):
+            self.assertFalse(self.w.still_wanted("c4", lock))
+
+    def test_lock_state_timeout_keeps_lockout(self) -> None:
+        self.w.policy.observe_lock(True)
+        for _ in range(20):
+            self.w.policy.on_miss()
+        self.w.policy.observe_lock(True)
+        with mock.patch.object(fp5_qtee_unlock, "locked", lambda sid: None):
+            self.assertIsNone(self.w.lock_state("c4"))
+        self.assertEqual(self.w.policy.why_not(), "lockout-permanent")
+        with mock.patch.object(fp5_qtee_unlock, "locked", lambda sid: False):
+            self.w.lock_state("c4")
+        self.assertEqual(self.w.policy.why_not(), "lockout-permanent")
 
     def test_partial_press_is_told(self) -> None:
         proc = FakeProc(["AUTH 1 empty avgv=0,0,0\n", "session_exit:2\n"], then_exit=True)
