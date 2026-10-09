@@ -53,7 +53,12 @@ The watcher follows Android's rules for when a finger may unlock:
   this off.
 - 5 rejected fingers in a row lock fingerprint unlock for 30 seconds,
   20 until the PIN is used. A match resets the count. A partial press
-  ("Finger not read") does not count. A scored non-match counts even if
+  ("Finger not read") does not count. A light tap is still scored when at
+  least one of its three frames is in range (the trustlet still does the
+  match); enrollment still needs all three. The power key is the sensor,
+  so a no-match from the press that wakes the panel (down within
+  `FP5_QTEE_WAKE_GRACE_MS`, default 400 ms, of panel-on) is ignored: no
+  strike, no buzz, no notice. A hit from that press still unlocks. A scored non-match counts even if
   the panel went off while it was being scored. The count and the end of
   the timed lockout are kept in `$XDG_RUNTIME_DIR/fp5-qtee-lockout` (mode
   0600, written atomically), so a crash and `Restart=on-failure` keep the
