@@ -847,6 +847,84 @@ class WarmLoopTest(unittest.TestCase):
         self.step()
         self.assertEqual(len(self.started), 2)
 
+    def arm_dark(self) -> None:
+        wakes: list[str] = []
+        self.wakes = wakes
+
+        def is_locked(sid: str) -> bool | None:
+            self.lock_asks += 1
+            return self.lock[0]
+
+        self.loop = WarmLoop(
+            self.w,
+            panel=lambda: self.panel[0],
+            is_locked=is_locked,
+            clock=lambda: self.now[0],
+            dark_arm=True,
+            wake=lambda: wakes.append("wake"),
+        )
+
+    def test_dark_arm_sends_auth_while_the_panel_is_off(self) -> None:
+        self.arm_dark()
+        self.panel[0] = False
+        self.step()
+        warm = self.started[0]
+        warm.say("SERVE ready", "SERVE idle")
+        self.step()
+        self.assertEqual(warm.sent, ["auth"])
+        self.assertEqual(self.wakes, [])
+
+    def test_dark_miss_does_not_wake_or_unlock(self) -> None:
+        self.arm_dark()
+        self.panel[0] = False
+        self.step()
+        warm = self.started[0]
+        warm.say("SERVE idle")
+        self.step()
+        warm.say(self.FAIL, "SERVE result 2", "SERVE idle")
+        self.step()
+        self.assertEqual(self.w.policy.failed, 1)
+        self.assertEqual(self.wakes, [])
+        self.assertEqual(self.unlocks(), [])
+        self.assertIn(("miss", "nomatch"), self.events)
+
+    def test_dark_hit_wakes_then_unlocks(self) -> None:
+        self.arm_dark()
+        self.panel[0] = False
+        self.step()
+        warm = self.started[0]
+        warm.say("SERVE idle")
+        self.step()
+        warm.say(self.HIT)
+        self.step()
+        self.assertEqual(self.wakes, ["wake"])
+        self.assertEqual(self.unlocks(), [("unlock", "c4", 1403494260)])
+
+
+class DarkDecisionTest(unittest.TestCase):
+    def test_should_arm_and_wake(self) -> None:
+        self.assertTrue(fp5_qtee_unlock.should_arm(True, True, False))
+        self.assertFalse(fp5_qtee_unlock.should_arm(False, True, False))
+        self.assertTrue(fp5_qtee_unlock.should_arm(False, True, True))
+        self.assertFalse(fp5_qtee_unlock.should_arm(True, False, True))
+        self.assertFalse(fp5_qtee_unlock.should_wake_panel(False, False, True))
+        self.assertFalse(fp5_qtee_unlock.should_wake_panel(True, False, False))
+        self.assertFalse(fp5_qtee_unlock.should_wake_panel(True, True, True))
+        self.assertTrue(fp5_qtee_unlock.should_wake_panel(True, False, True))
+
+    def test_request_panel_on_unblanks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bl = root / "bl_power"
+            bl.write_text("4")
+            dpms_dir = root / "card0-DSI-1"
+            dpms_dir.mkdir()
+            dpms = dpms_dir / "dpms"
+            dpms.write_text("Off\n")
+            fp5_qtee_unlock.request_panel_on(bl, root)
+            self.assertEqual(bl.read_text(), "0")
+            self.assertEqual(dpms.read_text(), "on\n")
+
 
 FAKE_SERVE = r"""
 import sys

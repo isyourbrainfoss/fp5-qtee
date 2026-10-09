@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """While the Phosh lock screen is up and the panel is on, match once.
 
-A real AUTH HIT asks logind to unlock that Phosh session. A miss does not.
-The screen being off does not listen, so a pocket press cannot unlock.
-That is checked while the session waits for a finger too, not only when
-the session prints a line. Does not load qsee_fingerpr and does not use
-the Phosh PAM stack.
+A real AUTH HIT asks logind to unlock that Phosh session. A miss does not,
+and a miss never wakes the screen. The screen being off does not listen,
+so a pocket press cannot unlock, unless FP5_QTEE_DARK_ARM=1. Only a hit
+can unlock. That is checked while the session waits for a finger too, not
+only when the session prints a line. Does not load qsee_fingerpr and does
+not use the Phosh PAM stack.
 """
 
 from __future__ import annotations
@@ -79,6 +80,12 @@ POLICY_TEXT = {
 # so a wake only has to arm the sensor. Opt in until it is proven on more
 # phones: FP5_QTEE_WARM=1.
 WARM = os.environ.get("FP5_QTEE_WARM", "0") == "1"
+# Screen-off arming. Default off: the focaltech IRQ (gpio34) is not a
+# wakeup source, so a dark press cannot resume s2idle. The kernel change
+# that would make it one is enable_irq_wake() on that IRQ. This tree does
+# not patch the kernel. With the flag on, a hit may ask the panel to come
+# on; a miss never does, and only a hit can unlock.
+DARK_ARM = os.environ.get("FP5_QTEE_DARK_ARM", "0") == "1"
 # After the panel goes off, ask LockedHint once a second this many times,
 # so the session can load while the screen is dark. Then stay quiet.
 OFF_LOCK_CHECKS = 10
@@ -94,6 +101,38 @@ MISS_TEXT = {
     "nomatch": "Not recognized. Try again, or use your PIN.",
     "partial": "Finger not read. Cover the whole sensor and hold still.",
 }
+
+
+def should_arm(panel: bool, locked: bool, dark_arm: bool) -> bool:
+    """Send auth while the panel is on, or in the dark when opted in."""
+    if not locked:
+        return False
+    return panel or dark_arm
+
+
+def should_wake_panel(hit: bool, panel_on_now: bool, dark_arm: bool) -> bool:
+    """A miss never wakes. A hit wakes only for an opted-in dark arm."""
+    return bool(hit and dark_arm and not panel_on_now)
+
+
+def request_panel_on(backlight: Path = BACKLIGHT, drm: Path = DSI_DPMS) -> None:
+    """Best-effort panel on. This does not wake a suspended CPU.
+
+    bl_power 0 is FB_BLANK_UNBLANK. dpms "on" is the DRM power mode. Until
+    enable_irq_wake() is set on the focaltech IRQ (gpio34), a press while
+    the CPU is in s2idle never reaches this.
+    """
+    try:
+        backlight.write_text("0")
+    except OSError:
+        pass
+    if not drm.is_dir():
+        return
+    for path in sorted(drm.glob("card*-DSI-*/dpms")):
+        try:
+            path.write_text("on\n")
+        except OSError:
+            pass
 
 
 def hit_fid(line: str) -> int | None:
@@ -596,6 +635,8 @@ class UnlockWatcher:
         marker = default_pin_marker()
         self.policy = UnlockPolicy(marker=marker, state=lockout_state_for(marker))
         self.haptic = Haptic()
+        # main() copies DARK_ARM onto this. Tests leave it off.
+        self.dark_arm = False
         self._policy_sid: str | None = None
         self._told_reason: str | None = None
         # monotonic time the panel was last seen going off -> on.
@@ -687,10 +728,14 @@ class UnlockWatcher:
         """
         if OLD_DRIVER.is_dir():
             return False
-        if not panel_on():
+        if not panel_on() and not self.dark_arm:
             return False
         # Unknown (None) is not locked: stop rather than guess.
         return lock_check.get() is True
+
+    def wake_panel(self) -> None:
+        """Ask the panel to come on. Never called for a miss."""
+        request_panel_on()
 
     def unlock(self, sid: str, fid: int) -> None:
         self.note(f"unlock session {sid} fid {fid}")
@@ -791,8 +836,13 @@ class UnlockWatcher:
                     down_at = self._clock()
                 fid = hit_fid(line)
                 if fid is not None:
+                    # A hit in the dark can turn the panel on. A miss never
+                    # reaches this, so it cannot wake the screen.
+                    if self.dark_arm and should_wake_panel(True, panel_on(), True):
+                        self.wake_panel()
                     # A press that landed just as the panel went off
-                    # must not unlock.
+                    # must not unlock, unless dark arming is on and the
+                    # session is still locked.
                     if not wanted():
                         outcome = "stop"
                         break
@@ -864,7 +914,7 @@ class UnlockWatcher:
         signals = LockSignals()
         if not signals.alive:
             self.note("no logind signals; polling LockedHint")
-        loop = WarmLoop(self, signals=signals)
+        loop = WarmLoop(self, signals=signals, dark_arm=self.dark_arm)
         try:
             while True:
                 loop.step()
@@ -877,21 +927,25 @@ class UnlockWatcher:
         """Idle cheaply until the panel is on, then ask logind.
 
         The panel is a sysfs read every PANEL_POLL_S, so a wake is seen
-        within about 0.2 s. loginctl runs only while the panel is on.
+        within about 0.2 s. loginctl runs only while the panel is on,
+        unless dark arming is opted in.
         """
         self.note("watcher start")
         last_lock_ask = 0.0
         was_on = True
         while True:
-            if not panel_on():
+            on = panel_on()
+            if not on and not self.dark_arm:
                 # Ask logind as soon as the panel comes back on.
                 last_lock_ask = 0.0
                 was_on = False
                 time.sleep(PANEL_POLL_S)
                 continue
-            if not was_on:
+            if on and not was_on:
                 was_on = True
                 self.panel_on_at = time.monotonic()
+            elif not on:
+                was_on = False
             now = time.monotonic()
             if now - last_lock_ask < LOCK_POLL_S and last_lock_ask:
                 time.sleep(PANEL_POLL_S)
@@ -1026,27 +1080,33 @@ class WarmLoop:
       again immediately before every auth, so a wake never arms on the
       lock state from before the panel went off. After each result the
       session says "SERVE idle" and can be armed again.
-    - Panel off: send cancel. Unlocked: quit the session, which frees the
-      sensor for the Finger app. The next lock (a logind LockedHint
-      signal, or a poll) starts a new session at once, while unlocked
-      screen-on or dark, so it is warm again before the next wake. LockedHint unknown (loginctl timed out,
-      failed, or printed nothing): cancel, keep the session, do not arm.
+    - Panel off: send cancel, unless dark_arm is set. Unlocked: quit the
+      session, which frees the sensor for the Finger app. The next lock (a
+      logind LockedHint signal, or a poll) starts a new session at once,
+      while unlocked screen-on or dark, so it is warm again before the next
+      wake. LockedHint unknown (loginctl timed out, failed, or printed
+      nothing): cancel, keep the session, do not arm.
     A hit unlocks only if it belongs to the auth we sent in this panel-on
-    period and was not cancelled, the panel is on, logind says locked
-    right now, and the policy allows it. A scored non-match is a strike
-    whatever the panel did meanwhile; only the feedback needs the panel.
+    period and was not cancelled, the panel is on (or dark_arm is set),
+    logind says locked right now, and the policy allows it. A scored
+    non-match is a strike whatever the panel did meanwhile. It never wakes
+    the screen. Feedback in the dark is played only when dark_arm is set.
     """
 
     def __init__(self, watcher: "UnlockWatcher",
                  panel: Callable[[], bool] = panel_on,
                  is_locked: Callable[[str], bool | None] = locked,
                  clock: Callable[[], float] = time.monotonic,
-                 signals: "LockSignals | None" = None) -> None:
+                 signals: "LockSignals | None" = None,
+                 dark_arm: bool = False,
+                 wake: Callable[[], None] | None = None) -> None:
         self.w = watcher
         self.signals = signals
         self.panel = panel
         self.is_locked = is_locked
         self.clock = clock
+        self.dark_arm = dark_arm
+        self.wake = wake if wake is not None else watcher.wake_panel
         self.warm: WarmSession | None = None
         self.armed = False
         # True from sending auth until that attempt is cancelled, the
@@ -1146,7 +1206,11 @@ class WarmLoop:
                 # even if the panel went off or we cancelled meanwhile.
                 if kind == "nomatch":
                     self.w.policy.on_miss()
-                if panel and self.believed_locked and self.attempt_live:
+                # A miss never wakes the panel. In the dark the double
+                # pulse still plays when dark arming is on.
+                if self.believed_locked and self.attempt_live and (
+                    panel or self.dark_arm
+                ):
                     self.w.tell_miss(kind)
         if dead or not warm.alive():
             self.w.note("warm session ended")
@@ -1158,18 +1222,22 @@ class WarmLoop:
         self.attempt_live = False
         sid = self.sid
         if not live:
-            # After cancel, after panel-off, or not from an auth we sent
-            # in this panel-on period.
+            # After cancel, after panel-off (unless dark arming), or not
+            # from an auth we sent for this attempt.
             self.w.note("hit refused: attempt was cancelled or stale")
             return
-        if not panel or not self.believed_locked or sid is None:
+        if not self.believed_locked or sid is None:
             return
-        if not self.panel():
+        if not panel and not self.dark_arm:
+            return
+        if not self.dark_arm and not self.panel():
             return
         if self.w.policy.why_not() is not None:
             return
         if self.is_locked(sid) is not True:
             return
+        if should_wake_panel(True, panel, self.dark_arm):
+            self.wake()
         self.w.policy.on_hit()
         self.w.tell_hit()
         self.w.unlock(sid, fid)
@@ -1202,7 +1270,7 @@ class WarmLoop:
         if panel and self.prev_panel is False:
             self.panel_on_at = now
         self.drain(panel)
-        if not panel:
+        if not panel and not self.dark_arm:
             self.cancel()
             if self.prev_panel:
                 self.off_checks = OFF_LOCK_CHECKS
@@ -1227,11 +1295,11 @@ class WarmLoop:
                     self.off_checks = 0
                     self.start()
             return
-        if not self.prev_panel:
-            # Waking: ask logind now. The lock seen before the panel went
-            # off is not enough to arm on.
+        # Panel on, or dark arming. Ask logind on the first step and on
+        # off -> on. Staying dark must not ask on every poll.
+        if (panel and not self.prev_panel) or self.prev_panel is None:
             self.next_lock_ask = now
-        self.prev_panel = True
+        self.prev_panel = panel
         if signalled:
             self.next_lock_ask = now
         if now >= self.next_lock_ask:
@@ -1263,9 +1331,9 @@ class WarmLoop:
         warm = self.warm
         if warm is None or not warm.idle or self.armed:
             return
-        # Immediately before arming: the panel, and LockedHint unless it
-        # was read in this very step.
-        if not self.panel():
+        # Immediately before arming: the panel (unless dark arming), and
+        # LockedHint unless it was read in this very step.
+        if not should_arm(self.panel(), True, self.dark_arm):
             return
         if self._asked_step != self._step_no:
             self.next_lock_ask = now + LOCK_POLL_S
@@ -1288,6 +1356,7 @@ class WarmLoop:
 
 def main() -> None:
     watcher = UnlockWatcher()
+    watcher.dark_arm = DARK_ARM
     if WARM:
         watcher.run_warm()
     else:

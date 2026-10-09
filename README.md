@@ -22,8 +22,9 @@ Phosh does not ask PAM until a PIN is submitted, so the finger is not a PAM
 module. While the lock screen is showing and the panel is on, `fp5-qtee-unlock`
 runs one match (`unlock` mode, a single press). A real hit calls
 `loginctl unlock-session` on the Phosh session. The panel being off does not
-listen. A miss does not unlock. PIN still works. On 2026-10-08 the user
-confirmed that this dismisses the Phosh lock screen.
+listen unless `FP5_QTEE_DARK_ARM=1`. A miss does not unlock and does not
+wake the screen. Only a hit can unlock. PIN still works. On 2026-10-08 the
+user confirmed that this dismisses the Phosh lock screen.
 
 The watcher reads the panel state from sysfs every 0.2 s and asks logind
 only while the panel is on. While a match waits for a finger it keeps
@@ -125,6 +126,25 @@ systemctl --user edit fp5-qtee-unlock.service
 # [Service]
 # Environment=FP5_QTEE_WARM=1
 ```
+
+### Screen off (`FP5_QTEE_DARK_ARM`, default off)
+
+The focaltech fingerprint IRQ is not a wakeup source on this kernel, so a
+press cannot resume the CPU from s2idle. The kernel change that would make
+it one is `enable_irq_wake()` on that IRQ, which is gpio 34. This
+repository does not patch the kernel.
+
+With the flag unset, a dark phone does not arm the sensor and a press
+cannot unlock. Warm mode may still preload the session while the phone is
+locked and dark; it does not treat that press as a wake. The no-match from
+the power-key press that turns the panel on is still ignored for
+`FP5_QTEE_WAKE_GRACE_MS` (default 400 ms). A hit from that press still
+unlocks.
+
+`FP5_QTEE_DARK_ARM=1` arms while the panel is off. A hit then writes `0`
+to the backlight `bl_power` file and `on` to the DSI `dpms` file. A miss
+never does that, and only a hit can unlock. The write cannot resume a
+suspended CPU until `enable_irq_wake()` is in place.
 
 Log scans, the time-listener reply, and the group-path buffer stop at the
 buffer they were given. A group path that does not fit is refused before it
