@@ -90,6 +90,16 @@ It stays idle until Enroll or Match is tapped. Hold about a second on PRESS.
 - Unlink the secure-storage segment. A real unlink destroys it.
 - Program or erase the RPMB key (`req_resp=1`, listener command `0x101`).
 
+## Acknowledgement
+
+Catcrafts' [Fairphone 6 fingerprint bring-up](https://catcrafts.net/posts/fairphone-6-postmarketos-fully-working-fingerprint-sensor)
+is what moved this project off the in-kernel `qsee_fingerpr` Register path.
+Their stack enrolls and matches a signed trustlet from userspace over QTEE
+([fingerprintd](https://forgejo.catcrafts.net/Catcrafts/fingerprintd)).
+This tree is that idea on Fairphone 5: a userspace session over `qcomtee`
+and `/dev/tee0`, talking to the signed `focal32` trustlet. It is not their
+daemon, and it does not use their FP6 opcodes.
+
 ## License
 
 GPL-2.0-only for the C session. See `LICENSE`.
