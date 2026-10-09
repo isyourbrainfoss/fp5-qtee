@@ -38,6 +38,20 @@ notification ("Not recognized" or "Finger not read"). Set
 haptic off. `FP5_QTEE_HIT_EVENT` (empty by default) does the same for a
 match. Put either in a systemd drop-in for `fp5-qtee-unlock.service`.
 
+The watcher follows Android's rules for when a finger may unlock:
+
+- The PIN must be used once after each boot, and again if the last PIN
+  unlock is more than 72 hours old. Any unlock the watcher did not do
+  itself counts as the PIN. It is kept in `$XDG_RUNTIME_DIR/fp5-qtee-pin-ok`
+  (a tmpfs, so a reboot or logout forgets it).
+  `FP5_QTEE_REQUIRE_PIN_AFTER_BOOT=0` turns this off.
+- 5 rejected fingers in a row lock fingerprint unlock for 30 seconds,
+  20 until the PIN is used. A match resets the count. A partial press
+  ("Finger not read") does not count.
+
+While one of these applies the sensor is not armed at all, and one
+notification says why.
+
 Log scans, the time-listener reply, and the group-path buffer stop at the
 buffer they were given. A group path that does not fit is refused before it
 is sent. The phone session includes those checks and a one-press `unlock` mode.

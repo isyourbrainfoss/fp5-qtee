@@ -14,6 +14,7 @@ from unittest import mock
 import fp5_qtee_unlock
 from fp5_qtee_unlock import (
     Throttle,
+    UnlockPolicy,
     UnlockWatcher,
     armed,
     choose_phosh,
@@ -108,6 +109,82 @@ class MissTest(unittest.TestCase):
         self.assertIsNone(feedback_args(""))
 
 
+class PolicyTest(unittest.TestCase):
+    def make(self, require_pin: bool = True, marker: Path | None = None) -> tuple[UnlockPolicy, list[float]]:
+        now = [1000.0]
+        return UnlockPolicy(require_pin=require_pin, marker=marker, clock=lambda: now[0]), now
+
+    def test_pin_needed_after_boot(self) -> None:
+        pol, _ = self.make()
+        pol.observe_lock(True)
+        self.assertEqual(pol.why_not(), "pin-after-boot")
+        pol.observe_lock(False)  # PIN
+        self.assertIsNone(pol.why_not())
+
+    def test_starting_unlocked_counts_as_pin(self) -> None:
+        pol, _ = self.make()
+        pol.observe_lock(False)
+        self.assertIsNone(pol.why_not())
+
+    def test_finger_unlock_is_not_pin(self) -> None:
+        pol, now = self.make()
+        pol.observe_lock(False)
+        pol.observe_lock(True)
+        now[0] += 71 * 3600
+        pol.on_hit()
+        pol.observe_lock(False)
+        pol.observe_lock(True)
+        now[0] += 2 * 3600
+        self.assertEqual(pol.why_not(), "pin-72h")
+        pol.observe_lock(False)  # PIN again
+        self.assertIsNone(pol.why_not())
+
+    def test_timed_and_permanent_lockout(self) -> None:
+        pol, now = self.make(require_pin=False)
+        for _ in range(4):
+            pol.on_miss()
+        self.assertIsNone(pol.why_not())
+        pol.on_miss()
+        self.assertEqual(pol.why_not(), "lockout")
+        now[0] += 29
+        self.assertEqual(pol.why_not(), "lockout")
+        now[0] += 1
+        self.assertIsNone(pol.why_not())
+        for _ in range(15):
+            pol.on_miss()
+            now[0] += 31
+        self.assertEqual(pol.failed, 20)
+        self.assertEqual(pol.why_not(), "lockout-permanent")
+        pol.observe_lock(True)
+        pol.observe_lock(False)  # PIN clears it
+        self.assertIsNone(pol.why_not())
+
+    def test_hit_resets_count(self) -> None:
+        pol, _ = self.make(require_pin=False)
+        for _ in range(4):
+            pol.on_miss()
+        pol.on_hit()
+        pol.on_miss()
+        self.assertIsNone(pol.why_not())
+
+    def test_marker_survives_restart_and_ignores_old_boot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "pin-ok"
+            pol, now = self.make(marker=marker)
+            pol.observe_lock(False)
+            again, _ = self.make(marker=marker)
+            self.assertIsNone(again.why_not())
+            marker.write_text("999999.0\n")  # later than now: earlier boot
+            self.assertEqual(again.why_not(), "pin-after-boot")
+            marker.write_text("junk\n")
+            self.assertEqual(again.why_not(), "pin-after-boot")
+
+    def test_opt_out(self) -> None:
+        pol, _ = self.make(require_pin=False)
+        pol.observe_lock(True)
+        self.assertIsNone(pol.why_not())
+
+
 class PumpAndThrottleTest(unittest.TestCase):
     def test_pump_ends_with_none(self) -> None:
         q: queue.Queue[str | None] = queue.Queue()
@@ -150,6 +227,7 @@ class FollowTest(unittest.TestCase):
         self.misses: list[str] = []
         self.w.tell_miss = lambda kind: self.misses.append(kind)  # type: ignore[method-assign]
         self.w.feedback = lambda event: None  # type: ignore[method-assign]
+        self.w.policy = UnlockPolicy(require_pin=False, marker=None)
 
     @staticmethod
     def _close_procs() -> None:
@@ -207,6 +285,22 @@ class FollowTest(unittest.TestCase):
         self.assertEqual(out, "miss")
         self.assertEqual(self.unlocked, [])
         self.assertEqual(self.misses, ["nomatch"])
+
+    def test_hit_refused_during_lockout(self) -> None:
+        for _ in range(5):
+            self.w.policy.on_miss()
+        proc = FakeProc(["AUTH HIT 1 itype=0x2 avgv=304 fid=1403494260 rc=0\n"])
+        out = self.w.follow("c4", proc, lambda: True, poll_s=0.01)  # type: ignore[arg-type]
+        self.assertEqual(out, "stop")
+        self.assertEqual(self.unlocked, [])
+
+    def test_partial_does_not_count(self) -> None:
+        for _ in range(4):
+            self.w.policy.on_miss()
+        proc = FakeProc(["AUTH 1 empty avgv=0,0,0\n", "session_exit:2\n"], then_exit=True)
+        self.w.follow("c4", proc, lambda: True, poll_s=0.01)  # type: ignore[arg-type]
+        self.assertEqual(self.w.policy.failed, 4)
+        self.assertIsNone(self.w.policy.why_not())
 
     def test_partial_press_is_told(self) -> None:
         proc = FakeProc(["AUTH 1 empty avgv=0,0,0\n", "session_exit:2\n"], then_exit=True)

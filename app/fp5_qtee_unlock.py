@@ -52,6 +52,20 @@ _PARTIAL = re.compile(r"^AUTH \d+ empty ")
 MISS_EVENT = os.environ.get("FP5_QTEE_MISS_EVENT", "bell-terminal")
 HIT_EVENT = os.environ.get("FP5_QTEE_HIT_EVENT", "")
 FEEDBACK_APP_ID = "org.fp5.qtee"
+# Android's lockout (AOSP FingerprintService): 5 rejected fingers lock the
+# sensor for 30 s, 20 lock it until the PIN is used.
+LOCKOUT_EVERY = 5
+LOCKOUT_S = 30.0
+LOCKOUT_PERMANENT = 20
+# Android also wants the PIN after a restart and at least every 72 h.
+PIN_MAX_AGE_S = 72 * 3600.0
+REQUIRE_PIN = os.environ.get("FP5_QTEE_REQUIRE_PIN_AFTER_BOOT", "1") != "0"
+POLICY_TEXT = {
+    "pin-after-boot": "Unlock with your PIN once to turn on fingerprint unlock.",
+    "pin-72h": "Fingerprint unlock needs your PIN every 72 hours.",
+    "lockout": "Too many attempts. Try again in 30 seconds, or use your PIN.",
+    "lockout-permanent": "Too many attempts. Unlock with your PIN.",
+}
 MISS_TEXT = {
     "nomatch": "Not recognized. Try again, or use your PIN.",
     "partial": "Finger not read. Cover the whole sensor and hold still.",
@@ -87,6 +101,102 @@ def feedback_args(event: str) -> list[str] | None:
     if not event:
         return None
     return ["fbcli", "-A", FEEDBACK_APP_ID, "-E", event]
+
+
+def boottime() -> float:
+    """Seconds since boot, counting suspend. Resets on reboot."""
+    return time.clock_gettime(time.CLOCK_BOOTTIME)
+
+
+def default_pin_marker() -> Path | None:
+    run = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    if not os.path.isdir(run):
+        return None
+    return Path(run) / "fp5-qtee-pin-ok"
+
+
+class UnlockPolicy:
+    """When a finger may unlock. Pure state, so it can be tested.
+
+    - The PIN (any unlock that was not ours) must have been used once
+      this boot, and within the last 72 h. It is remembered in a file in
+      XDG_RUNTIME_DIR, which is a tmpfs, so a reboot forgets it. The file
+      holds CLOCK_BOOTTIME, so a wall-clock jump does not change the age.
+    - 5 rejected fingers in a row: 30 s lockout. 20: until the PIN.
+    - Only a scored non-match counts. A partial press does not.
+    """
+
+    def __init__(self, require_pin: bool = REQUIRE_PIN,
+                 marker: Path | None = None,
+                 clock: Callable[[], float] = boottime) -> None:
+        self.require_pin = require_pin
+        self.marker = marker
+        self.clock = clock
+        self.failed = 0
+        self.locked_until = 0.0
+        self.prev_locked: bool | None = None
+        self._pin_at: float | None = None
+
+    def pin_at(self) -> float | None:
+        if self.marker is not None:
+            try:
+                value = float(self.marker.read_text(encoding="utf-8").strip())
+            except (OSError, ValueError):
+                value = None
+            # A value from the future is from an earlier boot.
+            if value is not None and value <= self.clock():
+                return value
+            return None
+        return self._pin_at
+
+    def _pin_seen(self) -> None:
+        now = self.clock()
+        self._pin_at = now
+        self.failed = 0
+        self.locked_until = 0.0
+        if self.marker is not None:
+            try:
+                self.marker.write_text(f"{now:.3f}\n", encoding="utf-8")
+            except OSError:
+                pass
+
+    def observe_lock(self, is_locked: bool) -> None:
+        """Feed LockedHint. An unlock that was not ours means the PIN."""
+        was = self.prev_locked
+        self.prev_locked = is_locked
+        if is_locked:
+            return
+        if was is False:
+            return
+        # Unlocked now, and locked before (or first look). on_hit already
+        # marked our own unlock as unlocked, so this one was the PIN.
+        self._pin_seen()
+
+    def on_hit(self) -> None:
+        """Our unlock. It must not count as the PIN."""
+        self.failed = 0
+        self.locked_until = 0.0
+        self.prev_locked = False
+
+    def on_miss(self) -> None:
+        self.failed += 1
+        if self.failed % LOCKOUT_EVERY == 0:
+            self.locked_until = self.clock() + LOCKOUT_S
+
+    def why_not(self) -> str | None:
+        """None when a finger may unlock now, else the reason."""
+        now = self.clock()
+        if self.require_pin:
+            at = self.pin_at()
+            if at is None:
+                return "pin-after-boot"
+            if now - at > PIN_MAX_AGE_S:
+                return "pin-72h"
+        if self.failed >= LOCKOUT_PERMANENT:
+            return "lockout-permanent"
+        if now < self.locked_until:
+            return "lockout"
+        return None
 
 
 def pump_lines(stream: Iterable[str], out: "queue.Queue[str | None]") -> None:
@@ -244,6 +354,8 @@ class UnlockWatcher:
         self._log = None
         self._sid = Throttle(SESSION_ID_TTL_S, phosh_session_id)
         self._told_this_lock = False
+        self.policy = UnlockPolicy(marker=default_pin_marker())
+        self._told_reason: str | None = None
 
     def note(self, text: str) -> None:
         stamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -416,13 +528,22 @@ class UnlockWatcher:
                     if not wanted():
                         outcome = "stop"
                         break
+                    if self.policy.why_not() is not None:
+                        outcome = "stop"
+                        break
                     outcome = "hit"
+                    self.policy.on_hit()
                     self.feedback(HIT_EVENT)
                     self.unlock(sid, fid)
                     break
                 kind = miss_kind(line)
                 if kind is not None and wanted():
+                    if kind == "nomatch":
+                        self.policy.on_miss()
                     self.tell_miss(kind)
+                    if self.policy.why_not() is not None:
+                        outcome = "stop"
+                        break
                 if not wanted():
                     outcome = "stop"
                     break
@@ -471,8 +592,20 @@ class UnlockWatcher:
             if sid is None:
                 continue
             if not locked(sid):
+                self.policy.observe_lock(False)
                 self._told_this_lock = False
+                self._told_reason = None
                 continue
+            self.policy.observe_lock(True)
+            reason = self.policy.why_not()
+            if reason is not None:
+                # The sensor is not armed at all, so nothing is spent.
+                if reason != self._told_reason:
+                    self._told_reason = reason
+                    self.note(f"not listening: {reason}")
+                    self.notify(POLICY_TEXT[reason])
+                continue
+            self._told_reason = None
             if other_session_running(None):
                 time.sleep(LOCK_POLL_S)
                 continue
