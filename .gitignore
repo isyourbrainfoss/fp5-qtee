@@ -7,4 +7,3 @@ session/test_fp5_cmd
 *.ko
 __pycache__/
 *.pyc
-session/test_fp5_cmd
