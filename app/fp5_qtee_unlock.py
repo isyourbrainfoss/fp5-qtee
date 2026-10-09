@@ -38,6 +38,24 @@ LOCK_POLL_S = 1.0
 SESSION_ID_TTL_S = 30.0
 _HIT = re.compile(r"^AUTH HIT \d+ .* fid=(\d+) ")
 _ARM = re.compile(r"^AUTH \d+ arm ")
+# auth_once prints these after a real finger-down (itype 0x2):
+#   AUTH FAIL <n> itype=0x2 ...   the image was scored and did not match
+#   AUTH <n> empty avgv=...       the finger was too light or partial
+# An AUTH FAIL with itype 0x0 is the arm command failing, not a press.
+_NOMATCH = re.compile(r"^AUTH FAIL \d+ itype=0x2 ")
+_PARTIAL = re.compile(r"^AUTH \d+ empty ")
+# feedbackd event for a press that did not unlock. The standard event
+# names have no "authentication failed" yet. bell-terminal is a single
+# 100 ms rumble in the default theme's quiet profile, with no sound in
+# full, and nothing in silent. Override with FP5_QTEE_MISS_EVENT, or set
+# it empty to turn the haptic off.
+MISS_EVENT = os.environ.get("FP5_QTEE_MISS_EVENT", "bell-terminal")
+HIT_EVENT = os.environ.get("FP5_QTEE_HIT_EVENT", "")
+FEEDBACK_APP_ID = "org.fp5.qtee"
+MISS_TEXT = {
+    "nomatch": "Not recognized. Try again, or use your PIN.",
+    "partial": "Finger not read. Cover the whole sensor and hold still.",
+}
 
 
 def hit_fid(line: str) -> int | None:
@@ -52,6 +70,23 @@ def hit_fid(line: str) -> int | None:
 
 def armed(line: str) -> bool:
     return _ARM.match(line.strip()) is not None
+
+
+def miss_kind(line: str) -> str | None:
+    """nomatch or partial for a real press that did not unlock, else None."""
+    text = line.strip()
+    if _NOMATCH.match(text):
+        return "nomatch"
+    if _PARTIAL.match(text):
+        return "partial"
+    return None
+
+
+def feedback_args(event: str) -> list[str] | None:
+    """fbcli command for a feedbackd event, or None when turned off."""
+    if not event:
+        return None
+    return ["fbcli", "-A", FEEDBACK_APP_ID, "-E", event]
 
 
 def pump_lines(stream: Iterable[str], out: "queue.Queue[str | None]") -> None:
@@ -230,6 +265,37 @@ class UnlockWatcher:
         except (OSError, subprocess.TimeoutExpired):
             pass
 
+    def _background(self, args: list[str]) -> None:
+        def go() -> None:
+            try:
+                subprocess.run(
+                    args,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    timeout=5,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+        threading.Thread(target=go, daemon=True).start()
+
+    def feedback(self, event: str) -> None:
+        """Haptic through feedbackd, so the user's profile applies."""
+        args = feedback_args(event)
+        if args is not None:
+            self._background(args)
+
+    def tell_miss(self, kind: str) -> None:
+        """A finger was read and did not unlock. Say so right away."""
+        self.note(f"miss {kind}")
+        self.feedback(MISS_EVENT)
+        # Transient, so misses do not pile up in the notification list.
+        self._background(
+            ["notify-send", "-h", "boolean:transient:true", "-t", "2500",
+             "-a", "Fingerprint", "Fingerprint", MISS_TEXT[kind]]
+        )
+
     def session_id(self) -> str | None:
         sid = self._sid.get()
         if sid is None:
@@ -351,8 +417,12 @@ class UnlockWatcher:
                         outcome = "stop"
                         break
                     outcome = "hit"
+                    self.feedback(HIT_EVENT)
                     self.unlock(sid, fid)
                     break
+                kind = miss_kind(line)
+                if kind is not None and wanted():
+                    self.tell_miss(kind)
                 if not wanted():
                     outcome = "stop"
                     break
