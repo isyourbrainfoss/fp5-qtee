@@ -1,0 +1,39 @@
+{
+  "name": "fp5-qtee",
+  "profiles": [
+    {
+      "name": "full",
+      "feedbacks": [
+        {
+          "event-name": "fp5-qtee-match",
+          "type": "VibraPattern",
+          "magnitudes": [1.0],
+          "durations": [20]
+        },
+        {
+          "event-name": "fp5-qtee-miss",
+          "type": "VibraPattern",
+          "magnitudes": [1.0, 0.0, 1.0],
+          "durations": [30, 100, 30]
+        }
+      ]
+    },
+    {
+      "name": "quiet",
+      "feedbacks": [
+        {
+          "event-name": "fp5-qtee-match",
+          "type": "VibraPattern",
+          "magnitudes": [1.0],
+          "durations": [20]
+        },
+        {
+          "event-name": "fp5-qtee-miss",
+          "type": "VibraPattern",
+          "magnitudes": [1.0, 0.0, 1.0],
+          "durations": [30, 100, 30]
+        }
+      ]
+    }
+  ]
+}

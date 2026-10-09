@@ -30,13 +30,17 @@ only while the panel is on. While a match waits for a finger it keeps
 checking: panel off, or an unlock with the PIN, stops the session at once.
 A hit is checked once more before `unlock-session`.
 
-A real press that does not unlock gives feedback straight away: a
-feedbackd event (`fbcli -A org.fp5.qtee -E bell-terminal`, a short rumble
-in the default theme, nothing in the silent profile) and a transient
-notification ("Not recognized" or "Finger not read"). Set
-`FP5_QTEE_MISS_EVENT` to another event name, or to empty to turn the
-haptic off. `FP5_QTEE_HIT_EVENT` (empty by default) does the same for a
-match. Put either in a systemd drop-in for `fp5-qtee-unlock.service`.
+A real press that does not unlock gives feedback straight away: two
+30 ms pulses, 130 ms from the start of one to the start of the next, at
+the same amplitude, plus a transient notification ("Not recognized" or
+"Finger not read"). A match is a single 20 ms click. The silent
+feedbackd profile plays nothing. Lockout adds no extra vibration. Each
+counted enroll sample in the Finger app uses that same click. The
+waveform is written to the aw86927 LED device (`duration` then
+`activate`) when that device is present, and otherwise named as the
+feedbackd events `fp5-qtee-match` and `fp5-qtee-miss`
+(`app/fp5-qtee-feedback.json`, which plays nothing until it is merged
+into the installed theme). `FP5_QTEE_HAPTIC=0` turns both off.
 
 The watcher follows Android's rules for when a finger may unlock:
 

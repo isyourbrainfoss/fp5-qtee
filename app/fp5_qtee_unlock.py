@@ -20,6 +20,8 @@ import time
 from pathlib import Path
 from typing import Callable, Iterable
 
+from fp5_qtee_haptic import Haptic
+
 SESSION_CANDIDATES = (
     Path("/home/user/fp5-qtee-keep/session/fp5-qtee-session"),
     Path("/tmp/fp5-qtee/fp5-qtee-session"),
@@ -50,11 +52,9 @@ _ARM = re.compile(r"^AUTH \d+ arm ")
 _NOMATCH = re.compile(r"^AUTH FAIL \d+ itype=0x2 ")
 _PARTIAL = re.compile(r"^AUTH \d+ empty ")
 _DOWN = re.compile(r"^AUTH \d+ REAL DOWN ")
-# feedbackd event for a press that did not unlock. The standard event
-# names have no "authentication failed" yet. bell-terminal is a single
-# 100 ms rumble in the default theme's quiet profile, with no sound in
-# full, and nothing in silent. Override with FP5_QTEE_MISS_EVENT, or set
-# it empty to turn the haptic off.
+# Named fbcli events. The fingerprint waveforms live in fp5_qtee_haptic
+# (one 20 ms click, or two 30 ms pulses). These stay so a drop-in can
+# still name an event; an empty name plays nothing through fbcli.
 MISS_EVENT = os.environ.get("FP5_QTEE_MISS_EVENT", "bell-terminal")
 HIT_EVENT = os.environ.get("FP5_QTEE_HIT_EVENT", "")
 FEEDBACK_APP_ID = "org.fp5.qtee"
@@ -595,6 +595,7 @@ class UnlockWatcher:
         self._told_this_lock = False
         marker = default_pin_marker()
         self.policy = UnlockPolicy(marker=marker, state=lockout_state_for(marker))
+        self.haptic = Haptic()
         self._policy_sid: str | None = None
         self._told_reason: str | None = None
         # monotonic time the panel was last seen going off -> on.
@@ -642,10 +643,19 @@ class UnlockWatcher:
         if args is not None:
             self._background(args)
 
+    def tell_hit(self) -> None:
+        """The Android confirm click. Nothing extra is added for lockout."""
+        self.haptic.play("success")
+
     def tell_miss(self, kind: str) -> None:
-        """A finger was read and did not unlock. Say so right away."""
+        """A finger was read and did not unlock. Say so right away.
+
+        A partial press uses the same double pulse as a mismatch. The
+        silent profile plays nothing. Lockout does not add a third pattern;
+        the miss that reached 5 still plays this one.
+        """
         self.note(f"miss {kind}")
-        self.feedback(MISS_EVENT)
+        self.haptic.play("miss")
         # Transient, so misses do not pile up in the notification list.
         self._background(notify_args(MISS_TEXT[kind], 2500, transient=True))
 
@@ -791,7 +801,7 @@ class UnlockWatcher:
                         break
                     outcome = "hit"
                     self.policy.on_hit()
-                    self.feedback(HIT_EVENT)
+                    self.tell_hit()
                     self.unlock(sid, fid)
                     break
                 kind = miss_kind(line)
@@ -1161,7 +1171,7 @@ class WarmLoop:
         if self.is_locked(sid) is not True:
             return
         self.w.policy.on_hit()
-        self.w.feedback(HIT_EVENT)
+        self.w.tell_hit()
         self.w.unlock(sid, fid)
         self.believed_locked = False
         self.w._told_this_lock = False

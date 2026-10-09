@@ -168,6 +168,29 @@ class MissTest(unittest.TestCase):
         self.assertIn("boolean:transient:true", args)
         self.assertEqual(notify_args("hi", 6000)[-1], "hi")
 
+    def test_lockout_notice_is_the_summary(self) -> None:
+        # Phosh shows the summary only. The 5th miss is the double click;
+        # the lockout notice itself adds no waveform.
+        for key in ("lockout", "lockout-permanent"):
+            text = fp5_qtee_unlock.POLICY_TEXT[key]
+            self.assertTrue(text.startswith("Too many attempts"))
+            args = notify_args(text, 6000)
+            self.assertEqual(args[-1], text)
+            self.assertNotIn("-b", args)
+        self.assertIn("30 seconds", fp5_qtee_unlock.POLICY_TEXT["lockout"])
+        self.assertIn("PIN", fp5_qtee_unlock.POLICY_TEXT["lockout-permanent"])
+
+    def test_tell_uses_the_android_waveform(self) -> None:
+        played: list[str] = []
+        watcher = UnlockWatcher()
+        watcher.haptic = type("H", (), {"play": lambda _s, kind, **_k: played.append(kind)})()  # type: ignore[assignment]
+        watcher.note = lambda _text: None  # type: ignore[method-assign]
+        watcher._background = lambda _args: None  # type: ignore[method-assign]
+        watcher.tell_miss("nomatch")
+        watcher.tell_miss("partial")
+        watcher.tell_hit()
+        self.assertEqual(played, ["miss", "miss", "success"])
+
 
 class PolicyTest(unittest.TestCase):
     def make(self, require_pin: bool = True, marker: Path | None = None) -> tuple[UnlockPolicy, list[float]]:
@@ -415,6 +438,7 @@ class FollowTest(unittest.TestCase):
         self.w._stop = lambda proc: proc.stop()  # type: ignore[method-assign,assignment]
         self.misses: list[str] = []
         self.w.tell_miss = lambda kind: self.misses.append(kind)  # type: ignore[method-assign]
+        self.w.tell_hit = lambda: None  # type: ignore[method-assign]
         self.w.feedback = lambda event: None  # type: ignore[method-assign]
         self.w.policy = UnlockPolicy(require_pin=False, marker=None)
 
@@ -623,6 +647,7 @@ class WarmLoopTest(unittest.TestCase):
         self.w.note = lambda text: None  # type: ignore[method-assign]
         self.w.unlock = lambda sid, fid: self.events.append(("unlock", sid, fid))  # type: ignore[method-assign]
         self.w.feedback = lambda event: None  # type: ignore[method-assign]
+        self.w.tell_hit = lambda: self.events.append(("haptic", "success"))  # type: ignore[method-assign]
         self.w.tell_miss = lambda kind: self.events.append(("miss", kind))  # type: ignore[method-assign]
         self.w.session_id = lambda: "c4"  # type: ignore[method-assign]
         self.started: list[FakeWarm] = []
