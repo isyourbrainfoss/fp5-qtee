@@ -67,7 +67,12 @@ void fp5_poison_rem(uint8_t *pay);
 int fp5_real_down(uint32_t itype, int esd);
 /* Average value in (0, 600). */
 int fp5_score_sample(uint32_t avgv);
+/* Enrollment: all 3 frames in range. */
+int fp5_burst_full(const uint32_t *avgv, int n);
+/* Authentication: at least one of the first 3 frames in range. */
 int fp5_burst_ok(const uint32_t *avgv, int n);
+/* Last in-range avgv of the first 3 frames, 0 if none. */
+uint32_t fp5_burst_pick(const uint32_t *avgv, int n);
 uint32_t fp5_auth_plen(void); /* 0xe, HAL ff_trustlet_authenticate */
 /* Report rc 0 and a real template id. Poison and fid 0 are not a match. */
 int fp5_auth_match(uint32_t itype, int esd, uint32_t avgv, int32_t report_rc,

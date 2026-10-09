@@ -36,6 +36,11 @@ POISON = {0, 0xAAAAAAAA, 0xA5A5A5A5}
 PANEL_POLL_S = 0.2
 LOCK_POLL_S = 1.0
 SESSION_ID_TTL_S = 30.0
+# The power key is the fingerprint sensor on FP5, so the press that wakes
+# the panel is often read as a finger. A no-match from a press that went
+# down within this long of panel-on is ignored: no strike, no buzz, no
+# notice. A hit from that press still unlocks.
+WAKE_GRACE_S = float(os.environ.get("FP5_QTEE_WAKE_GRACE_MS", "400")) / 1000.0
 _HIT = re.compile(r"^AUTH HIT \d+ .* fid=(\d+) ")
 _ARM = re.compile(r"^AUTH \d+ arm ")
 # auth_once prints these after a real finger-down (itype 0x2):
@@ -44,6 +49,7 @@ _ARM = re.compile(r"^AUTH \d+ arm ")
 # An AUTH FAIL with itype 0x0 is the arm command failing, not a press.
 _NOMATCH = re.compile(r"^AUTH FAIL \d+ itype=0x2 ")
 _PARTIAL = re.compile(r"^AUTH \d+ empty ")
+_DOWN = re.compile(r"^AUTH \d+ REAL DOWN ")
 # feedbackd event for a press that did not unlock. The standard event
 # names have no "authentication failed" yet. bell-terminal is a single
 # 100 ms rumble in the default theme's quiet profile, with no sound in
@@ -95,6 +101,23 @@ def hit_fid(line: str) -> int | None:
 
 def armed(line: str) -> bool:
     return _ARM.match(line.strip()) is not None
+
+
+def is_down(line: str) -> bool:
+    return _DOWN.match(line.strip()) is not None
+
+
+def wake_press(down_at: float, panel_on_at: float | None,
+               grace_s: float = WAKE_GRACE_S) -> bool:
+    """True when a press went down within grace_s of the panel turning on.
+
+    The panel is polled, so panel_on_at can be a little after the real
+    wake; a press before it also counts. Without a seen off -> on change
+    (panel_on_at None) nothing is a wake press.
+    """
+    if panel_on_at is None or grace_s <= 0:
+        return False
+    return down_at <= panel_on_at + grace_s
 
 
 def miss_kind(line: str) -> str | None:
@@ -308,6 +331,18 @@ class UnlockPolicy:
         return None
 
 
+def notify_args(text: str, timeout_ms: int, transient: bool = False) -> list[str]:
+    """notify-send command that puts the message in the summary.
+
+    The Phosh lock screen shows only the summary of a notification, so the
+    sentence itself must be the summary. No body is passed.
+    """
+    args = ["notify-send", "-a", "Fingerprint", "-t", str(timeout_ms)]
+    if transient:
+        args += ["-h", "boolean:transient:true"]
+    return args + [text]
+
+
 def pump_lines(stream: Iterable[str], out: "queue.Queue[str | None]") -> None:
     """Copy each line into the queue, then None at end of stream."""
     try:
@@ -486,6 +521,9 @@ class UnlockWatcher:
         self.policy = UnlockPolicy(marker=marker, state=lockout_state_for(marker))
         self._policy_sid: str | None = None
         self._told_reason: str | None = None
+        # monotonic time the panel was last seen going off -> on.
+        self.panel_on_at: float | None = None
+        self._clock: Callable[[], float] = time.monotonic
 
     def note(self, text: str) -> None:
         stamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -500,7 +538,7 @@ class UnlockWatcher:
     def notify(self, text: str) -> None:
         try:
             subprocess.run(
-                ["notify-send", "-t", "6000", "Fingerprint", text],
+                notify_args(text, 6000),
                 check=False,
                 timeout=3,
             )
@@ -533,10 +571,7 @@ class UnlockWatcher:
         self.note(f"miss {kind}")
         self.feedback(MISS_EVENT)
         # Transient, so misses do not pile up in the notification list.
-        self._background(
-            ["notify-send", "-h", "boolean:transient:true", "-t", "2500",
-             "-a", "Fingerprint", "Fingerprint", MISS_TEXT[kind]]
-        )
+        self._background(notify_args(MISS_TEXT[kind], 2500, transient=True))
 
     def session_id(self) -> str | None:
         sid = self._sid.get()
@@ -649,6 +684,7 @@ class UnlockWatcher:
         )
         reader.start()
         outcome = "miss"
+        down_at: float | None = None
         with path.open("w", encoding="utf-8") as log:
             while True:
                 try:
@@ -665,6 +701,8 @@ class UnlockWatcher:
                 if not self._told_this_lock and armed(line):
                     self._told_this_lock = True
                     self.notify("Hold the power button to unlock. PIN still works.")
+                if is_down(line):
+                    down_at = self._clock()
                 fid = hit_fid(line)
                 if fid is not None:
                     # A press that landed just as the panel went off
@@ -681,6 +719,13 @@ class UnlockWatcher:
                     self.unlock(sid, fid)
                     break
                 kind = miss_kind(line)
+                if kind is not None:
+                    at = self._clock() if down_at is None else down_at
+                    down_at = None
+                    if wake_press(at, self.panel_on_at):
+                        # The power-key press that woke the panel. Not a try.
+                        self.note(f"miss {kind} ignored: wake press")
+                        kind = None
                 if kind is not None:
                     # A scored non-match is a strike even if the panel
                     # went off meanwhile; only the feedback is skipped.
@@ -746,12 +791,17 @@ class UnlockWatcher:
         """
         self.note("watcher start")
         last_lock_ask = 0.0
+        was_on = True
         while True:
             if not panel_on():
                 # Ask logind as soon as the panel comes back on.
                 last_lock_ask = 0.0
+                was_on = False
                 time.sleep(PANEL_POLL_S)
                 continue
+            if not was_on:
+                was_on = True
+                self.panel_on_at = time.monotonic()
             now = time.monotonic()
             if now - last_lock_ask < LOCK_POLL_S and last_lock_ask:
                 time.sleep(PANEL_POLL_S)

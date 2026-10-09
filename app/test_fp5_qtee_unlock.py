@@ -24,12 +24,16 @@ from fp5_qtee_unlock import (
     choose_phosh,
     feedback_args,
     hit_fid,
+    is_down,
     is_locked,
     lockout_state_for,
     miss_kind,
     parse_locked,
+
+    notify_args,
     pump_lines,
     screen_is_on,
+    wake_press,
 )
 
 
@@ -150,6 +154,15 @@ class MissTest(unittest.TestCase):
             ["fbcli", "-A", "org.fp5.qtee", "-E", "bell-terminal"],
         )
         self.assertIsNone(feedback_args(""))
+
+    def test_notice_text_is_the_summary(self) -> None:
+        # Phosh's lock screen shows only the summary; the sentence must be it.
+        args = notify_args(fp5_qtee_unlock.MISS_TEXT["nomatch"], 2500, transient=True)
+        self.assertEqual(args[0], "notify-send")
+        self.assertEqual(args[-1], fp5_qtee_unlock.MISS_TEXT["nomatch"])
+        self.assertNotIn("Fingerprint", args[-2:])
+        self.assertIn("boolean:transient:true", args)
+        self.assertEqual(notify_args("hi", 6000)[-1], "hi")
 
 
 class PolicyTest(unittest.TestCase):
@@ -364,6 +377,23 @@ class PumpAndThrottleTest(unittest.TestCase):
         self.assertEqual(t.get(), 3)
 
 
+class WakePressTest(unittest.TestCase):
+    def test_window(self) -> None:
+        self.assertTrue(wake_press(100.3, 100.0, 0.4))
+        self.assertTrue(wake_press(99.9, 100.0, 0.4))  # panel poll lag
+        self.assertTrue(wake_press(100.4, 100.0, 0.4))
+        self.assertFalse(wake_press(100.41, 100.0, 0.4))
+        self.assertFalse(wake_press(100.0, None, 0.4))
+        self.assertFalse(wake_press(100.0, 100.0, 0.0))
+
+    def test_default_is_named_and_about_400ms(self) -> None:
+        self.assertAlmostEqual(fp5_qtee_unlock.WAKE_GRACE_S, 0.4)
+
+    def test_down_line(self) -> None:
+        self.assertTrue(is_down("AUTH 1 REAL DOWN itype=0x2\n"))
+        self.assertFalse(is_down("AUTH 1 arm mode=1 irq=4"))
+
+
 class FollowTest(unittest.TestCase):
     """The session is silent while it waits. The watcher must still stop it."""
 
@@ -482,6 +512,52 @@ class FollowTest(unittest.TestCase):
         with mock.patch.object(fp5_qtee_unlock, "locked", lambda sid: False):
             self.w.lock_state("c4")
         self.assertEqual(self.w.policy.why_not(), "lockout-permanent")
+
+    def _wake_case(self, lines: list[str], down_after: float) -> str:
+        now = [1000.0]
+        self.w._clock = lambda: now[0]  # type: ignore[assignment]
+        self.w.panel_on_at = 1000.0
+        proc = FakeProc(lines, then_exit=True)
+        orig = self.w.note
+        self.notes: list[str] = []
+        self.w.note = lambda text: self.notes.append(text)  # type: ignore[method-assign]
+        now[0] = 1000.0 + down_after
+        out = self.w.follow("c4", proc, lambda: True, poll_s=0.01)  # type: ignore[arg-type]
+        self.w.note = orig  # type: ignore[method-assign]
+        return out
+
+    def test_wake_press_miss_is_ignored(self) -> None:
+        out = self._wake_case([
+            "AUTH 1 REAL DOWN itype=0x2\n",
+            "AUTH FAIL 1 itype=0x2 esd=0 avgv=291 fid=0 rc=-11\n",
+            "session_exit:2\n",
+        ], 0.15)
+        self.assertEqual(out, "miss")
+        self.assertEqual(self.w.policy.failed, 0)
+        self.assertEqual(self.misses, [])
+        self.assertTrue(any("wake press" in n for n in self.notes))
+
+    def test_wake_press_partial_is_silent(self) -> None:
+        self._wake_case(["AUTH 1 REAL DOWN itype=0x2\n",
+                         "AUTH 1 empty avgv=0,0,0\n", "session_exit:2\n"], 0.1)
+        self.assertEqual(self.misses, [])
+
+    def test_wake_press_hit_still_unlocks(self) -> None:
+        out = self._wake_case([
+            "AUTH 1 REAL DOWN itype=0x2\n",
+            "AUTH HIT 1 itype=0x2 avgv=304 fid=1403494260 rc=0\n",
+        ], 0.1)
+        self.assertEqual(out, "hit")
+        self.assertEqual(self.unlocked, [("c4", 1403494260)])
+
+    def test_miss_after_wake_window_is_a_strike(self) -> None:
+        self._wake_case([
+            "AUTH 1 REAL DOWN itype=0x2\n",
+            "AUTH FAIL 1 itype=0x2 esd=0 avgv=291 fid=0 rc=-11\n",
+            "session_exit:2\n",
+        ], 1.5)
+        self.assertEqual(self.w.policy.failed, 1)
+        self.assertEqual(self.misses, ["nomatch"])
 
     def test_partial_press_is_told(self) -> None:
         proc = FakeProc(["AUTH 1 empty avgv=0,0,0\n", "session_exit:2\n"], then_exit=True)
