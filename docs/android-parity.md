@@ -16,6 +16,22 @@ PRs in this repo that act on this plan:
 
 #7–#9 are stacked on #6, in that order.
 
+## Measured on the phone (FP5, kernel `7.2.0-nfc-test+`, 2026-10-09)
+
+| What | Result |
+|---|---|
+| #6 panel-off / PIN stop | pass |
+| #7 miss notice | fail as first pushed: the Phosh lock screen shows only the notification summary ("Fingerprint"), not the body. Fixed in #7: the sentence is now the summary (also the arm and lockout notices). |
+| #8 timed lockout | pass |
+| #8 light tap | reported `partial`, no strike (right), but buzzed, showed the notice, and could never match: `fp5_burst_ok()` needed all 3 frames in range and light taps had 1–2. Fixed in #8: auth scores a burst with at least one in-range frame (enrol still needs all 3); the trustlet still does the match. |
+| #8 wake press | the power key is the sensor, so the press that wakes the panel was sometimes scored as a miss (strike + buzz). Fixed in #8: a no-match from a press down within `FP5_QTEE_WAKE_GRACE_MS` (400 ms) of panel-on is ignored; a hit still unlocks. |
+| Cold start (`unlock`, or a fresh `serve`) to armed | 3–6 s |
+| Re-arm inside one `serve` session | ~1 s |
+| #9 warm match, sensor released after unlock | pass |
+| #9 after unlock | every unlock quit `serve`, so each new lock paid the cold load again. Fixed in #9: a new `serve` starts as soon as logind reports the lock (signal), panel on or off. |
+| Watcher idle CPU | ~0.8 % of one core (before the #9 change that drops the 1 s LockedHint poll while unlocked with the panel on) |
+| Wake sources | only `pmic_pwrkey` and `gpio-keys` can wake the SoC. The fingerprint interrupt (IRQ 256, TLMM gpio34) has wakeup disabled. |
+
 ---
 
 ## 1. Delay between waking the screen and a finger working
@@ -117,36 +133,66 @@ hears about the attempt: there is no PAM conversation and no
   TLMM GPIOs 56–59 as `gpio-reserved-ranges` ("fingerprint reader (SPI)"),
   so that SPI bus belongs to the secure world. The interrupt and reset
   lines are set up by the out-of-tree module, and are not described here.
+- Measured: the finger interrupt is IRQ 256 on TLMM gpio34, with wakeup
+  disabled. Only `pmic_pwrkey` and `gpio-keys` are wakeup sources. The
+  sensor is the power key, so today the press both wakes the panel (via
+  pwrkey) and may be read as a finger; #8 ignores a miss from that press.
 
-### What it would take
+### Design: touch to wake (not in this round; needs the kernel)
 
-1. **Kernel/device tree:** the finger-down interrupt has to be able to
-   wake the SoC from suspend. In the driver that means `device_init_wakeup()`
-   and `enable_irq_wake()` while suspended, plus `pm_wakeup_event()` on the
-   interrupt so userspace gets to run. The driver also needs a pollable
-   event: `sysfs_notify` on `irq_count`, `poll()` on `/dev/focaltech_fp`, or
-   an input event. Upstream this means a DT binding and node for the
-   sensor's interrupt with `wakeup-source`. This needs the real GPIO
-   number and polarity from the vendor kernel source, which this repo does
-   not have.
-2. **Session (this repo, after 1):** keep the #9 serve session armed in
-   mode 1 while the panel is off, blocking in `poll()` on the event fd
-   instead of 20 ms steps. Whether the TEE session and sensor state survive
-   system suspend needs testing.
-3. **Policy (this repo):** on a finger-down with the panel off, check
-   proximity first (iio-sensor-proxy `ClaimProximity` / `ProximityNear`) so
-   a pocket does not count. Then capture and match. On a hit, wake the
-   panel through Phosh's `org.gnome.Mutter.DisplayConfig` `PowerSaveMode = 0`
-   ([Phosh MonitorManager](https://phosh-a673aa.pages.gitlab.gnome.org/class.MonitorManager.html))
-   and unlock. On a miss, leave the panel off and give a haptic only, as
-   Android does. Make it a user setting, off by default.
-4. **Battery:** what matters is userspace wakeups, not the chip. Today the
-   session polls `irq_count` at 50 Hz while armed, and the debug watch
-   thread reads `/dev/qsee_log` every 30 ms. #9 drops the watch thread in
-   serve mode. With the panel off, nothing should run until the interrupt
-   fires.
+Goal: a finger on the sensor with the panel off wakes the phone and the
+same press unlocks, without giving up #6's rule that a dark phone never
+unlocks from a press it did not mean (pocket, bag).
 
-Until 1 exists, the power key is the screen-off path. The watcher's own
+1. **Kernel/DT: make the finger interrupt a wakeup source.**
+   - In `focaltech_fp_life` (or its upstream replacement):
+     `device_init_wakeup(dev, true)`; in `suspend` call
+     `enable_irq_wake(irq)` (gpio34 / IRQ 256) and `disable_irq_wake()` in
+     `resume`; in the handler `pm_wakeup_dev_event(dev, 0, true)` so the
+     system stays up long enough for userspace.
+   - DT: a node for the sensor's interrupt (`interrupts-extended = <&tlmm 34
+     IRQ_TYPE_EDGE_RISING>`, polarity to confirm from the vendor tree) with
+     `wakeup-source`, plus the TLMM pin config so gpio34 is routed to the
+     PDC (wake-capable) while suspended. Check `/sys/kernel/irq/256/wakeup`
+     reads `enabled` and that `cat /sys/power/wakeup_count` moves on a touch.
+   - The driver makes the event pollable (`sysfs_notify` on `irq_count`
+     or `poll()` on the char device); #9 already waits with `POLLPRI`.
+2. **Kernel: inject `KEY_WAKEUP`.** On a finger-down while the panel is
+   off, the driver (or a tiny input device it registers) reports
+   `KEY_WAKEUP` press+release. Phosh/logind already treat it like the
+   power key, so the panel comes on through the normal path and nothing in
+   userspace has to drive DPMS.
+3. **Session (here): keep `wait-touch` armed while dark.** In warm mode
+   the `serve` session stays armed in work mode 1 (finger-down detect)
+   instead of cancelling on panel-off, and blocks in `poll()` with no
+   timeout. The TEE session and sensor state must survive system suspend;
+   test that first (if not, re-arm on resume, from the PM notifier or the
+   logind `PrepareForSleep(false)` signal).
+4. **Match the same press.** The finger that woke the phone is still down,
+   so the session goes straight to capture → REPORT for that press. There
+   is no second touch.
+5. **Guard: only the waking press can unlock while dark.** Keep #6's
+   pocket protection by allowing exactly one attempt per dark wake:
+   - The watcher only accepts a hit when the press's down timestamp is
+     within a short window (e.g. 300 ms) of a `KEY_WAKEUP` it saw on the
+     input device (or of the panel-on edge), and only one hit per wake.
+     A press that started while dark but did not produce a wake event, or
+     a second press, is cancelled exactly as #6 does today.
+   - A miss from the waking press is silent (no strike if within the #8
+     wake grace, no notice) and the panel turns off again after the
+     normal Phosh timeout.
+   - **Proximity:** before accepting the hit, read iio-sensor-proxy
+     (`ClaimProximity`, `ProximityNear`). Near → refuse the unlock, no
+     strike, cancel and let the panel go off. If proximity is unavailable,
+     fail closed (no dark unlock; power key still works).
+   - Policy (#8) still applies: PIN after boot / 72 h, lockout.
+   - Off by default, a user setting (`FP5_QTEE_TOUCH_WAKE=1`).
+6. **Battery.** Only interrupts matter: with the IRQ as a wake source the
+   SoC sleeps until a touch. Measure suspend current and wakeups/hour
+   (`/sys/kernel/debug/wakeup_sources`) overnight with it on and off, and
+   count false wakes in a pocket.
+
+Until 1–2 exist, the power key is the screen-off path. The watcher's own
 notice says the sensor is on the power button ("Hold the power button to
 unlock"), so a press wakes the panel. With #9 the session is already
 loaded at that point.
