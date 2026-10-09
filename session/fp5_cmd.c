@@ -61,3 +61,57 @@ int fp5_cmd_parse(const char *line)
 		return FP5_CMD_NONE;
 	return FP5_CMD_UNKNOWN;
 }
+
+void fp5_att_begin(struct fp5_attempt *a, unsigned irq_now)
+{
+	a->irq = irq_now;
+	a->down = 0;
+	a->cancelled = 0;
+	a->quit = 0;
+}
+
+int fp5_att_cmd(struct fp5_attempt *a, int cmd)
+{
+	switch (cmd) {
+	case FP5_CMD_QUIT:
+		a->quit = 1;
+		a->cancelled = 1;
+		return FP5_REPLY_NONE;
+	case FP5_CMD_CANCEL:
+		a->cancelled = 1;
+		return FP5_REPLY_NONE;
+	case FP5_CMD_AUTH:
+		return FP5_REPLY_BUSY;
+	case FP5_CMD_NONE:
+		return FP5_REPLY_NONE;
+	default:
+		return FP5_REPLY_UNKNOWN;
+	}
+}
+
+int fp5_att_irq(struct fp5_attempt *a, unsigned irq_now)
+{
+	if (a->cancelled)
+		return 0;
+	if (irq_now == a->irq)
+		return 0;
+	a->irq = irq_now;
+	return 1;
+}
+
+int fp5_att_down(struct fp5_attempt *a)
+{
+	if (a->cancelled)
+		return 0;
+	a->down = 1;
+	return 1;
+}
+
+int fp5_att_finish(const struct fp5_attempt *a, int matched)
+{
+	if (matched)
+		return a->cancelled ? FP5_ATT_CANCELLED : FP5_ATT_HIT;
+	/* A scored non-match is still a real press. Report it, so the
+	 * watcher counts the strike even if it cancelled meanwhile. */
+	return FP5_ATT_MISS;
+}

@@ -77,16 +77,29 @@ commands on stdin: `auth`, `cancel`, `quit` (EOF is `quit`). It prints
 `SERVE ready`, then `SERVE idle` whenever it waits for a command and
 `SERVE result <rc>` after each `auth`. Idle is a blocking read; there is no
 polling and no sensor command. A finger wait also watches stdin, so
-`cancel` ends it at once (`AUTH <n> cancelled`, result 3). Serve mode does
-not start the `/dev/qsee_log` watch thread.
+`cancel` ends it at once (`AUTH <n> cancelled`, result 3). stdin is read
+before every interrupt check, after the finger-down query, after each
+capture and before the verdict, so a cancelled attempt never prints
+`AUTH HIT`, even if the finger was already down or had matched
+(`AUTH <n> cancelled after match`). A scored non-match is still printed as
+`AUTH FAIL` so it counts as a strike. Each `auth` starts from the
+interrupt count read when it is armed, so a press while cancelled or dark
+does not carry into it. An `auth` sent while one runs gets
+`SERVE reject auth busy`, an unknown line `SERVE reject unknown`. Serve
+mode does not start the `/dev/qsee_log` watch thread.
 
 With `FP5_QTEE_WARM=1` the watcher starts one serve session when it sees
 the session locked, including in the 10 s after the panel goes off, so
-the load happens while the screen is dark. On wake it sends `auth` at
-once and confirms the lock within a second. After a miss it re-arms
-straight away. Panel off sends `cancel`. An unlock (finger or PIN) quits
-the session, which frees the sensor for the Finger app. A hit still has
-to pass the panel, logind and lockout checks.
+the load happens while the screen is dark. On wake it reads the panel and
+LockedHint again and only then sends `auth` (one loginctl call, so arming
+waits for it). After a miss it re-arms straight away, again after a fresh
+LockedHint. Panel off sends `cancel`. An unknown LockedHint cancels and
+does not arm. An unlock (finger or PIN) quits the session, which frees the
+sensor for the Finger app. A hit unlocks only if it is from the `auth` sent
+in this panel-on period and not cancelled (no hit after `cancel`, after
+panel-off, or after that attempt's `SERVE result`), and it still has to
+pass the panel, logind and lockout checks. A scored non-match counts as a
+strike even if the panel went off meanwhile.
 
 Enable it with a drop-in:
 

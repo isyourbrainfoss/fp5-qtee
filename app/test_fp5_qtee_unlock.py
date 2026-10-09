@@ -554,7 +554,7 @@ class WarmLoopTest(unittest.TestCase):
 
         self.w.start_warm = start_warm  # type: ignore[method-assign,assignment]
 
-        def is_locked(sid: str) -> bool:
+        def is_locked(sid: str) -> bool | None:
             self.lock_asks += 1
             return self.lock[0]
 
@@ -568,7 +568,7 @@ class WarmLoopTest(unittest.TestCase):
     def unlocks(self) -> list[tuple]:
         return [e for e in self.events if e[0] == "unlock"]
 
-    def test_loads_while_dark_and_arms_on_wake_without_asking(self) -> None:
+    def test_loads_while_dark_and_rechecks_lock_on_wake(self) -> None:
         self.step()                      # panel on, locked: starts cold
         warm = self.started[0]
         self.panel[0] = False
@@ -579,7 +579,86 @@ class WarmLoopTest(unittest.TestCase):
         self.panel[0] = True
         self.step()
         self.assertEqual(warm.sent, ["auth"])
-        self.assertEqual(self.lock_asks, asks)  # armed before asking logind
+        # LockedHint is read again right before the auth on wake.
+        self.assertEqual(self.lock_asks, asks + 1)
+
+    def test_wake_does_not_arm_when_unlocked_or_unknown(self) -> None:
+        self.step()
+        warm = self.started[0]
+        self.panel[0] = False
+        warm.say("SERVE ready", "SERVE idle")
+        self.step()
+        self.lock[0] = None              # loginctl timed out
+        self.panel[0] = True
+        self.step()
+        self.assertEqual(warm.sent, [])
+        self.assertFalse(warm.closed)    # session kept for the next try
+        self.lock[0] = False             # PIN unlocked while dark
+        self.step(1.1)
+        self.step()
+        self.assertEqual(warm.sent, [])
+        self.assertTrue(warm.closed)
+
+    def test_cancel_after_finger_down_never_unlocks(self) -> None:
+        self.step()
+        warm = self.started[0]
+        warm.say("SERVE idle")
+        self.step()
+        self.assertEqual(warm.sent, ["auth"])
+        warm.say("AUTH 1 REAL DOWN itype=0x2")
+        self.step()
+        self.panel[0] = False            # panel off: cancel
+        self.step()
+        self.assertEqual(warm.sent, ["auth", "cancel"])
+        # Even if the session still printed a hit for that attempt,
+        # dark or after the panel came back on, it must not unlock.
+        warm.say(self.HIT)
+        self.step()
+        self.panel[0] = True
+        warm.say(self.HIT)
+        self.step()
+        self.assertEqual(self.unlocks(), [])
+
+    def test_touch_while_panel_off_does_not_unlock_on_wake(self) -> None:
+        self.step()
+        warm = self.started[0]
+        warm.say("SERVE idle")
+        self.step()
+        self.panel[0] = False
+        self.step()
+        warm.say("AUTH 1 cancelled", "SERVE result 3", "SERVE idle")
+        self.step()
+        # A touch while dark was latched and comes out as a hit just as
+        # the panel comes back on, before the new auth.
+        warm.say(self.HIT, "SERVE result 0", "SERVE idle")
+        self.panel[0] = True
+        self.step()
+        self.assertEqual(self.unlocks(), [])
+        self.assertEqual(warm.sent, ["auth", "cancel", "auth"])
+        # A hit for the new auth, armed on this wake, unlocks.
+        warm.say(self.HIT, "SERVE result 0", "SERVE idle")
+        self.step()
+        self.assertEqual(self.unlocks(), [("unlock", "c4", 1403494260)])
+
+    def test_hit_after_result_is_refused(self) -> None:
+        self.step()
+        warm = self.started[0]
+        warm.say("SERVE idle")
+        self.step()
+        warm.say("SERVE result 2", self.HIT)
+        self.step()
+        self.assertEqual(self.unlocks(), [])
+
+    def test_miss_counts_even_if_panel_went_off(self) -> None:
+        self.step()
+        warm = self.started[0]
+        warm.say("SERVE idle")
+        self.step()
+        self.panel[0] = False
+        warm.say(self.FAIL, "SERVE result 2", "SERVE idle")
+        self.step()
+        self.assertEqual(self.w.policy.failed, 1)
+        self.assertNotIn(("miss", "nomatch"), self.events)
 
     def test_starts_session_after_panel_off_when_locked(self) -> None:
         self.lock[0] = False

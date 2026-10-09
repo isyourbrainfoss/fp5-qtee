@@ -146,10 +146,13 @@ static int sysfs_write(const char *path, const char *text)
  * serve mode keeps one session open and takes commands on stdin
  * (fp5_cmd.h). A wait for a finger also watches stdin, so "cancel"
  * ends it at once. irq_fd stays open there so the wait can poll it.
+ * serve_att holds the running attempt: its irq baseline and whether it
+ * was cancelled. stdin is read before every irq check and again after
+ * capture, so a cancelled attempt never prints AUTH HIT.
  */
 static int serve_on;
-static volatile int serve_cancel;
 static int serve_quit;
+static struct fp5_attempt serve_att;
 static int irq_fd = -1;
 static struct fp5_cmdbuf serve_in;
 
@@ -210,6 +213,36 @@ static int serve_read_cmd(int timeout_ms)
 }
 
 /*
+ * Take every command already waiting on stdin, without blocking, and
+ * apply it to the running attempt. An auth here is rejected out loud,
+ * not dropped. Returns 1 once the attempt is cancelled.
+ */
+static int serve_poll_cmds(void)
+{
+	int guard;
+
+	if (!serve_on)
+		return 0;
+	for (guard = 0; guard < 64; guard++) {
+		int cmd = serve_read_cmd(0);
+		int r;
+
+		if (cmd == FP5_CMD_NONE && !memchr(serve_in.buf, '\n', serve_in.n))
+			break;
+		r = fp5_att_cmd(&serve_att, cmd);
+		if (r == FP5_REPLY_BUSY)
+			logl("SERVE reject auth busy");
+		else if (r == FP5_REPLY_UNKNOWN)
+			logl("SERVE reject unknown");
+		if (cmd == FP5_CMD_QUIT) {
+			serve_quit = 1;
+			break;
+		}
+	}
+	return serve_att.cancelled;
+}
+
+/*
  * One 20 ms step of a finger wait in serve mode. Returns 1 when the
  * wait should end because of a command. If the driver calls
  * sysfs_notify on irq_count, POLLPRI ends the step early. If it does
@@ -229,34 +262,37 @@ static int serve_wait_step(int ms)
 		p[1].revents = 0;
 		np = 2;
 	}
-	if (poll(p, (nfds_t)np, ms) > 0 && (p[0].revents & (POLLIN | POLLHUP))) {
-		int cmd = serve_read_cmd(0);
-
-		if (cmd == FP5_CMD_QUIT) {
-			serve_quit = 1;
-			serve_cancel = 1;
-		} else if (cmd == FP5_CMD_CANCEL) {
-			serve_cancel = 1;
-		}
-	}
-	return serve_cancel;
+	if (poll(p, (nfds_t)np, ms) > 0 && (p[0].revents & (POLLIN | POLLHUP)))
+		return serve_poll_cmds();
+	return serve_att.cancelled;
 }
 
 static int wait_irq(unsigned *prev, int ms)
 {
 	while (ms > 0) {
-		unsigned now = read_irq();
+		unsigned now;
 
+		if (serve_on) {
+			/* stdin first: a cancel that is already here wins over
+			 * an irq change that is also already here. */
+			if (serve_poll_cmds())
+				return 0;
+			now = read_irq();
+			if (fp5_att_irq(&serve_att, now)) {
+				*prev = now;
+				return 1;
+			}
+			if (serve_wait_step(20))
+				return 0;
+			ms -= 20;
+			continue;
+		}
+		now = read_irq();
 		if (now != *prev) {
 			*prev = now;
 			return 1;
 		}
-		if (serve_on) {
-			if (serve_wait_step(20))
-				return 0;
-		} else {
-			usleep(20 * 1000);
-		}
+		usleep(20 * 1000);
 		ms -= 20;
 	}
 	return 0;
@@ -1925,6 +1961,7 @@ static int auth_once(struct svc *s, int which)
 	uint8_t hat[0x4a];
 	uint8_t z[4] = { 0 };
 	uint32_t fid = 0;
+	int verdict;
 
 	/*
 	 * 0x2008 stores operation mode 2 (do_authenticate) and returns 0
@@ -1938,6 +1975,19 @@ static int auth_once(struct svc *s, int which)
 		logf("AUTH FAIL %d itype=0x0 esd=0 avgv=0 rc=%d fid=0", which,
 		     (int)s->last_rc);
 		return 2;
+	}
+	if (serve_on) {
+		/*
+		 * Fresh attempt: the baseline is this arm's irq_count, so a
+		 * press while cancelled or with the panel off is not a down
+		 * here, and nothing from the last attempt carries over.
+		 * Commands that came in with "auth" are applied now.
+		 */
+		fp5_att_begin(&serve_att, irq);
+		if (serve_poll_cmds()) {
+			logf("AUTH %d cancelled", which);
+			return FP5_ATT_CANCELLED;
+		}
 	}
 	logf("AUTH %d arm mode=%u irq=%u", which, mode, irq);
 	if (send_cmd(s, fp5_op_wmode(), 4, &mode, "WMODE_TOUCH"))
@@ -1957,12 +2007,17 @@ static int auth_once(struct svc *s, int which)
 		logf("skip leftover itype=0x%x esd=%d", itype, esd);
 	}
 	if (!down) {
-		if (serve_cancel) {
+		if (serve_on && serve_att.cancelled) {
 			logf("AUTH %d cancelled", which);
-			return 3;
+			return FP5_ATT_CANCELLED;
 		}
 		logf("AUTH %d no finger", which);
 		return 2;
+	}
+	/* The QEV round trip takes time; a cancel may have come in. */
+	if (serve_on && (serve_poll_cmds() || !fp5_att_down(&serve_att))) {
+		logf("AUTH %d cancelled after down", which);
+		return FP5_ATT_CANCELLED;
 	}
 	logf("AUTH %d REAL DOWN itype=0x%x", which, itype);
 	for (fi = 0; fi < 3; fi++) {
@@ -1971,6 +2026,10 @@ static int auth_once(struct svc *s, int which)
 		if (send_cmd(s, fp5_op_capture(), 0x24, NULL, "CAP"))
 			return -1;
 		av[fi] = s->last.avgv;
+		if (serve_on && serve_poll_cmds()) {
+			logf("AUTH %d cancelled during capture", which);
+			return FP5_ATT_CANCELLED;
+		}
 	}
 	if (!fp5_burst_ok(av, 3)) {
 		logf("AUTH %d empty avgv=%u,%u,%u", which, av[0], av[1], av[2]);
@@ -1982,7 +2041,18 @@ static int auth_once(struct svc *s, int which)
 	qsee_dump_delta("REPORT_EV5");
 	memcpy(&fid, s->req + FP5_PAY_OFF + 0x10, 4);
 	logf("AUTH %d report rc=%d fid=%u", which, (int)s->last_rc, fid);
-	if (fp5_auth_match(itype, esd, av[2], s->last_rc, fid)) {
+	if (serve_on)
+		serve_poll_cmds();	/* last look before the verdict */
+	verdict = fp5_auth_match(itype, esd, av[2], s->last_rc, fid) ?
+		  FP5_ATT_HIT : FP5_ATT_MISS;
+	if (serve_on)
+		verdict = fp5_att_finish(&serve_att, verdict == FP5_ATT_HIT);
+	if (verdict == FP5_ATT_CANCELLED) {
+		/* Matched, but the watcher cancelled. Never say HIT. */
+		logf("AUTH %d cancelled after match", which);
+		return FP5_ATT_CANCELLED;
+	}
+	if (verdict == FP5_ATT_HIT) {
 		logf("AUTH HIT %d itype=0x%x avgv=%u fid=%u rc=%d", which, itype,
 		     av[2], fid, (int)s->last_rc);
 		return 0;
@@ -2000,7 +2070,11 @@ static int auth_once(struct svc *s, int which)
  *   in:  auth | cancel | quit   (EOF is quit)
  *   out: "SERVE ready" once, "SERVE idle" before each wait for a
  *        command, "SERVE result <auth_once rc>" after each auth. A
- *        cancelled auth prints "AUTH <n> cancelled" and result 3.
+ *        cancelled auth prints "AUTH <n> cancelled..." and result 3,
+ *        also when the finger was already down or had matched. An
+ *        auth sent while one runs gets "SERVE reject auth busy"; an
+ *        unknown line gets "SERVE reject unknown". cancel while idle
+ *        does nothing.
  */
 static int serve_loop(struct svc *s)
 {
@@ -2017,12 +2091,15 @@ static int serve_loop(struct svc *s)
 		int cmd, a;
 
 		logl("SERVE idle");
-		do {
+		for (;;) {
 			cmd = serve_read_cmd(-1);
-		} while (cmd != FP5_CMD_AUTH && cmd != FP5_CMD_QUIT);
+			if (cmd == FP5_CMD_AUTH || cmd == FP5_CMD_QUIT)
+				break;
+			if (cmd == FP5_CMD_UNKNOWN)
+				logl("SERVE reject unknown");
+		}
 		if (cmd == FP5_CMD_QUIT)
 			break;
-		serve_cancel = 0;
 		a = auth_once(s, ++n);
 		logf("SERVE result %d", a);
 		if (a < 0) {
