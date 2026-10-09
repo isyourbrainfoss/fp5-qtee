@@ -56,7 +56,7 @@ notification says why.
 
 By default every attempt starts a new `fp5-qtee-session unlock`: mount,
 sensor power-up and reset, `/dev/tee0`, four listener registrations, the
-trustlet load from `focal32.mdt`/`.bXX`, 14 setup commands, then
+trustlet load from `focal32.mdt`/`.bXX`, 13 setup commands, then
 SET_GROUP/ENUM. Only then is the sensor armed. That is the wait after
 waking the screen, and it is paid again after every miss.
 
