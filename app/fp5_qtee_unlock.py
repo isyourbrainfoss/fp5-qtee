@@ -45,9 +45,15 @@ SESSION_ID_TTL_S = 30.0
 # "already down"; it logs AUTH arm and then REAL DOWN. That down is within
 # about 300 ms when the IRQ is already pending, and the work-mode command
 # sits between the arm line and the wait, so the default grace is 1 s from
-# the arm line (not from panel-on). Only that first no-match is ignored.
-# A later press counts, even a quick one. A hit still unlocks.
+# the arm line (not from panel-on). Only that first no-match is ignored,
+# and only when every verify score on it was 0. A no-match that already
+# scored anything other than 0 is a real try. A later press counts, even
+# a quick one. A hit still unlocks.
 WAKE_GRACE_S = float(os.environ.get("FP5_QTEE_WAKE_GRACE_MS", "1000")) / 1000.0
+# One LockedHint miss while a session is already armed is not a reason to
+# drop it. The reading has to stay unlocked or unknown this long.
+LOCK_FLICKER_S = 2.0
+_SCORE = re.compile(r"FtVerifySubTemplate\(\) score = (-?\d+)")
 # A wake hit can be printed before sysfs says the panel is on. Wait this
 # long, then unlock only if it came on. A miss that never turns the panel
 # on is not a strike.
@@ -178,18 +184,56 @@ def wake_press(down_at: float, arm_at: float | None,
     return down_at <= arm_at + grace_s
 
 
+def verify_score(line: str) -> int | None:
+    """FtVerifySubTemplate score on this line, or None when it has none."""
+    match = _SCORE.search(line)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
 def consume_wake(claimed: bool, at: float, arm_at: float | None,
-                 grace_s: float = WAKE_GRACE_S) -> tuple[bool, bool]:
+                 grace_s: float = WAKE_GRACE_S, nonzero: bool = False,
+                 ) -> tuple[bool, bool]:
     """(ignore this no-match, claimed after).
 
     Only the first no-match of the first listen after panel-on, and only
-    when that finger-down is within grace_s of that listen's arm. The
-    caller passes arm_at for that listen and None after it. A later
-    press is a real try, even when it is quick.
+    when that finger-down is within grace_s of that listen's arm and no
+    verify score on the press was non-zero. The caller passes arm_at for
+    that listen and None after it. A later press is a real try, even
+    when it is quick. nonzero still claims the wake slot.
     """
     if claimed or not wake_press(at, arm_at, grace_s):
         return False, claimed
+    if nonzero:
+        return False, True
     return True, True
+
+
+def armed_hold(armed: bool, reason: str, bad_since: float | None,
+               now: float, hold_s: float = LOCK_FLICKER_S,
+               ) -> tuple[bool, float | None]:
+    """(stop now, bad_since).
+
+    seat-unlocked and lock-unknown have to last hold_s once the session
+    has armed. Anything else, and a lock miss before arm, stops at once.
+    """
+    if not armed or reason not in ("lock unknown", "seat unlocked"):
+        return True, None
+    if bad_since is None:
+        return False, now
+    if now - bad_since >= hold_s:
+        return True, bad_since
+    return False, bad_since
+
+
+def listen_done_text(outcome: str, why: str | None) -> str:
+    """Watcher line for the end of one listen. A stop always names why."""
+    if outcome == "stop":
+        return f"listen done stop: {why or 'unspecified'}"
+    if outcome == "error" and why:
+        return f"listen done error: {why}"
+    return f"listen done {outcome}"
 
 
 def await_panel(panel: Callable[[], bool], wait_s: float,
@@ -694,6 +738,10 @@ class UnlockWatcher:
         self._wake_open = False
         self._arm_at: float | None = None
         self._wake_claimed = False
+        self._listen_why: str | None = None
+        # Set by listen_once to the throttled LockedHint read. follow()
+        # uses it only to name a stop. Tests leave it unset.
+        self._lock_state: Callable[[], object] | None = None
         # None until the first sample, so a panel that is already on at
         # start is not treated as a wake.
         self._panel_was_on: bool | None = None
@@ -800,8 +848,38 @@ class UnlockWatcher:
             return False
         # Stay armed while locked with the panel off. The wake press is
         # then a new edge on a sensor calibrated with no finger.
-        # Unknown (None) is not locked: stop rather than guess.
+        # Unknown (None) is not locked. follow() holds one flicker of
+        # that once the session has armed, then stops and names why.
         return lock_check.get() is True
+
+    def _unwanted_reason(self) -> str:
+        """Why wanted() is false. 'not wanted' when the caller gave no lock read."""
+        if OLD_DRIVER.is_dir():
+            return "qsee_fingerpr loaded"
+        get = self._lock_state
+        if get is None:
+            return "not wanted"
+        state = get()
+        if state is None:
+            return "lock unknown"
+        if state is False:
+            return "seat unlocked"
+        return "not wanted"
+
+    def hold_unwanted(self, armed_now: bool, bad_since: float | None,
+                      noted: bool) -> tuple[bool, float | None, bool]:
+        """wanted() is already false. (stop, bad_since, noted)."""
+        reason = self._unwanted_reason()
+        stop, bad_since = armed_hold(
+            armed_now, reason, bad_since, self._clock()
+        )
+        if stop:
+            self._listen_why = reason
+            return True, bad_since, noted
+        if not noted:
+            self.note(f"holding armed session: {reason}")
+            noted = True
+        return False, bad_since, noted
 
     def wake_panel(self) -> None:
         """Ask the panel to come on. Never called for a miss."""
@@ -856,10 +934,19 @@ class UnlockWatcher:
         binary = session_bin()
         if binary is None:
             return "error"
+        self._listen_why = None
+        self._lock_state = None
         early = self.prepare()
+        if early == "stop":
+            self._listen_why = "qsee_fingerpr loaded"
+            return early
+        if early == "error":
+            self._listen_why = "qcomtee load failed"
+            return early
         if early is not None:
             return early
         lock_check = Throttle(LOCK_POLL_S, lambda: locked(sid))
+        self._lock_state = lock_check.get
         return self.follow(
             sid,
             self.spawn(binary),
@@ -893,6 +980,9 @@ class UnlockWatcher:
         outcome = "miss"
         down_at: float | None = None
         saw_arm = False
+        press_nz = False
+        bad_since: float | None = None
+        held_note = False
         with path.open("w", encoding="utf-8") as log:
             while True:
                 try:
@@ -901,8 +991,15 @@ class UnlockWatcher:
                     if panel is not None:
                         self._note_panel(panel(), saw_arm)
                     if not wanted():
-                        outcome = "stop"
-                        break
+                        stop, bad_since, held_note = self.hold_unwanted(
+                            saw_arm, bad_since, held_note
+                        )
+                        if stop:
+                            outcome = "stop"
+                            break
+                        continue
+                    bad_since = None
+                    held_note = False
                     continue
                 if line is None:
                     break
@@ -912,11 +1009,16 @@ class UnlockWatcher:
                 log.flush()
                 if armed(line):
                     saw_arm = True
+                    press_nz = False
                     if self._wake_open and self._arm_at is None:
                         self._arm_at = self._clock()
                         down_at = None
                 if is_down(line):
                     down_at = self._clock()
+                    press_nz = False
+                score = verify_score(line)
+                if score not in (None, 0):
+                    press_nz = True
                 fid = hit_fid(line)
                 if fid is not None:
                     at = self._clock() if down_at is None else down_at
@@ -928,15 +1030,18 @@ class UnlockWatcher:
                         self.wake_panel()
                     # PIN unlock, or the seat is no longer one we may listen on.
                     if not wanted():
+                        self._listen_why = self._unwanted_reason()
                         outcome = "stop"
                         break
                     if panel is not None and not await_panel(
                         panel, wake_wait_s, wanted
                     ):
                         self.note("hit ignored: panel stayed off")
+                        self._listen_why = "panel stayed off"
                         outcome = "stop"
                         break
                     if self.policy.why_not() is not None:
+                        self._listen_why = self.policy.why_not()
                         outcome = "stop"
                         break
                     outcome = "hit"
@@ -957,8 +1062,9 @@ class UnlockWatcher:
                     else:
                         arm_at = self._arm_at if self._wake_open else None
                         ignore, self._wake_claimed = consume_wake(
-                            self._wake_claimed, at, arm_at
+                            self._wake_claimed, at, arm_at, nonzero=press_nz
                         )
+                        press_nz = False
                         if ignore:
                             # The power-key press that woke the panel. Not a try.
                             self.note(f"miss {kind} ignored: wake press")
@@ -971,11 +1077,19 @@ class UnlockWatcher:
                     if wanted():
                         self.tell_miss(kind)
                     if self.policy.why_not() is not None:
+                        self._listen_why = self.policy.why_not()
                         outcome = "stop"
                         break
                 if not wanted():
-                    outcome = "stop"
-                    break
+                    stop, bad_since, held_note = self.hold_unwanted(
+                        saw_arm, bad_since, held_note
+                    )
+                    if stop:
+                        outcome = "stop"
+                        break
+                else:
+                    bad_since = None
+                    held_note = False
         self._stop(proc)
         reader.join(timeout=2)
         if saw_arm and self._wake_open:
@@ -1081,7 +1195,7 @@ class UnlockWatcher:
             self.note(f"listen session {sid}")
             began = time.monotonic()
             outcome = self.listen_once(sid)
-            self.note(f"listen done {outcome}")
+            self.note(listen_done_text(outcome, self._listen_why))
             last_lock_ask = 0.0
             if outcome == "hit":
                 time.sleep(2.0)
@@ -1227,6 +1341,7 @@ class WarmLoop:
         self.saw_arm = False
         self.wake_claimed = False
         self.down_at: float | None = None
+        self.press_nz = False
 
     def _signalled(self) -> bool:
         return self.signals is not None and self.signals.poll()
@@ -1301,12 +1416,18 @@ class WarmLoop:
                 continue
             if armed(line):
                 self.saw_arm = True
+                self.press_nz = False
                 if self.wake_open and self.arm_at is None:
                     self.arm_at = self.clock()
                     self.down_at = None
                 continue
             if is_down(line):
                 self.down_at = self.clock()
+                self.press_nz = False
+                continue
+            score = verify_score(line)
+            if score not in (None, 0):
+                self.press_nz = True
                 continue
             fid = hit_fid(line)
             if fid is not None:
@@ -1322,8 +1443,9 @@ class WarmLoop:
                 self.down_at = None
                 arm_at = self.arm_at if self.wake_open else None
                 ignore, self.wake_claimed = consume_wake(
-                    self.wake_claimed, at, arm_at
+                    self.wake_claimed, at, arm_at, nonzero=self.press_nz
                 )
+                self.press_nz = False
                 if ignore:
                     # The power-key press that woke the panel. Not a try.
                     self.w.note(f"miss {kind} ignored: wake press")

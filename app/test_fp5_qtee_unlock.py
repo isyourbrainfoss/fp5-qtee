@@ -35,6 +35,9 @@ from fp5_qtee_unlock import (
     notify_args,
     pump_lines,
     screen_is_on,
+    armed_hold,
+    listen_done_text,
+    verify_score,
     wake_press,
 )
 
@@ -492,6 +495,60 @@ class WakePressTest(unittest.TestCase):
         # Fallback when the session cannot say the finger was already down.
         self.assertAlmostEqual(fp5_qtee_unlock.WAKE_GRACE_S, 1.0)
 
+    def test_nonzero_score(self) -> None:
+        line = "REPORT_EV5 qsee: FtVerifySubTemplate() score = 5, matchCnts = 13"
+        self.assertEqual(verify_score(line), 5)
+        self.assertEqual(
+            verify_score("FtVerifySubTemplate() score = 0, matchCnts = 17"), 0
+        )
+        self.assertIsNone(verify_score("AUTH FAIL 1 itype=0x2 esd=0 avgv=259 fid=0 rc=-11"))
+
+    def test_nonzero_score_is_not_ignored(self) -> None:
+        ignore, claimed = fp5_qtee_unlock.consume_wake(
+            False, 10.2, 10.0, 1.0, nonzero=True
+        )
+        self.assertFalse(ignore)
+        self.assertTrue(claimed)
+
+    def test_zero_score_wake_is_still_ignored(self) -> None:
+        ignore, claimed = fp5_qtee_unlock.consume_wake(
+            False, 10.2, 10.0, 1.0, nonzero=False
+        )
+        self.assertTrue(ignore)
+        self.assertTrue(claimed)
+
+    def test_flicker_hold(self) -> None:
+        stop, since = armed_hold(True, "seat unlocked", None, 10.0)
+        self.assertFalse(stop)
+        self.assertEqual(since, 10.0)
+        stop, since = armed_hold(True, "seat unlocked", 10.0, 11.9)
+        self.assertFalse(stop)
+        stop, since = armed_hold(True, "lock unknown", 10.0, 12.0)
+        self.assertTrue(stop)
+        self.assertEqual(since, 10.0)
+        stop, _since = armed_hold(False, "seat unlocked", None, 10.0)
+        self.assertTrue(stop)
+        stop, since = armed_hold(True, "qsee_fingerpr loaded", 10.0, 10.1)
+        self.assertTrue(stop)
+        self.assertIsNone(since)
+        stop, _since = armed_hold(True, "not wanted", None, 10.0)
+        self.assertTrue(stop)
+
+    def test_listen_stop_names_the_reason(self) -> None:
+        self.assertEqual(
+            listen_done_text("stop", "seat unlocked"),
+            "listen done stop: seat unlocked",
+        )
+        self.assertEqual(
+            listen_done_text("stop", None),
+            "listen done stop: unspecified",
+        )
+        self.assertEqual(listen_done_text("miss", None), "listen done miss")
+        self.assertEqual(
+            listen_done_text("error", "qcomtee load failed"),
+            "listen done error: qcomtee load failed",
+        )
+
     def test_down_line(self) -> None:
         self.assertTrue(is_down("AUTH 1 REAL DOWN itype=0x2\n"))
         self.assertFalse(is_down("AUTH 1 arm mode=1 irq=4"))
@@ -695,6 +752,34 @@ class FollowTest(unittest.TestCase):
         self.assertTrue(any("wake press" in n for n in self.notes))
         self.assertFalse(self.w._wake_open)
 
+    def test_wake_nonzero_score_is_a_strike(self) -> None:
+        # 20:18:02Z: one subtemplate scored 5 and the wake rule dropped it.
+        out = self._wake_case([
+            "AUTH 1 arm mode=1 irq=4\n",
+            "AUTH 1 REAL DOWN itype=0x2\n",
+            "REPORT_EV5 qsee: FtVerifySubTemplate() score = 0, matchCnts = 12\n",
+            "REPORT_EV5 qsee: FtVerifySubTemplate() score = 5, matchCnts = 13\n",
+            "AUTH FAIL 1 itype=0x2 esd=0 avgv=259 fid=0 rc=-11\n",
+            "session_exit:2\n",
+        ], [22.0, 22.2], reopen=True)
+        self.assertEqual(out, "miss")
+        self.assertEqual(self.w.policy.failed, 1)
+        self.assertEqual(self.misses, ["nomatch"])
+        self.assertFalse(any("ignored" in n for n in self.notes))
+
+    def test_wake_all_zero_scores_stay_ignored(self) -> None:
+        out = self._wake_case([
+            "AUTH 1 arm mode=1 irq=4\n",
+            "AUTH 1 REAL DOWN itype=0x2\n",
+            "REPORT_EV5 qsee: FtVerifySubTemplate() score = 0, matchCnts = 17\n",
+            "AUTH FAIL 1 itype=0x2 esd=0 avgv=241 fid=0 rc=-11\n",
+            "session_exit:2\n",
+        ], [22.0, 22.2], reopen=True)
+        self.assertEqual(out, "miss")
+        self.assertEqual(self.w.policy.failed, 0)
+        self.assertEqual(self.misses, [])
+        self.assertTrue(any("wake press" in n for n in self.notes))
+
     def test_wake_press_partial_is_silent(self) -> None:
         self._wake_case([
             "AUTH 1 arm mode=1 irq=4\n",
@@ -788,6 +873,41 @@ class FollowTest(unittest.TestCase):
             # Locked, screen off: keep the sensor armed for the wake press.
             self.assertTrue(self.w.still_wanted("c4", lock))
         self.assertEqual(len(asks), 1)
+
+    def test_unlock_before_arm_stops_at_once(self) -> None:
+        notes: list[str] = []
+        self.w.note = lambda text: notes.append(text)  # type: ignore[method-assign]
+        self.w._lock_state = lambda: False
+        self.w._clock = lambda: 0.0  # type: ignore[method-assign]
+        proc = FakeProc(["booting\n"])
+        t0 = time.monotonic()
+        out = self.w.follow("c4", proc, lambda: False, poll_s=0.01)  # type: ignore[arg-type]
+        self.assertEqual(out, "stop")
+        self.assertEqual(self.w._listen_why, "seat unlocked")
+        self.assertFalse(any("holding" in n for n in notes))
+        self.assertLess(time.monotonic() - t0, 1.0)
+
+    def test_armed_flicker_holds_then_stops(self) -> None:
+        ticks = [0.0]
+        calls = [0]
+        notes: list[str] = []
+        self.w.note = lambda text: notes.append(text)  # type: ignore[method-assign]
+        self.w._clock = lambda: ticks[0]  # type: ignore[method-assign]
+        self.w._lock_state = lambda: False
+
+        def wanted() -> bool:
+            calls[0] += 1
+            if calls[0] >= 2:
+                ticks[0] = 2.0
+            return False
+
+        proc = FakeProc(["AUTH 1 arm mode=1 irq=4\n"])
+        t0 = time.monotonic()
+        out = self.w.follow("c4", proc, wanted, poll_s=0.01)  # type: ignore[arg-type]
+        self.assertEqual(out, "stop")
+        self.assertEqual(self.w._listen_why, "seat unlocked")
+        self.assertTrue(any("holding armed session: seat unlocked" in n for n in notes))
+        self.assertLess(time.monotonic() - t0, 1.0)
 
 
 class FakeWarm:
