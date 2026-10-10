@@ -9,19 +9,26 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import struct
+
 import fp5_qtee_haptic
 from fp5_qtee_haptic import (
     AMPLITUDE,
     GAIN,
     MISS_OFF_MS,
     MISS_ON_MS,
+    RUMBLE_MAGNITUDE,
     SUCCESS_MS,
     Haptic,
     enroll_accept,
     fbcli_args,
+    ff_play_event,
+    ff_steps,
+    find_ff,
     find_led,
     parse_profile,
     plays,
+    rumble_effect,
     sysfs_steps,
     waveform,
 )
@@ -48,6 +55,28 @@ class WaveTest(unittest.TestCase):
         self.assertIsNone(waveform(""))
         self.assertIsNone(sysfs_steps("lockout"))
         self.assertIsNone(fbcli_args("lockout"))
+        self.assertIsNone(ff_steps("lockout"))
+
+    def test_ff_steps_keep_the_130ms_gap(self) -> None:
+        self.assertEqual(ff_steps("success"), [("rumble", SUCCESS_MS)])
+        self.assertEqual(
+            ff_steps("miss"),
+            [("rumble", MISS_ON_MS), ("sleep", 130), ("rumble", MISS_ON_MS)],
+        )
+
+    def test_rumble_magnitude_is_android_gain(self) -> None:
+        raw = rumble_effect(SUCCESS_MS)
+        self.assertEqual(len(raw), 48)
+        typ, effect_id = struct.unpack_from("<Hh", raw, 0)
+        self.assertEqual(typ, 0x50)
+        self.assertEqual(effect_id, -1)
+        length, delay = struct.unpack_from("<HH", raw, 10)
+        strong, weak = struct.unpack_from("<HH", raw, 16)
+        self.assertEqual((length, delay), (SUCCESS_MS, 0))
+        self.assertEqual(strong, RUMBLE_MAGNITUDE)
+        self.assertEqual(strong, 0xFFFF)
+        self.assertEqual(weak, 0)
+        self.assertEqual(len(ff_play_event(3)), 24)
 
     def test_profile(self) -> None:
         self.assertFalse(plays(None))
@@ -74,6 +103,8 @@ class ThemeTest(unittest.TestCase):
         path = Path(fp5_qtee_haptic.__file__).with_name("fp5-qtee-feedback.json")
         theme = json.loads(path.read_text(encoding="utf-8"))
         names = [p["name"] for p in theme["profiles"]]
+        self.assertEqual(theme["name"], "fp5-qtee")
+        self.assertEqual(theme["parent-name"], "default")
         self.assertEqual(names, ["full", "quiet"])
         self.assertNotIn("silent", names)
         for profile in theme["profiles"]:
@@ -175,6 +206,41 @@ class PlayTest(unittest.TestCase):
             self.assertEqual(haptic.play_sync("miss"), "fbcli")
             self.assertEqual(haptic.play_sync("lockout"), "none")
         self.assertEqual(ran, [fbcli_args("miss")])
+
+    def test_no_feedbackd_uses_evdev_rumble(self) -> None:
+        played: list[int] = []
+        sleeps: list[float] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            haptic = Haptic(
+                profile="full",
+                leds=Path(tmp),
+                feedback=False,
+                rumble=played.append,
+                sleeper=sleeps.append,
+                enabled=True,
+            )
+            self.assertEqual(haptic.play_sync("miss"), "evdev")
+            self.assertEqual(haptic.play_sync("success"), "evdev")
+            self.assertEqual(haptic.play_sync("lockout"), "none")
+        self.assertEqual(played, [MISS_ON_MS, MISS_ON_MS, SUCCESS_MS])
+        self.assertEqual(sleeps, [0.13])
+
+    def test_finds_aw869_event_node(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dev = root / "dev"
+            sysfs = root / "sys"
+            event = dev / "event3"
+            event.parent.mkdir()
+            event.write_text("")
+            name = sysfs / "event3" / "device"
+            name.mkdir(parents=True)
+            (name / "name").write_text("aw86927-haptics\n")
+            (sysfs / "event0" / "device").mkdir(parents=True)
+            (dev / "event0").write_text("")
+            (sysfs / "event0" / "device" / "name").write_text("gpio-keys\n")
+            self.assertEqual(find_ff(dev, sysfs), event)
+            self.assertIsNone(find_ff(dev / "missing", sysfs))
 
     def test_env_profile_overrides_the_bus(self) -> None:
         called = []

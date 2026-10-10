@@ -1,5 +1,6 @@
 {
   "name": "fp5-qtee",
+  "parent-name": "default",
   "profiles": [
     {
       "name": "full",

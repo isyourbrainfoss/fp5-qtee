@@ -37,12 +37,14 @@ A real press that does not unlock gives feedback straight away: two
 the same amplitude, plus a transient notification ("Not recognized" or
 "Finger not read"). A match is a single 20 ms click. The silent
 feedbackd profile plays nothing. Lockout adds no extra vibration. Each
-counted enroll sample in the Finger app uses that same click. The
-waveform is written to the aw86927 LED device (`duration` then
-`activate`) when that device is present, and otherwise named as the
-feedbackd events `fp5-qtee-match` and `fp5-qtee-miss`
-(`app/fp5-qtee-feedback.json`, which plays nothing until it is merged
-into the installed theme). `FP5_QTEE_HAPTIC=0` turns both off.
+counted enroll sample in the Finger app uses that same click. When
+feedbackd has opened the aw86927, those clicks are the events
+`fp5-qtee-match` and `fp5-qtee-miss` from `app/fp5-qtee-feedback.json`
+(install it as `~/.config/feedbackd/themes/fp5-qtee.json` and select
+that theme; it parents `default`). Otherwise the watcher uploads
+`FF_RUMBLE` on the input device. Magnitude `0xffff` is gain `0x80` on
+this chip. An LED `duration` / `activate` node is used only when one
+exists. `FP5_QTEE_HAPTIC=0` turns this off.
 
 The watcher follows Android's rules for when a finger may unlock:
 
@@ -265,13 +267,10 @@ What does not match yet:
   match starts happening in a pocket.
 - The finger enrolled on Android (template id 1250370140) is not the
   postmarketOS finger. The watcher uses the id the session prints.
-- The haptic timings are not confirmed on the phone. `fbcli` cannot pass
-  a custom waveform. The sysfs player (`duration`, then `activate`) is
-  what produces the milliseconds above. `app/fp5-qtee-feedback.json`
-  plays nothing until it is merged into the installed feedbackd theme.
-- `scripts/fp5-qtee-load.service` is not installed. After a reboot
-  `/dev/tee0` is still missing until that unit, or `load-qcomtee.sh`,
-  has been run on the phone.
+- `scripts/fp5-qtee-load.service` is not installed by the repository.
+  After a reboot `/dev/tee0` is still missing until that unit, or
+  `load-qcomtee.sh`, has been run on the phone. The unit itself is in
+  `scripts/`.
 - The capture integration time is unchanged (Android used 144 and 128).
   Android's detect client is not used. The 30 second lockout is the
   length kept here; that capture did not measure the timed lockout
