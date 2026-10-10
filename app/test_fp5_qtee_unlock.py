@@ -406,16 +406,17 @@ class PumpAndThrottleTest(unittest.TestCase):
 
 class WakePressTest(unittest.TestCase):
     def test_window(self) -> None:
-        self.assertTrue(wake_press(100.3, 100.0, 0.4))
-        self.assertTrue(wake_press(99.9, 100.0, 0.4))  # panel poll lag
-        self.assertTrue(wake_press(100.4, 100.0, 0.4))
-        self.assertFalse(wake_press(100.41, 100.0, 0.4))
-        self.assertFalse(wake_press(100.0, None, 0.4))
+        # Already down at the arm line, or the IRQ within ~300 ms.
+        self.assertTrue(wake_press(100.0, 100.0, 1.0))
+        self.assertTrue(wake_press(100.3, 100.0, 1.0))
+        self.assertTrue(wake_press(101.0, 100.0, 1.0))
+        self.assertFalse(wake_press(101.01, 100.0, 1.0))
+        self.assertFalse(wake_press(100.0, None, 1.0))
         self.assertFalse(wake_press(100.0, 100.0, 0.0))
 
-    def test_default_covers_the_measured_wake(self) -> None:
-        # Coldest scored wake on 2026-10-10 was 7.5 s after panel-on.
-        self.assertAlmostEqual(fp5_qtee_unlock.WAKE_GRACE_S, 8.0)
+    def test_default_is_one_second_from_arm(self) -> None:
+        # Fallback when the session cannot say the finger was already down.
+        self.assertAlmostEqual(fp5_qtee_unlock.WAKE_GRACE_S, 1.0)
 
     def test_down_line(self) -> None:
         self.assertTrue(is_down("AUTH 1 REAL DOWN itype=0x2\n"))
@@ -542,66 +543,115 @@ class FollowTest(unittest.TestCase):
             self.w.lock_state("c4")
         self.assertEqual(self.w.policy.why_not(), "lockout-permanent")
 
-    def _wake_case(self, lines: list[str], down_after: float) -> str:
-        now = [1000.0]
-        self.w._clock = lambda: now[0]  # type: ignore[assignment]
-        self.w.panel_on_at = 1000.0
+    def _wake_case(self, lines: list[str], times: list[float],
+                   reopen: bool = False) -> str:
+        """times are successive _clock() reads: arm, then finger-down."""
+        seq = list(times)
+        idx = [0]
+
+        def clock() -> float:
+            i = min(idx[0], len(seq) - 1)
+            idx[0] += 1
+            return seq[i]
+
+        self.w._clock = clock  # type: ignore[method-assign]
+        if reopen:
+            self.w._wake_open = True
+            self.w._arm_at = None
+            self.w._wake_claimed = False
         proc = FakeProc(lines, then_exit=True)
-        orig = self.w.note
         self.notes: list[str] = []
         self.w.note = lambda text: self.notes.append(text)  # type: ignore[method-assign]
-        now[0] = 1000.0 + down_after
-        out = self.w.follow("c4", proc, lambda: True, poll_s=0.01)  # type: ignore[arg-type]
-        self.w.note = orig  # type: ignore[method-assign]
-        return out
+        return self.w.follow("c4", proc, lambda: True, poll_s=0.01)  # type: ignore[arg-type]
 
     def test_wake_press_miss_is_ignored(self) -> None:
+        # 07:48:21Z: first listen, REAL DOWN with no leftover, within 1 s of arm.
         out = self._wake_case([
+            "AUTH 1 arm mode=1 irq=428\n",
             "AUTH 1 REAL DOWN itype=0x2\n",
-            "AUTH FAIL 1 itype=0x2 esd=0 avgv=291 fid=0 rc=-11\n",
+            "AUTH FAIL 1 itype=0x2 esd=0 avgv=241 fid=0 rc=-11\n",
             "session_exit:2\n",
-        ], 0.15)
+        ], [22.0, 22.2], reopen=True)
         self.assertEqual(out, "miss")
         self.assertEqual(self.w.policy.failed, 0)
         self.assertEqual(self.misses, [])
         self.assertTrue(any("wake press" in n for n in self.notes))
+        self.assertFalse(self.w._wake_open)
 
     def test_wake_press_partial_is_silent(self) -> None:
-        self._wake_case(["AUTH 1 REAL DOWN itype=0x2\n",
-                         "AUTH 1 empty avgv=0,0,0\n", "session_exit:2\n"], 0.1)
+        self._wake_case([
+            "AUTH 1 arm mode=1 irq=4\n",
+            "AUTH 1 REAL DOWN itype=0x2\n",
+            "AUTH 1 empty avgv=0,0,0\n",
+            "session_exit:2\n",
+        ], [10.0, 10.1], reopen=True)
         self.assertEqual(self.misses, [])
+        self.assertEqual(self.w.policy.failed, 0)
 
     def test_wake_press_hit_still_unlocks(self) -> None:
         out = self._wake_case([
+            "AUTH 1 arm mode=1 irq=4\n",
             "AUTH 1 REAL DOWN itype=0x2\n",
             "AUTH HIT 1 itype=0x2 avgv=304 fid=1403494260 rc=0\n",
-        ], 0.1)
+        ], [10.0, 10.1], reopen=True)
         self.assertEqual(out, "hit")
         self.assertEqual(self.unlocked, [("c4", 1403494260)])
+        self.assertEqual(self.w.policy.failed, 0)
 
-    def test_miss_after_wake_window_is_a_strike(self) -> None:
+    def test_miss_seconds_after_arm_is_a_strike(self) -> None:
+        # 08:08:43Z and 08:08:54Z: the finger arrived seconds after arm.
         self._wake_case([
+            "AUTH 1 arm mode=1 irq=476\n",
             "AUTH 1 REAL DOWN itype=0x2\n",
             "AUTH FAIL 1 itype=0x2 esd=0 avgv=291 fid=0 rc=-11\n",
             "session_exit:2\n",
-        ], 8.5)
+        ], [44.0, 46.8], reopen=True)
+        self.assertEqual(self.w.policy.failed, 1)
+        self.assertEqual(self.misses, ["nomatch"])
+        self.assertFalse(any("wake press" in n for n in self.notes))
+
+    def test_second_listen_quick_press_counts(self) -> None:
+        # 07:48:24Z: next listen, no new panel-on, its own down was quick.
+        self._wake_case([
+            "AUTH 1 arm mode=1 irq=428\n",
+            "AUTH 1 REAL DOWN itype=0x2\n",
+            "AUTH FAIL 1 itype=0x2 esd=0 avgv=241 fid=0 rc=-11\n",
+            "session_exit:2\n",
+        ], [22.0, 22.2], reopen=True)
+        self.assertEqual(self.w.policy.failed, 0)
+        self._wake_case([
+            "AUTH 1 arm mode=1 irq=439\n",
+            "AUTH 1 REAL DOWN itype=0x2\n",
+            "AUTH FAIL 1 itype=0x2 esd=0 avgv=236 fid=0 rc=-11\n",
+            "session_exit:2\n",
+        ], [24.5, 24.6])
         self.assertEqual(self.w.policy.failed, 1)
         self.assertEqual(self.misses, ["nomatch"])
 
-    def test_second_press_inside_the_window_counts(self) -> None:
+    def test_stop_before_arm_keeps_the_wake_slot(self) -> None:
+        # 08:09:09Z: panel off while the session was still starting.
+        self.w._wake_open = True
+        proc = FakeProc(["booting\n"], then_exit=True)
+        self.w.follow("c4", proc, lambda: True, poll_s=0.01)  # type: ignore[arg-type]
+        self.assertTrue(self.w._wake_open)
         self._wake_case([
+            "AUTH 1 arm mode=1 irq=614\n",
             "AUTH 1 REAL DOWN itype=0x2\n",
             "AUTH FAIL 1 itype=0x2 esd=0 avgv=291 fid=0 rc=-11\n",
             "session_exit:2\n",
-        ], 6.4)
+        ], [15.1, 15.3])
         self.assertEqual(self.w.policy.failed, 0)
-        self.assertEqual(self.misses, [])
-        self._wake_case([
-            "AUTH 1 REAL DOWN itype=0x2\n",
-            "AUTH FAIL 1 itype=0x2 esd=0 avgv=280 fid=0 rc=-11\n",
+
+    def test_arm_does_not_notify(self) -> None:
+        sent: list[str] = []
+        self.w.notify = lambda text: sent.append(text)  # type: ignore[method-assign]
+        proc = FakeProc([
+            "AUTH 1 arm mode=1 irq=4\n",
+            "AUTH FAIL 1 itype=0x2 esd=0 avgv=291 fid=0 rc=-11\n",
             "session_exit:2\n",
-        ], 6.2)
-        self.assertEqual(self.w.policy.failed, 1)
+        ], then_exit=True)
+        self.w.follow("c4", proc, lambda: True, poll_s=0.01)  # type: ignore[arg-type]
+        self.assertEqual(sent, [])
         self.assertEqual(self.misses, ["nomatch"])
 
     def test_partial_press_is_told(self) -> None:
@@ -1057,15 +1107,17 @@ class WarmRelockTest(WarmLoopTest.__base__):  # type: ignore[misc]
         self.panel[0] = True                  # power key wakes the panel
         self.step()
         self.assertEqual(warm.sent[-1], "auth")
-        warm.say("AUTH 1 REAL DOWN itype=0x2", self.FAIL,
+        warm.say("AUTH 1 arm mode=1 irq=428",
+                 "AUTH 1 REAL DOWN itype=0x2", self.FAIL,
                  "SERVE result 2", "SERVE idle")
-        self.step()                           # 0.2 s after panel-on
+        self.step()                           # down at the arm line: wake finger
         self.assertEqual(self.w.policy.failed, 0)
         self.assertNotIn(("miss", "nomatch"), self.events)
-        self.now[0] += 1.0
-        warm.say("AUTH 1 REAL DOWN itype=0x2", self.FAIL,
+        self.assertFalse(self.loop.wake_open)
+        warm.say("AUTH 2 arm mode=1 irq=439",
+                 "AUTH 1 REAL DOWN itype=0x2", self.FAIL,
                  "SERVE result 2", "SERVE idle")
-        self.step()                           # a real try later
+        self.step()                           # next listen, still quick
         self.assertEqual(self.w.policy.failed, 1)
         self.assertIn(("miss", "nomatch"), self.events)
 
@@ -1077,10 +1129,19 @@ class WarmRelockTest(WarmLoopTest.__base__):  # type: ignore[misc]
         self.step()
         self.panel[0] = True
         self.step()
-        warm.say("AUTH 1 REAL DOWN itype=0x2", self.HIT,
+        warm.say("AUTH 1 arm mode=1 irq=476",
+                 "AUTH 1 REAL DOWN itype=0x2", self.HIT,
                  "SERVE result 0", "SERVE idle")
         self.step()
         self.assertEqual(self.unlocks(), [("unlock", "c4", 1403494260)])
+
+    def test_auth_does_not_notify(self) -> None:
+        self.step()
+        warm = self.started[0]
+        warm.say("SERVE idle")
+        self.step()
+        self.assertEqual(warm.sent, ["auth"])
+        self.assertEqual([e for e in self.events if e[0] == "notify"], [])
 
 
 class LockSignalTest(unittest.TestCase):

@@ -68,11 +68,13 @@ The watcher follows Android's rules for when a finger may unlock:
   one with avgv 600 or more. While the finger stays down a miss is tried
   again, up to three bursts, and then one reject is one strike. Enrollment
   still needs all three frames in range. The power key is the sensor.
-  The first no-match of a panel-on period is ignored when its finger-down
-  is within `FP5_QTEE_WAKE_GRACE_MS` (default 8000 ms) of panel-on: no
-  strike, no buzz, no notice. That covers the wake finger, which on this
-  phone arrived 1.4 s to 7.5 s after the panel came on. A later press
-  still counts. A hit from the wake press still unlocks. A scored non-match counts even if
+  The first listen after the panel comes on ignores one no-match when
+  that finger was already down at arm, or the finger-down arrived within
+  `FP5_QTEE_WAKE_GRACE_MS` (default 1000 ms) of that session's arm line:
+  no strike, no buzz, no notice. The session does not report "already
+  down", so the grace is measured from the arm line, not from panel-on.
+  A later press counts, even a quick one. A hit from the wake press still
+  unlocks. A scored non-match counts even if
   the panel went off while it was being scored. The count and the end of
   the timed lockout are kept in `$XDG_RUNTIME_DIR/fp5-qtee-lockout` (mode
   0600, written atomically), so a crash and `Restart=on-failure` keep the
@@ -147,11 +149,11 @@ repository does not patch the kernel.
 
 With the flag unset, a dark phone does not arm the sensor and a press
 cannot unlock. Warm mode may still preload the session while the phone is
-locked and dark; it does not treat that press as a wake. The no-match from
-the first no-match from the power-key press that turns the panel on is
-still ignored for `FP5_QTEE_WAKE_GRACE_MS` (default 8000 ms). A later
-press in that window still counts. A hit from the wake press still
-unlocks.
+locked and dark; it does not treat that press as a wake. The first
+listen after the panel comes on still ignores one no-match whose
+finger-down is within `FP5_QTEE_WAKE_GRACE_MS` (default 1000 ms) of that
+session's arm. A later press counts, even a quick one. A hit from the
+wake press still unlocks.
 
 `FP5_QTEE_DARK_ARM=1` arms while the panel is off. A hit then writes `0`
 to the backlight `bl_power` file and `on` to the DSI `dpms` file. A miss
@@ -256,9 +258,9 @@ What matches:
   unlock for 30 seconds. Twenty misses lock it until the PIN is used.
   The PIN clears the lockout immediately. The notice text is the
   notification summary, which is the line Phosh's lock screen shows.
-- A miss never wakes the screen. Only a hit can unlock. The no-match
-  from the press that turns the panel on, within 8 s, is not a strike.
-  A hit from that press still unlocks.
+- A miss never wakes the screen. Only a hit can unlock. The finger
+  already down when the first listen arms is not a strike. A later press
+  counts. A hit from that wake press still unlocks.
 
 What does not match yet:
 

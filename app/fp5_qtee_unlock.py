@@ -39,13 +39,14 @@ POISON = {0, 0xAAAAAAAA, 0xA5A5A5A5}
 PANEL_POLL_S = 0.2
 LOCK_POLL_S = 1.0
 SESSION_ID_TTL_S = 30.0
-# The power key is the fingerprint sensor on FP5, so the press that wakes
-# the panel is often read as a finger. The session is not armed until
-# after the panel is on, so that finger-down is late. On 2026-10-10 the
-# first IRQ of a wake was 1.4 s to 7.5 s after DSI modeset (6.4 s for the
-# cold miss). The first no-match inside this window is ignored: no strike,
-# no buzz, no notice. A later press still counts. A hit still unlocks.
-WAKE_GRACE_S = float(os.environ.get("FP5_QTEE_WAKE_GRACE_MS", "8000")) / 1000.0
+# The power key is the sensor, so the finger that is already down when the
+# first listen after panel-on arms is not a try. The session does not say
+# "already down"; it logs AUTH arm and then REAL DOWN. That down is within
+# about 300 ms when the IRQ is already pending, and the work-mode command
+# sits between the arm line and the wait, so the default grace is 1 s from
+# the arm line (not from panel-on). Only that first no-match is ignored.
+# A later press counts, even a quick one. A hit still unlocks.
+WAKE_GRACE_S = float(os.environ.get("FP5_QTEE_WAKE_GRACE_MS", "1000")) / 1000.0
 _HIT = re.compile(r"^AUTH HIT \d+ .* fid=(\d+) ")
 _ARM = re.compile(r"^AUTH \d+ arm ")
 # auth_once prints these after a real finger-down (itype 0x2):
@@ -155,27 +156,29 @@ def is_down(line: str) -> bool:
     return _DOWN.match(line.strip()) is not None
 
 
-def wake_press(down_at: float, panel_on_at: float | None,
+def wake_press(down_at: float, arm_at: float | None,
                grace_s: float = WAKE_GRACE_S) -> bool:
-    """True when a press went down within grace_s of the panel turning on.
+    """True when finger-down is within grace_s of this listen's arm.
 
-    The panel is polled, so panel_on_at can be a little after the real
-    wake; a press before it also counts. Without a seen off -> on change
-    (panel_on_at None) nothing is a wake press.
+    arm_at is the watcher clock when the AUTH arm line was read. None
+    means this press is not the wake press: no arm yet, or not the first
+    listen after the panel came on.
     """
-    if panel_on_at is None or grace_s <= 0:
+    if arm_at is None or grace_s <= 0:
         return False
-    return down_at <= panel_on_at + grace_s
+    return down_at <= arm_at + grace_s
 
 
-def consume_wake(claimed: bool, at: float, panel_on_at: float | None,
+def consume_wake(claimed: bool, at: float, arm_at: float | None,
                  grace_s: float = WAKE_GRACE_S) -> tuple[bool, bool]:
     """(ignore this no-match, claimed after).
 
-    Only the first no-match inside the grace is the power-key wake.
-    A second press in the same panel-on period is a real try.
+    Only the first no-match of the first listen after panel-on, and only
+    when that finger-down is within grace_s of that listen's arm. The
+    caller passes arm_at for that listen and None after it. A later
+    press is a real try, even when it is quick.
     """
-    if claimed or not wake_press(at, panel_on_at, grace_s):
+    if claimed or not wake_press(at, arm_at, grace_s):
         return False, claimed
     return True, True
 
@@ -645,7 +648,6 @@ class UnlockWatcher:
     def __init__(self) -> None:
         self._log = None
         self._sid = Throttle(SESSION_ID_TTL_S, phosh_session_id)
-        self._told_this_lock = False
         marker = default_pin_marker()
         self.policy = UnlockPolicy(marker=marker, state=lockout_state_for(marker))
         self.haptic = Haptic()
@@ -653,9 +655,11 @@ class UnlockWatcher:
         self.dark_arm = False
         self._policy_sid: str | None = None
         self._told_reason: str | None = None
-        # monotonic time the panel was last seen going off -> on.
-        self.panel_on_at: float | None = None
-        # The first no-match of this panel-on period already took the grace.
+        # The first listen after off -> on may ignore one no-match near
+        # its arm line. Closed when that listen finishes after arming, so
+        # a later press counts even when its own down is quick.
+        self._wake_open = False
+        self._arm_at: float | None = None
         self._wake_claimed = False
         self._clock: Callable[[], float] = time.monotonic
 
@@ -832,6 +836,7 @@ class UnlockWatcher:
         reader.start()
         outcome = "miss"
         down_at: float | None = None
+        saw_arm = False
         with path.open("w", encoding="utf-8") as log:
             while True:
                 try:
@@ -845,15 +850,17 @@ class UnlockWatcher:
                     break
                 log.write(line)
                 log.flush()
-                if not self._told_this_lock and armed(line):
-                    self._told_this_lock = True
-                    self.notify("Hold the power button to unlock. PIN still works.")
+                if armed(line):
+                    saw_arm = True
+                    if self._wake_open and self._arm_at is None:
+                        self._arm_at = self._clock()
+                        down_at = None
                 if is_down(line):
                     down_at = self._clock()
                 fid = hit_fid(line)
                 if fid is not None:
                     at = self._clock() if down_at is None else down_at
-                    if wake_press(at, self.panel_on_at):
+                    if self._wake_open and wake_press(at, self._arm_at):
                         self._wake_claimed = True
                     # A hit in the dark can turn the panel on. A miss never
                     # reaches this, so it cannot wake the screen.
@@ -877,8 +884,9 @@ class UnlockWatcher:
                 if kind is not None:
                     at = self._clock() if down_at is None else down_at
                     down_at = None
+                    arm_at = self._arm_at if self._wake_open else None
                     ignore, self._wake_claimed = consume_wake(
-                        self._wake_claimed, at, self.panel_on_at
+                        self._wake_claimed, at, arm_at
                     )
                     if ignore:
                         # The power-key press that woke the panel. Not a try.
@@ -899,6 +907,9 @@ class UnlockWatcher:
                     break
         self._stop(proc)
         reader.join(timeout=2)
+        if saw_arm and self._wake_open:
+            self._wake_open = False
+        self._arm_at = None
         return outcome
 
     def _stop(self, proc: subprocess.Popen[str]) -> None:
@@ -965,7 +976,8 @@ class UnlockWatcher:
                 continue
             if on and not was_on:
                 was_on = True
-                self.panel_on_at = time.monotonic()
+                self._wake_open = True
+                self._arm_at = None
                 self._wake_claimed = False
             elif not on:
                 was_on = False
@@ -985,7 +997,6 @@ class UnlockWatcher:
                 # unlock nor a reason to listen.
                 continue
             if not state:
-                self._told_this_lock = False
                 self._told_reason = None
                 continue
             reason = self.policy.why_not()
@@ -1006,7 +1017,6 @@ class UnlockWatcher:
             self.note(f"listen done {outcome}")
             last_lock_ask = 0.0
             if outcome == "hit":
-                self._told_this_lock = False
                 time.sleep(2.0)
             elif outcome == "error":
                 time.sleep(5.0)
@@ -1144,9 +1154,10 @@ class WarmLoop:
         self._step_no = 0
         self._asked_step = -1
         self.dark_ask_at = 0.0
-        # When the panel was last seen going off -> on, and when the
-        # current press went down. For the wake-press grace.
-        self.panel_on_at: float | None = None
+        # First listen after off -> on. Same rule as UnlockWatcher.
+        self.wake_open = False
+        self.arm_at: float | None = None
+        self.saw_arm = False
         self.wake_claimed = False
         self.down_at: float | None = None
 
@@ -1174,6 +1185,15 @@ class WarmLoop:
         self.warm = None
         self.armed = False
         self.attempt_live = False
+        self._close_armed_listen()
+
+    def _close_armed_listen(self) -> None:
+        """The first armed listen is over. Later presses are real tries."""
+        if not self.saw_arm:
+            return
+        self.wake_open = False
+        self.saw_arm = False
+        self.arm_at = None
 
     def cancel(self) -> None:
         """No hit may unlock from the running attempt any more."""
@@ -1202,13 +1222,21 @@ class WarmLoop:
                 warm.cancel_sent = False
                 self.armed = False
                 self.attempt_live = False
+                self._close_armed_listen()
                 continue
             if line.startswith("SERVE result"):
                 # That attempt is over. Nothing after this is from it.
                 self.attempt_live = False
+                self._close_armed_listen()
                 continue
             if line.startswith("SERVE reject"):
                 self.w.note(f"warm session: {line.strip()}")
+                continue
+            if armed(line):
+                self.saw_arm = True
+                if self.wake_open and self.arm_at is None:
+                    self.arm_at = self.clock()
+                    self.down_at = None
                 continue
             if is_down(line):
                 self.down_at = self.clock()
@@ -1217,7 +1245,7 @@ class WarmLoop:
             if fid is not None:
                 at = self.clock() if self.down_at is None else self.down_at
                 self.down_at = None
-                if wake_press(at, self.panel_on_at):
+                if self.wake_open and wake_press(at, self.arm_at):
                     self.wake_claimed = True
                 self.on_hit(fid, panel)
                 continue
@@ -1225,8 +1253,9 @@ class WarmLoop:
             if kind is not None:
                 at = self.clock() if self.down_at is None else self.down_at
                 self.down_at = None
+                arm_at = self.arm_at if self.wake_open else None
                 ignore, self.wake_claimed = consume_wake(
-                    self.wake_claimed, at, self.panel_on_at
+                    self.wake_claimed, at, arm_at
                 )
                 if ignore:
                     # The power-key press that woke the panel. Not a try.
@@ -1272,7 +1301,6 @@ class WarmLoop:
         self.w.tell_hit()
         self.w.unlock(sid, fid)
         self.believed_locked = False
-        self.w._told_this_lock = False
 
     def ask_lock(self) -> bool | None:
         """LockedHint now: True, False, or None when unknown."""
@@ -1289,7 +1317,6 @@ class WarmLoop:
     def _unlocked(self) -> None:
         self.believed_locked = False
         self.stop()
-        self.w._told_this_lock = False
         self.w._told_reason = None
 
     def step(self) -> None:
@@ -1298,8 +1325,11 @@ class WarmLoop:
         panel = self.panel()
         signalled = self._signalled()
         if panel and self.prev_panel is False:
-            self.panel_on_at = now
+            self.wake_open = True
+            self.arm_at = None
+            self.saw_arm = False
             self.wake_claimed = False
+            self.down_at = None
         self.drain(panel)
         if not panel and not self.dark_arm:
             self.cancel()
@@ -1380,9 +1410,7 @@ class WarmLoop:
         warm.idle = False
         self.armed = True
         self.attempt_live = True
-        if not self.w._told_this_lock:
-            self.w._told_this_lock = True
-            self.w.notify("Hold the power button to unlock. PIN still works.")
+        self.down_at = None
 
 
 def main() -> None:
