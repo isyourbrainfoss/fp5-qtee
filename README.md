@@ -19,17 +19,21 @@ template id 1403494260, a real finger-down (`itype` `0x2`), and
 `authentication failed`.
 
 Phosh does not ask PAM until a PIN is submitted, so the finger is not a PAM
-module. While the lock screen is showing and the panel is on, `fp5-qtee-unlock`
-runs one match (`unlock` mode, a single press). A real hit calls
-`loginctl unlock-session` on the Phosh session. The panel being off does not
-listen unless `FP5_QTEE_DARK_ARM=1`. A miss does not unlock and does not
-wake the screen. Only a hit can unlock. PIN still works. On 2026-10-08 the
-user confirmed that this dismisses the Phosh lock screen.
+module. While the seat is locked, `fp5-qtee-unlock` keeps one match armed
+(`unlock` mode), including while the panel is off, so the wake press is a
+new edge on a sensor that was calibrated with no finger. A finger already
+down when that session arms is queried and captured; holding it is enough.
+Up to three bursts run while the finger stays down. A real hit calls
+`loginctl unlock-session` once the panel is on (the power key turns it
+on). A hit that leaves the panel off does not unlock. A miss while the
+panel stays off is not a strike and does not wake the screen. Only a hit
+can unlock. PIN still works. On 2026-10-08 the user confirmed that this
+dismisses the Phosh lock screen.
 
-The watcher reads the panel state from sysfs every 0.2 s and, unless
-`FP5_QTEE_DARK_ARM=1`, asks logind only while the panel is on. While a
-match waits for a finger it keeps checking: panel off, or an unlock with
-the PIN, stops the session at once. A hit is checked once more before
+The watcher reads the panel from sysfs every 0.2 s. It asks logind while
+the seat may be locked, including with the panel off. An unlock with the
+PIN stops the session. The panel going off does not. A hit is checked
+again, and the panel must be on or come on within about a second, before
 `unlock-session`.
 
 A real press that does not unlock gives feedback straight away: two
@@ -68,14 +72,12 @@ The watcher follows Android's rules for when a finger may unlock:
   one with avgv 600 or more. While the finger stays down a miss is tried
   again, up to three bursts, and then one reject is one strike. Enrollment
   still needs all three frames in range. The power key is the sensor.
-  The first listen after the panel comes on ignores one no-match when
-  that finger was already down at arm, or the finger-down arrived within
-  `FP5_QTEE_WAKE_GRACE_MS` (default 1000 ms) of that session's arm line:
-  no strike, no buzz, no notice. The session does not report "already
-  down", so the grace is measured from the arm line, not from panel-on.
+  The session queries a finger already down at arm and captures it. The
+  first listen that arms after the panel is already on still ignores one
+  no-match when that finger-down is within `FP5_QTEE_WAKE_GRACE_MS`
+  (default 1000 ms) of that arm line: no strike, no buzz, no notice.
   A later press counts, even a quick one. A hit from the wake press still
-  unlocks. A scored non-match counts even if
-  the panel went off while it was being scored. The count and the end of
+  unlocks. A miss while the panel stays off is not a strike. The count and the end of
   the timed lockout are kept in `$XDG_RUNTIME_DIR/fp5-qtee-lockout` (mode
   0600, written atomically), so a crash and `Restart=on-failure` keep the
   lockout. If that file is unreadable, or missing while the PIN marker
@@ -143,22 +145,27 @@ systemctl --user edit fp5-qtee-unlock.service
 ### Screen off (`FP5_QTEE_DARK_ARM`, default off)
 
 The focaltech fingerprint IRQ is not a wakeup source on this kernel, so a
-press cannot resume the CPU from s2idle. The kernel change that would make
-it one is `enable_irq_wake()` on that IRQ, which is gpio 34. This
+press cannot resume the CPU from s2idle by itself. The power key still
+wakes the CPU. The kernel change that would make the sensor IRQ a wake
+source is `enable_irq_wake()` on that IRQ, which is gpio 34. This
 repository does not patch the kernel.
 
-With the flag unset, a dark phone does not arm the sensor and a press
-cannot unlock. Warm mode may still preload the session while the phone is
-locked and dark; it does not treat that press as a wake. The first
-listen after the panel comes on still ignores one no-match whose
+The cold watcher keeps a session armed while the seat is locked and the
+panel is off. When the CPU is awake, the wake press is a new edge. A
+finger already down at arm, or still down when the panel comes on and
+the counter did not move, is queried once and captured when the type is
+an exact finger-down. Up to three bursts run while it stays down. A hit
+unlocks only if the panel is on or comes on within about a second. A
+miss while the panel stays off is not a strike. The first listen that
+arms after the panel is already on still ignores one no-match whose
 finger-down is within `FP5_QTEE_WAKE_GRACE_MS` (default 1000 ms) of that
-session's arm. A later press counts, even a quick one. A hit from the
-wake press still unlocks.
+arm. A later press counts, even a quick one. A hit from the wake press
+still unlocks.
 
-`FP5_QTEE_DARK_ARM=1` arms while the panel is off. A hit then writes `0`
-to the backlight `bl_power` file and `on` to the DSI `dpms` file. A miss
-never does that, and only a hit can unlock. The write cannot resume a
-suspended CPU until `enable_irq_wake()` is in place.
+`FP5_QTEE_DARK_ARM=1` is the warm-path opt-in that also writes `0` to
+the backlight `bl_power` file and `on` to the DSI `dpms` file on a hit.
+A miss never does that. The write cannot resume a suspended CPU until
+`enable_irq_wake()` is in place.
 
 Log scans, the time-listener reply, and the group-path buffer stop at the
 buffer they were given. A group path that does not fit is refused before it
@@ -266,9 +273,10 @@ What does not match yet:
 
 - The focaltech IRQ (gpio 34) is not a wakeup source.
   `enable_irq_wake()` on that IRQ is the kernel change that would let a
-  finger resume s2idle. It is not in this tree. Screen-off arming is
-  `FP5_QTEE_DARK_ARM=1` and defaults off. With the flag on, a hit only
-  asks a running panel to unblank; it cannot wake a suspended CPU.
+  finger resume s2idle. It is not in this tree. The cold watcher still
+  arms while the seat is locked and the panel is off, and a hit unlocks
+  after the power key has turned the panel on. It cannot wake a
+  suspended CPU on its own.
 - There is no proximity veto. The Android capture did not gate
   authentication on the front proximity sensor. Add one only if a real
   match starts happening in a pocket.

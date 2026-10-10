@@ -65,6 +65,12 @@ void fp5_poison_rem(uint8_t *pay);
 
 /* Exact interrupt type 0x2 and not ESD. 0x212 is not a down. */
 int fp5_real_down(uint32_t itype, int esd);
+/* A query at arm, before any new edge. No printed type is not a finger.
+ * Leftovers and ESD are not a finger. */
+int fp5_down_at_arm(int saw_itype, uint32_t itype, int esd);
+/* The panel came on while this attempt was already waiting. Query even
+ * though irq_count did not move. */
+int fp5_query_on_panel_rise(int was_on, int now_on);
 /* Average value in (0, 600). */
 int fp5_score_sample(uint32_t avgv);
 /* Enrollment: all 3 frames in range. */

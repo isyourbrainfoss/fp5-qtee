@@ -404,6 +404,80 @@ class PumpAndThrottleTest(unittest.TestCase):
         self.assertEqual(t.get(), 3)
 
 
+class AwaitPanelTest(unittest.TestCase):
+    def test_already_on(self) -> None:
+        self.assertTrue(fp5_qtee_unlock.await_panel(
+            lambda: True, 1.0, lambda: True, sleep=lambda _s: None,
+            clock=lambda: 0.0,
+        ))
+
+    def test_comes_on_within_the_grace(self) -> None:
+        now = [0.0]
+        on = [False]
+
+        def clock() -> float:
+            return now[0]
+
+        def sleep(dt: float) -> None:
+            now[0] += dt
+            if now[0] >= 0.2:
+                on[0] = True
+
+        self.assertTrue(fp5_qtee_unlock.await_panel(
+            lambda: on[0], 1.0, lambda: True, sleep=sleep, clock=clock,
+        ))
+        self.assertLess(now[0], 1.0)
+
+    def test_staying_off(self) -> None:
+        now = [0.0]
+
+        def sleep(dt: float) -> None:
+            now[0] += dt
+
+        self.assertFalse(fp5_qtee_unlock.await_panel(
+            lambda: False, 1.0, lambda: True, sleep=sleep, clock=lambda: now[0],
+        ))
+        self.assertGreaterEqual(now[0], 1.0)
+
+    def test_stops_when_no_longer_wanted(self) -> None:
+        now = [0.0]
+
+        def sleep(dt: float) -> None:
+            now[0] += dt
+
+        self.assertFalse(fp5_qtee_unlock.await_panel(
+            lambda: False, 5.0, lambda: now[0] < 0.1,
+            sleep=sleep, clock=lambda: now[0],
+        ))
+        self.assertLess(now[0], 1.0)
+
+    def test_zero_wait_checks_once(self) -> None:
+        self.assertFalse(fp5_qtee_unlock.await_panel(
+            lambda: False, 0.0, lambda: True,
+        ))
+
+
+class PanelRiseTest(unittest.TestCase):
+    def test_rise_before_arm_opens_the_wake_window(self) -> None:
+        w = fp5_qtee_unlock.UnlockWatcher()
+        w._panel_was_on = False
+        self.assertTrue(w._note_panel(True, False))
+        self.assertTrue(w._wake_open)
+
+    def test_rise_after_arm_is_scored(self) -> None:
+        w = fp5_qtee_unlock.UnlockWatcher()
+        w._panel_was_on = False
+        w._wake_open = False
+        self.assertTrue(w._note_panel(True, True))
+        self.assertFalse(w._wake_open)
+
+    def test_already_on_at_start_is_not_a_wake(self) -> None:
+        w = fp5_qtee_unlock.UnlockWatcher()
+        self.assertIsNone(w._panel_was_on)
+        self.assertFalse(w._note_panel(True, False))
+        self.assertFalse(w._wake_open)
+
+
 class WakePressTest(unittest.TestCase):
     def test_window(self) -> None:
         # Already down at the arm line, or the IRQ within ~300 ms.
@@ -517,14 +591,57 @@ class FollowTest(unittest.TestCase):
         self.assertEqual(self.w.policy.failed, 4)
         self.assertIsNone(self.w.policy.why_not())
 
-    def test_miss_counts_even_after_panel_off(self) -> None:
+    def test_miss_counts_when_the_screen_was_on(self) -> None:
+        # The seat can unlock as the line arrives. The press still counts.
         proc = FakeProc(
             ["AUTH FAIL 1 itype=0x2 esd=0 avgv=291 fid=0 rc=-11\n", "session_exit:2\n"],
             then_exit=True,
         )
-        self.w.follow("c4", proc, lambda: False, poll_s=0.01)  # type: ignore[arg-type]
+        self.w.follow(  # type: ignore[arg-type]
+            "c4", proc, lambda: False, poll_s=0.01,
+            panel=lambda: True, wake_wait_s=0,
+        )
         self.assertEqual(self.w.policy.failed, 1)
         self.assertEqual(self.misses, [])
+
+    def test_miss_with_panel_off_is_not_a_strike(self) -> None:
+        proc = FakeProc(
+            ["AUTH FAIL 1 itype=0x2 esd=0 avgv=291 fid=0 rc=-11\n", "session_exit:2\n"],
+            then_exit=True,
+        )
+        notes: list[str] = []
+        self.w.note = lambda text: notes.append(text)  # type: ignore[method-assign]
+        self.w.follow(  # type: ignore[arg-type]
+            "c4", proc, lambda: True, poll_s=0.01,
+            panel=lambda: False, wake_wait_s=0,
+        )
+        self.assertEqual(self.w.policy.failed, 0)
+        self.assertEqual(self.misses, [])
+        self.assertTrue(any("panel off" in n for n in notes))
+
+    def test_hit_with_panel_staying_off_does_not_unlock(self) -> None:
+        proc = FakeProc(["AUTH HIT 1 itype=0x2 avgv=304 fid=1403494260 rc=0\n"])
+        out = self.w.follow(  # type: ignore[arg-type]
+            "c4", proc, lambda: True, poll_s=0.01,
+            panel=lambda: False, wake_wait_s=0,
+        )
+        self.assertEqual(out, "stop")
+        self.assertEqual(self.unlocked, [])
+
+    def test_hit_unlocks_when_the_panel_comes_on(self) -> None:
+        calls = [0]
+
+        def panel() -> bool:
+            calls[0] += 1
+            return calls[0] >= 2
+
+        proc = FakeProc(["AUTH HIT 1 itype=0x2 avgv=304 fid=1403494260 rc=0\n"])
+        out = self.w.follow(  # type: ignore[arg-type]
+            "c4", proc, lambda: True, poll_s=0.01,
+            panel=panel, wake_wait_s=1.0,
+        )
+        self.assertEqual(out, "hit")
+        self.assertEqual(self.unlocked, [("c4", 1403494260)])
 
     def test_unknown_lock_state_stops(self) -> None:
         lock = Throttle(60.0, lambda: None)
@@ -668,7 +785,9 @@ class FollowTest(unittest.TestCase):
                 self.assertTrue(self.w.still_wanted("c4", lock))
         self.assertEqual(len(asks), 1)
         with mock.patch.object(fp5_qtee_unlock, "panel_on", lambda: False):
-            self.assertFalse(self.w.still_wanted("c4", lock))
+            # Locked, screen off: keep the sensor armed for the wake press.
+            self.assertTrue(self.w.still_wanted("c4", lock))
+        self.assertEqual(len(asks), 1)
 
 
 class FakeWarm:

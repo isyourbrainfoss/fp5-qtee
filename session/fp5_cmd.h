@@ -34,10 +34,11 @@ int fp5_cmd_parse(const char *line);
  * final match verdict, and asks it what to do. Pure, so the cancel and
  * re-arm rules have host tests.
  *
- * - A new attempt starts from the irq_count read at arm time. A press
- *   between attempts (cancelled, panel off) is in that baseline and
- *   does not count as a finger-down for the new one. The down and
- *   cancel flags of the previous attempt are cleared.
+ * - A new attempt starts from the irq_count read at arm time. An irq
+ *   change while cancelled is ignored. A finger already down is not an
+ *   irq change; the session queries once and captures only an exact
+ *   down. cancel still refuses that capture. The down and cancel flags
+ *   of the previous attempt are cleared.
  * - cancel or quit marks the attempt cancelled. From then on an irq
  *   change is ignored, and a match is reported as cancelled, never as
  *   a hit.
@@ -62,6 +63,7 @@ enum {
 	FP5_ATT_HIT = 0,
 	FP5_ATT_MISS = 2,
 	FP5_ATT_CANCELLED = 3,
+	FP5_ATT_NONE = 4,	/* armed, no finger-down in this window */
 };
 
 void fp5_att_begin(struct fp5_attempt *a, unsigned irq_now);

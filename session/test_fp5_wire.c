@@ -92,6 +92,17 @@ static void test_decisions(void)
 	expect(!fp5_real_down(0x212, 0), "0x212 leftover");
 	expect(!fp5_real_down(0x2, 1), "esd blocks down");
 	expect(!fp5_real_down(0x12, 0), "0x12 is not down");
+	expect(fp5_down_at_arm(1, 0x2, 0), "held finger at arm");
+	expect(!fp5_down_at_arm(0, 0x2, 0), "query with no type is not a finger");
+	expect(!fp5_down_at_arm(1, 0x212, 0), "0x212 at arm is leftover");
+	expect(!fp5_down_at_arm(1, 0x2, 1), "esd at arm is not a finger");
+	expect(!fp5_down_at_arm(1, 0x0, 0), "idle 0 at arm");
+	expect(!fp5_down_at_arm(1, 0x1, 0), "idle 1 at arm");
+	expect(!fp5_down_at_arm(1, 0x210, 0), "0x210 at arm is not a down");
+	expect(fp5_query_on_panel_rise(0, 1), "panel rise queries");
+	expect(!fp5_query_on_panel_rise(1, 1), "panel staying on does not");
+	expect(!fp5_query_on_panel_rise(0, 0), "panel staying off does not");
+	expect(!fp5_query_on_panel_rise(1, 0), "panel fall does not");
 	expect(fp5_score_sample(300), "avgv 300");
 	expect(!fp5_score_sample(966), "empty avgv");
 	expect(!fp5_score_sample(0), "avgv 0");

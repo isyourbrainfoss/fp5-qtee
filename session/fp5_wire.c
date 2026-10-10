@@ -181,6 +181,18 @@ int fp5_real_down(uint32_t itype, int esd)
 	return itype == 0x2u && !esd;
 }
 
+int fp5_down_at_arm(int saw_itype, uint32_t itype, int esd)
+{
+	if (!saw_itype)
+		return 0;
+	return fp5_real_down(itype, esd);
+}
+
+int fp5_query_on_panel_rise(int was_on, int now_on)
+{
+	return now_on && !was_on;
+}
+
 int fp5_score_sample(uint32_t avgv)
 {
 	return avgv > 0 && avgv < 600;

@@ -3,6 +3,7 @@
 #include "fp5_tee.h"
 #include "fp5_wire.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -298,19 +299,22 @@ static int wait_irq(unsigned *prev, int ms)
 	return 0;
 }
 
-/* Same wait, and subtract the time actually spent from the caller's budget. */
-static int wait_budget(unsigned *prev, int *left_ms)
+/* Wait at most slice ms. Subtract the time actually spent from left. */
+static int wait_slice(unsigned *prev, int *left_ms, int slice)
 {
 	struct timespec a, b;
 	long used;
+	int budget, got;
 
 	if (*left_ms <= 0)
 		return 0;
+	budget = slice;
+	if (budget > *left_ms)
+		budget = *left_ms;
+	if (budget < 1)
+		budget = 1;
 	clock_gettime(CLOCK_MONOTONIC, &a);
-	if (!wait_irq(prev, *left_ms)) {
-		*left_ms = 0;
-		return 0;
-	}
+	got = wait_irq(prev, budget);
 	clock_gettime(CLOCK_MONOTONIC, &b);
 	used = (b.tv_sec - a.tv_sec) * 1000L +
 	       (b.tv_nsec - a.tv_nsec) / 1000000L;
@@ -320,7 +324,7 @@ static int wait_budget(unsigned *prev, int *left_ms)
 		*left_ms = 0;
 	else
 		*left_ms -= (int)used;
-	return 1;
+	return got;
 }
 
 static int mkdir_p(char *path)
@@ -2071,6 +2075,60 @@ static int auth_press(struct svc *s, int which, unsigned *irq,
 	return 2;
 }
 
+/* DSI dpms "On". Missing sysfs is off. The path is cached. */
+static int dsi_is_on(void)
+{
+	static char path[256];
+	char buf[8];
+	int fd, n;
+
+	if (!path[0]) {
+		DIR *dir = opendir("/sys/class/drm");
+		struct dirent *ent;
+
+		if (!dir)
+			return 0;
+		while ((ent = readdir(dir)) != NULL) {
+			if (strncmp(ent->d_name, "card", 4) != 0)
+				continue;
+			if (strstr(ent->d_name, "-DSI-") == NULL)
+				continue;
+			n = snprintf(path, sizeof(path),
+				     "/sys/class/drm/%s/dpms", ent->d_name);
+			if (n < 0 || (size_t)n >= sizeof(path))
+				path[0] = 0;
+			break;
+		}
+		closedir(dir);
+		if (!path[0])
+			return 0;
+	}
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return 0;
+	n = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (n < 2)
+		return 0;
+	buf[n] = 0;
+	return (buf[0] == 'O' || buf[0] == 'o') &&
+	       (buf[1] == 'n' || buf[1] == 'N');
+}
+
+/* 1 when a query says a finger is down, 0 when it does not, -1 on invoke. */
+static int query_held(struct svc *s, uint32_t *itype, int *esd)
+{
+	uint8_t z[4] = { 0 };
+
+	if (send_cmd(s, fp5_op_query(), 4, z, "QEV"))
+		return -1;
+	if (!fp5_down_at_arm(s->last.saw_itype, s->last.itype, s->last.esd))
+		return 0;
+	*itype = s->last.itype;
+	*esd = s->last.esd;
+	return 1;
+}
+
 static int auth_once(struct svc *s, int which)
 {
 	unsigned irq = read_irq();
@@ -2102,9 +2160,9 @@ static int auth_once(struct svc *s, int which)
 	}
 	if (serve_on) {
 		/*
-		 * Fresh attempt: the baseline is this arm's irq_count, so a
-		 * press while cancelled or with the panel off is not a down
-		 * here, and nothing from the last attempt carries over.
+		 * Fresh attempt: the baseline is this arm's irq_count. An irq
+		 * change while cancelled is ignored. A finger already down
+		 * is the query below, and cancel still refuses the capture.
 		 * Commands that came in with "auth" are applied now.
 		 */
 		fp5_att_begin(&serve_att, irq);
@@ -2116,19 +2174,71 @@ static int auth_once(struct svc *s, int which)
 	logf("AUTH %d arm mode=%u irq=%u", which, mode, irq);
 	if (send_cmd(s, fp5_op_wmode(), 4, &mode, "WMODE_TOUCH"))
 		return -1;
-	while (left > 0) {
-		if (!wait_budget(&irq, &left))
-			break;
-		if (send_cmd(s, fp5_op_query(), 4, z, "QEV"))
+	if (serve_on && serve_poll_cmds()) {
+		logf("AUTH %d cancelled", which);
+		return FP5_ATT_CANCELLED;
+	}
+	/*
+	 * irq was sampled before AUTH_ARM. A finger already down sits
+	 * inside that baseline, and wait_irq will not see it. Ask once.
+	 * A mode-switch leftover is not a finger.
+	 */
+	{
+		int held = query_held(s, &itype, &esd);
+
+		if (held < 0)
 			return -1;
-		itype = s->last.itype;
-		esd = s->last.esd;
-		if (fp5_real_down(itype, esd)) {
+		if (held) {
 			down = 1;
-			break;
+			logf("AUTH %d already down itype=0x%x", which, itype);
+		} else if (s->last.saw_itype) {
+			logf("skip leftover itype=0x%x esd=%d",
+			     s->last.itype, s->last.esd);
 		}
-		/* Keep the screen on PRESS. An AUTH-prefixed skip would say LIFT. */
-		logf("skip leftover itype=0x%x esd=%d", itype, esd);
+	}
+	{
+		int panel = dsi_is_on();
+
+		while (!down && left > 0) {
+			int got = wait_slice(&irq, &left, 200);
+			int now_panel;
+
+			if (serve_on && serve_att.cancelled) {
+				logf("AUTH %d cancelled", which);
+				return FP5_ATT_CANCELLED;
+			}
+			if (got) {
+				if (send_cmd(s, fp5_op_query(), 4, z, "QEV"))
+					return -1;
+				itype = s->last.itype;
+				esd = s->last.esd;
+				if (fp5_real_down(itype, esd)) {
+					down = 1;
+					break;
+				}
+				/* Keep the screen on PRESS. An AUTH-prefixed skip would say LIFT. */
+				logf("skip leftover itype=0x%x esd=%d", itype, esd);
+				continue;
+			}
+			/*
+			 * The power key turned the panel on. The GPIO edge
+			 * can be missing when the CPU was suspended. Ask
+			 * once on that rise.
+			 */
+			now_panel = dsi_is_on();
+			if (fp5_query_on_panel_rise(panel, now_panel)) {
+				int held = query_held(s, &itype, &esd);
+
+				if (held < 0)
+					return -1;
+				if (held) {
+					down = 1;
+					logf("AUTH %d held at panel itype=0x%x",
+					     which, itype);
+				}
+			}
+			panel = now_panel;
+		}
 	}
 	if (!down) {
 		if (serve_on && serve_att.cancelled) {
@@ -2136,7 +2246,7 @@ static int auth_once(struct svc *s, int which)
 			return FP5_ATT_CANCELLED;
 		}
 		logf("AUTH %d no finger", which);
-		return 2;
+		return FP5_ATT_NONE;
 	}
 	/* The QEV round trip takes time; a cancel may have come in. */
 	if (serve_on && (serve_poll_cmds() || !fp5_att_down(&serve_att))) {
@@ -2402,14 +2512,21 @@ int main(int argc, char **argv)
 		logf("auth pair %d %d", a, b);
 		rc = (a == 0 && b == 0) ? 0 : 2;
 	} else if (!strcmp(mode, "unlock")) {
-		/* One press for the Phosh lock screen. Match still asks twice. */
-		int a;
+		/* One press for the Phosh lock screen. Match still asks twice.
+		 * Setup and calibration run once. A window with no finger
+		 * arms again in this process, so the next press is not a
+		 * fresh reset with the finger already down. A hit or a
+		 * scored miss ends it; the watcher starts the next one.
+		 */
+		int a, n = 0;
 
 		if (set_group(&s, group_path())) {
 			rc = 1;
 			goto done;
 		}
-		a = auth_once(&s, 1);
+		do {
+			a = auth_once(&s, ++n);
+		} while (a == FP5_ATT_NONE);
 		logf("unlock once %d", a);
 		rc = a == 0 ? 0 : (a < 0 ? 1 : 2);
 	} else if (!strcmp(mode, "serve")) {
