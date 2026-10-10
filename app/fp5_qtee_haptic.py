@@ -402,13 +402,23 @@ class Haptic:
         if self._runner is not None:
             self._runner(args)
             return
+        # fbcli ends the event when stdin hits EOF. A service has no tty,
+        # so leave the pipe open until the double pulse has finished.
         try:
-            subprocess.run(
+            proc = subprocess.Popen(
                 args,
+                stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                check=False,
-                timeout=2,
             )
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+        except OSError:
+            return
+        try:
+            self._sleeper(0.5)
+        finally:
+            if proc.stdin is not None:
+                proc.stdin.close()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
