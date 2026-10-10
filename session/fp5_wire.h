@@ -96,6 +96,13 @@ int fp5_auth_burst(uint32_t itype, int esd, const uint32_t *avgv, int n,
  */
 int fp5_finger_held(unsigned base, unsigned now, int saw_itype,
 		    uint32_t itype, int esd);
+/* Same as fp5_finger_held, except an already-down press whose next query
+ * is idle 0x0. That query is the report's leftover, not a lift, so the
+ * press keeps its remaining bursts. A lift (0x4), ESD, or any other type
+ * still stops. already is 0 on a fresh edge.
+ */
+int fp5_held_for_retry(int already, unsigned base, unsigned now,
+		       int saw_itype, uint32_t itype, int esd);
 /* 1 to capture another burst. Stops at 3, and when the finger has lifted. */
 int fp5_retry_more(int bursts_done, int held);
 /* One press is one strike, however many scored bursts missed. */
@@ -124,6 +131,11 @@ int fp5_sync_config(char *dst, size_t cap, int native_log);
 int fp5_log_is_score(const char *line);
 /* 1 when the session should print this qsee line. Score lines always pass. */
 int fp5_log_keep(const char *line);
+/* Last "there is/are N template(s) loaded" in buf. Returns 1 when the
+ * phrase is present and writes N to *count. A missing phrase returns 0
+ * and leaves *count alone.
+ */
+int fp5_gallery_loaded(const uint8_t *buf, size_t n, int *count);
 
 /* GPFILE. unlink_performs is always 0. write flags never include O_TRUNC. */
 #define FP5_GP_READ 0

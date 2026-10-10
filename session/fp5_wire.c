@@ -280,6 +280,19 @@ int fp5_finger_held(unsigned base, unsigned now, int saw_itype,
 	return fp5_real_down(itype, esd);
 }
 
+int fp5_held_for_retry(int already, unsigned base, unsigned now,
+		       int saw_itype, uint32_t itype, int esd)
+{
+	if (fp5_finger_held(base, now, saw_itype, itype, esd))
+		return 1;
+	/* Already-down consumed the 0x2. The capture report then raises
+	 * irq and the next query is idle 0x0. That is not a lift (0x4).
+	 */
+	if (!already || !saw_itype || esd)
+		return 0;
+	return itype == 0;
+}
+
 int fp5_retry_more(int bursts_done, int held)
 {
 	if (!held)
@@ -477,6 +490,7 @@ int fp5_log_keep(const char *line)
 	static const char *want[] = {
 		"enroll", "Null", "error", "image", "remain", "statistic",
 		"synced", "empty", "pointer", "core:", "trustlet", "authenticat",
+		"template", "loaded", "slot", "new fid", "removing", "fid_list",
 	};
 	int hex = 0, k, i;
 
@@ -503,6 +517,54 @@ int fp5_log_keep(const char *line)
 			return 1;
 	}
 	return 0;
+}
+
+int fp5_gallery_loaded(const uint8_t *buf, size_t n, int *count)
+{
+	const char *base, *end, *p;
+	int found = 0, val = 0;
+
+	if (!buf || !count)
+		return 0;
+	base = (const char *)buf;
+	end = base + n;
+	for (p = base; p < end; p++) {
+		const char *q;
+		int v;
+
+		if ((size_t)(end - p) < 18 || p[0] != 't')
+			continue;
+		if (memcmp(p, "there is ", 9) == 0)
+			q = p + 9;
+		else if ((size_t)(end - p) >= 19 && memcmp(p, "there are ", 10) == 0)
+			q = p + 10;
+		else
+			continue;
+		if (q >= end || *q < '0' || *q > '9')
+			continue;
+		v = 0;
+		while (q < end && *q >= '0' && *q <= '9') {
+			v = v * 10 + (*q - '0');
+			q++;
+			if (v > 20)
+				break;
+		}
+		if (v > 20 || (size_t)(end - q) < 16)
+			continue;
+		if (memcmp(q, " template", 9) != 0)
+			continue;
+		q += 9;
+		if (q < end && *q == 's')
+			q++;
+		if ((size_t)(end - q) < 7 || memcmp(q, " loaded", 7) != 0)
+			continue;
+		val = v;
+		found = 1;
+	}
+	if (!found)
+		return 0;
+	*count = val;
+	return 1;
 }
 
 static const char *const gp_roots[] = {

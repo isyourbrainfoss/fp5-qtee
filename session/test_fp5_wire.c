@@ -178,6 +178,22 @@ static void test_decisions(void)
 	expect(fp5_retry_more(2, 1), "retry after the second burst");
 	expect(!fp5_retry_more(3, 1), "three bursts is the limit");
 	expect(!fp5_retry_more(1, 0), "a lift stops the retry");
+	expect(fp5_held_for_retry(1, 4, 5, 1, 0, 0),
+	       "already-down idle query stays down");
+	expect(fp5_held_for_retry(1, 4, 5, 1, 0x2, 0),
+	       "already-down exact down stays down");
+	expect(fp5_held_for_retry(1, 4, 4, 0, 0, 0),
+	       "already-down unchanged irq stays down");
+	expect(!fp5_held_for_retry(1, 4, 5, 1, 0x4, 0),
+	       "already-down lift stops");
+	expect(!fp5_held_for_retry(1, 4, 5, 1, 0x10, 0),
+	       "already-down other edge stops");
+	expect(!fp5_held_for_retry(1, 4, 5, 1, 0, 1),
+	       "already-down esd stops");
+	expect(!fp5_held_for_retry(1, 4, 5, 0, 0, 0),
+	       "already-down unclassified edge stops");
+	expect(!fp5_held_for_retry(0, 4, 5, 1, 0, 0),
+	       "a fresh edge does not treat idle as down");
 	expect(!fp5_press_strikes(0), "no scored miss is no strike");
 	expect(fp5_press_strikes(1) == 1, "one scored miss is one strike");
 	expect(fp5_press_strikes(3) == 1, "three scored misses are one strike");
@@ -188,6 +204,44 @@ static void test_decisions(void)
 		       "focaltech-lib FtVerifySubTemplate() score = 40, matchCnts = 2"),
 	       "score line is kept");
 	expect(!fp5_log_keep("0123456789abcdef0123"), "long hex is dropped");
+	expect(fp5_log_keep("there is 1 template loaded."),
+	       "gallery count is kept");
+	expect(fp5_log_keep("new fid (= 1558157931) generated."),
+	       "new fid is kept");
+	expect(fp5_log_keep("template saved at slot 1. gid = 0, fid = 1"),
+	       "saved slot is kept");
+	expect(fp5_log_keep("removing 'ff_template_0_0.bin'"),
+	       "remove is kept");
+	{
+		int count = 7;
+		const char *one = "xx there is 1 template loaded. yy";
+		const char *two = "there are 2 templates loaded.";
+		const char *none = "not exist, skip";
+		const char *both =
+			"there is 1 template loaded.\nthere are 2 templates loaded.";
+
+		expect(fp5_gallery_loaded((const uint8_t *)one, strlen(one),
+					  &count) && count == 1,
+		       "one template");
+		expect(fp5_gallery_loaded((const uint8_t *)two, strlen(two),
+					  &count) && count == 2,
+		       "two templates");
+		count = 7;
+		expect(!fp5_gallery_loaded((const uint8_t *)none, strlen(none),
+					   &count) && count == 7,
+		       "a skip is not a count");
+		expect(fp5_gallery_loaded((const uint8_t *)both, strlen(both),
+					  &count) && count == 2,
+		       "the later count wins");
+		{
+			const char *zero = "there is 0 template loaded.";
+
+			count = 7;
+			expect(fp5_gallery_loaded((const uint8_t *)zero, strlen(zero),
+						  &count) && count == 0,
+			       "an empty gallery is a count of zero");
+		}
+	}
 
 	memset(log, 0, sizeof(log));
 	memcpy(log, "interrupt type: 0x212 avgv = 966", 32);

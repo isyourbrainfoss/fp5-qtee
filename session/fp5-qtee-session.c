@@ -1734,7 +1734,11 @@ static int lift_rearm(struct svc *s, unsigned *irq)
 	return send_cmd(s, fp5_op_wmode(), 4, &mode, "WMODE_DETECT");
 }
 
-/* Trustlet stores "%s/%s". With no base that is /ff_template_0_0.bin.
+/* Trustlet stores "%s/ff_template_%d_%d.bin". With no base the file is
+ * /ff_template_<gid>_<fid % 10>.bin. Unlock loads this empty path.
+ * Enroll has to load it before the fid is chosen: the new id's last
+ * digit is the first empty RAM slot, and an empty gallery is always
+ * slot 0, which replaces ff_template_0_0.bin.
  * /data/vendor_de/0/fpdata looks up a different object and drops the RAM copy.
  */
 static const char *group_path(void)
@@ -1839,6 +1843,47 @@ static int probe_capture(struct svc *s)
 	return s->last_rc == 0 ? 0 : 2;
 }
 
+/* SET_GROUP on the unlock path, then the bytes from that command only.
+ * The full qsee ring still holds older "there is 1 template loaded"
+ * lines, which must not count. ENUM is sent only after a real load:
+ * it returns -203 and does not remove a template.
+ */
+static int gallery_in_cmd(struct svc *s, int *count)
+{
+	if (qsee_delta && qsee_delta_len &&
+	    fp5_gallery_loaded(qsee_delta, qsee_delta_len, count))
+		return 1;
+	if (s->rsp_out && fp5_gallery_loaded(s->rsp_out, RSP_SZ, count))
+		return 1;
+	if (s->req && fp5_gallery_loaded(s->req, REQ_SZ, count))
+		return 1;
+	return 0;
+}
+
+static int enroll_load_gallery(struct svc *s)
+{
+	uint8_t g[FP5_GROUP_CAP];
+	int n = fp5_build_group(g, sizeof(g), group_path());
+	int count = -1;
+
+	if (n < 0)
+		return -1;
+	if (send_cmd(s, fp5_op_set_group(), (uint32_t)n, g, "SET_GROUP"))
+		return -1;
+	if (!gallery_in_cmd(s, &count)) {
+		logl("enroll refuse: trustlet did not report a template count");
+		return 2;
+	}
+	if (count < 1) {
+		logf("enroll refuse: loaded=%d; not minting a finger", count);
+		return 2;
+	}
+	logf("enroll gallery loaded=%d", count);
+	if (send_cmd(s, fp5_op_enum(), 0, NULL, "ENUM"))
+		return -1;
+	return 0;
+}
+
 static int enroll_finger(struct svc *s)
 {
 	unsigned irq = read_irq();
@@ -1846,7 +1891,16 @@ static int enroll_finger(struct svc *s)
 	int sample;
 	int wrote = 0;
 	long save_ms = 0;
+	int loaded;
 
+	/* Fill RAM before PRE_ENROLL. The trustlet then gives the new
+	 * finger the next free slot instead of replacing slot 0. A load
+	 * that does not see the current finger stops here, before any
+	 * fid is generated and before SAVE.
+	 */
+	loaded = enroll_load_gallery(s);
+	if (loaded)
+		return loaded;
 	if (open_enroll(s))
 		return -1;
 	if (s->last_rc != 0) {
@@ -1954,7 +2008,7 @@ static int enroll_finger(struct svc *s)
  * A new edge is classified with QEV and is not passed to fp5_att_irq, so a
  * lift cannot look like another finger-down of this attempt.
  */
-static int finger_held(struct svc *s, unsigned *irq)
+static int finger_held(struct svc *s, unsigned *irq, int already)
 {
 	unsigned now = read_irq();
 	unsigned base = *irq;
@@ -1965,8 +2019,11 @@ static int finger_held(struct svc *s, unsigned *irq)
 		return 1;
 	if (send_cmd(s, fp5_op_query(), 4, z, "QEV"))
 		return -1;
-	held = fp5_finger_held(base, now, s->last.saw_itype, s->last.itype,
-			       s->last.esd);
+	held = fp5_held_for_retry(already, base, now, s->last.saw_itype,
+				  s->last.itype, s->last.esd);
+	if (held && !fp5_finger_held(base, now, s->last.saw_itype,
+				     s->last.itype, s->last.esd))
+		logf("still down after idle query itype=0x%x", s->last.itype);
 	if (s->last.saw_itype)
 		*irq = now;
 	return held;
@@ -1980,7 +2037,7 @@ static int finger_held(struct svc *s, unsigned *irq)
  * Cancel before any scored report returns cancelled and prints no FAIL.
  */
 static int auth_press(struct svc *s, int which, unsigned *irq,
-		      uint32_t itype, int esd)
+		      uint32_t itype, int esd, int already)
 {
 	int burst, scored = 0, saw_empty = 0, cut = 0;
 	uint32_t empty_av[3] = { 0, 0, 0 };
@@ -2000,7 +2057,7 @@ static int auth_press(struct svc *s, int which, unsigned *irq,
 				}
 				break;
 			}
-			held = finger_held(s, irq);
+			held = finger_held(s, irq, already);
 			if (held < 0)
 				return -1;
 			if (!fp5_retry_more(burst, held))
@@ -2140,7 +2197,7 @@ static int auth_once(struct svc *s, int which)
 	 */
 	uint32_t mode = fp5_wmode_touch();
 	uint32_t itype = 0;
-	int esd = 0, down = 0;
+	int esd = 0, down = 0, from_query = 0;
 	int left = 90000;
 	uint8_t hat[0x4a];
 	uint8_t z[4] = { 0 };
@@ -2190,6 +2247,7 @@ static int auth_once(struct svc *s, int which)
 			return -1;
 		if (held) {
 			down = 1;
+			from_query = 1;
 			logf("AUTH %d already down itype=0x%x", which, itype);
 		} else if (s->last.saw_itype) {
 			logf("skip leftover itype=0x%x esd=%d",
@@ -2233,6 +2291,7 @@ static int auth_once(struct svc *s, int which)
 					return -1;
 				if (held) {
 					down = 1;
+					from_query = 1;
 					logf("AUTH %d held at panel itype=0x%x",
 					     which, itype);
 				}
@@ -2254,7 +2313,7 @@ static int auth_once(struct svc *s, int which)
 		return FP5_ATT_CANCELLED;
 	}
 	logf("AUTH %d REAL DOWN itype=0x%x", which, itype);
-	return auth_press(s, which, &irq, itype, esd);
+	return auth_press(s, which, &irq, itype, esd, from_query);
 }
 
 /*
