@@ -22,6 +22,9 @@ from fp5_qtee_haptic import (
     Haptic,
     enroll_accept,
     fbcli_args,
+    FEEDBACKD_GAIN,
+    FULL_GAIN,
+    ff_gain_event,
     ff_play_event,
     ff_steps,
     find_ff,
@@ -77,6 +80,12 @@ class WaveTest(unittest.TestCase):
         self.assertEqual(strong, 0xFFFF)
         self.assertEqual(weak, 0)
         self.assertEqual(len(ff_play_event(3)), 24)
+        gain = ff_gain_event(FULL_GAIN)
+        self.assertEqual(len(gain), 24)
+        code, value = struct.unpack_from("<Hi", gain, 18)
+        self.assertEqual(code, 0x60)
+        self.assertEqual(value, 0xFFFF)
+        self.assertEqual(FEEDBACKD_GAIN, 0xC000)
 
     def test_profile(self) -> None:
         self.assertFalse(plays(None))
@@ -237,6 +246,24 @@ class PlayTest(unittest.TestCase):
             self.assertEqual(haptic.play_sync("lockout"), "none")
         self.assertEqual(played, [MISS_ON_MS, MISS_ON_MS, SUCCESS_MS])
         self.assertEqual(sleeps, [0.13])
+
+    def test_evdev_uses_full_gain_for_the_pulse_only(self) -> None:
+        played: list[int] = []
+        gains: list[int] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            haptic = Haptic(
+                profile="full",
+                leds=Path(tmp),
+                feedback=False,
+                rumble=played.append,
+                gain=gains.append,
+                sleeper=lambda _s: None,
+                enabled=True,
+            )
+            self.assertEqual(haptic.play_sync("success"), "evdev")
+            self.assertEqual(haptic.play_sync("miss"), "evdev")
+        self.assertEqual(played, [SUCCESS_MS, MISS_ON_MS, MISS_ON_MS])
+        self.assertEqual(gains, [FULL_GAIN, FEEDBACKD_GAIN, FULL_GAIN, FEEDBACKD_GAIN])
 
     def test_finds_aw869_event_node(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

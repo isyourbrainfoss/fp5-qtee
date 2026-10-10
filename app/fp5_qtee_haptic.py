@@ -9,8 +9,11 @@ feedbackd plays a named event from the theme beside this file when that
 daemon has the device open. Otherwise the same timings are uploaded as
 FF_RUMBLE. ff-memless stops the effect after replay.length. The driver's
 gain register is ``strong_magnitude * 0x80 / 0xffff``, so magnitude
-0xffff is the Android fingerprint gain 0x80. An LED ``duration`` /
-``activate`` device is still used when one exists.
+0xffff is the Android fingerprint gain 0x80 only when the device gain
+is also 0xffff. feedbackd sets that gain to 0xc000 (75%) when it opens
+the motor, which would store 0x60. The player raises it to 0xffff for
+the pulse and puts 0xc000 back. An LED ``duration`` / ``activate``
+device is still used when one exists.
 """
 
 from __future__ import annotations
@@ -32,6 +35,11 @@ AMPLITUDE = 1.0
 GAIN = 0x80
 # aw86927_play_sine writes (magnitude * 0x80 / 0xffff) into PLAYCFG2.
 RUMBLE_MAGNITUDE = 0xFFFF
+FF_GAIN = 0x60
+# ff-memless scales strong_magnitude by this device gain. feedbackd
+# writes 0xc000 at open. 0xffff lets 0xffff through, which is register 0x80.
+FEEDBACKD_GAIN = 0xC000
+FULL_GAIN = 0xFFFF
 SUCCESS_EVENT = "fp5-qtee-match"
 MISS_EVENT = "fp5-qtee-miss"
 APP_ID = "org.fp5.qtee"
@@ -170,6 +178,11 @@ def ff_play_event(effect_id: int) -> bytes:
     return struct.pack("<16xHHi", EV_FF, effect_id, 1)
 
 
+def ff_gain_event(value: int) -> bytes:
+    """EV_FF / FF_GAIN. ff-memless applies it to every rumble on the device."""
+    return struct.pack("<16xHHi", EV_FF, FF_GAIN, value)
+
+
 def find_ff(dev_root: Path, sys_root: Path) -> Path | None:
     """The event node whose input name looks like the aw86927."""
     if not dev_root.is_dir():
@@ -251,6 +264,7 @@ class Haptic:
         enabled: bool | None = None,
         feedback: bool | None = None,
         rumble: Callable[[int], None] | None = None,
+        gain: Callable[[int], None] | None = None,
         ff_dev: Path | None = None,
         sys_root: Path | None = None,
         dev_root: Path | None = None,
@@ -265,6 +279,7 @@ class Haptic:
         # None probes feedbackd. False skips it and uses the evdev device.
         self._feedback = feedback
         self._rumble = rumble
+        self._gain = gain
         self._ff_dev = ff_dev
         self._sys_root = sys_root if sys_root is not None else Path("/sys/class/input")
         self._dev_root = dev_root if dev_root is not None else Path("/dev/input")
@@ -314,7 +329,7 @@ class Haptic:
             args = fbcli_args(kind)
             if args is None:
                 return "none"
-            self._run(args)
+            self._bracket_gain(lambda: self._run(args))
             return "fbcli"
         if self._play_ff(kind):
             return "evdev"
@@ -345,11 +360,16 @@ class Haptic:
         if not steps:
             return False
         if self._rumble is not None:
-            for op, value in steps:
-                if op == "sleep":
-                    self._sleeper(value / 1000.0)
-                else:
-                    self._rumble(value)
+            rumble = self._rumble
+
+            def injected() -> None:
+                for op, value in steps:
+                    if op == "sleep":
+                        self._sleeper(value / 1000.0)
+                    else:
+                        rumble(value)
+
+            self._bracket_gain(injected)
             return True
         device = self._ff_dev if self._ff_dev is not None else find_ff(
             self._dev_root, self._sys_root
@@ -361,28 +381,77 @@ class Haptic:
         except OSError:
             return False
         try:
-            last_id: int | None = None
-            last_ms = 0
-            for op, value in steps:
-                if op == "sleep":
-                    self._sleeper(value / 1000.0)
-                    if last_id is not None:
-                        self._erase(fd, last_id)
-                        last_id = None
-                    continue
-                last_id = self._upload_play(fd, value)
-                last_ms = value
-                if last_id is None:
-                    return False
-            if last_id is not None:
-                # The kernel has already stopped the motor. Erase frees the slot.
-                self._sleeper(last_ms / 1000.0)
-                self._erase(fd, last_id)
-            return True
+            ok = True
+
+            def uploaded() -> None:
+                nonlocal ok
+                last_id: int | None = None
+                last_ms = 0
+                for op, value in steps:
+                    if op == "sleep":
+                        self._sleeper(value / 1000.0)
+                        if last_id is not None:
+                            self._erase(fd, last_id)
+                            last_id = None
+                        continue
+                    last_id = self._upload_play(fd, value)
+                    last_ms = value
+                    if last_id is None:
+                        ok = False
+                        return
+                if last_id is not None:
+                    # The kernel has already stopped the motor. Erase frees
+                    # the slot before the gain goes back, so ff-memless does
+                    # not replay this pulse at 75%.
+                    self._sleeper(last_ms / 1000.0)
+                    self._erase(fd, last_id)
+
+            self._bracket_gain(uploaded, fd)
+            return ok
         except OSError:
             return False
         finally:
             os.close(fd)
+
+    def _bracket_gain(self, body: Callable[[], None], fd: int | None = None) -> None:
+        """Device gain 0xffff for body, then feedbackd's 0xc000.
+
+        An injected player records the values and does not open a device.
+        """
+        opened = fd
+        own = False
+        if opened is None and self._gain is None and self._runner is None and self._rumble is None:
+            opened = self._open_ff()
+            own = opened is not None
+        self._write_gain(opened, FULL_GAIN)
+        try:
+            body()
+        finally:
+            self._write_gain(opened, FEEDBACKD_GAIN)
+            if own and opened is not None:
+                os.close(opened)
+
+    def _open_ff(self) -> int | None:
+        device = self._ff_dev if self._ff_dev is not None else find_ff(
+            self._dev_root, self._sys_root
+        )
+        if device is None:
+            return None
+        try:
+            return os.open(device, os.O_RDWR)
+        except OSError:
+            return None
+
+    def _write_gain(self, fd: int | None, value: int) -> None:
+        if self._gain is not None:
+            self._gain(value)
+            return
+        if fd is None:
+            return
+        try:
+            os.write(fd, ff_gain_event(value))
+        except OSError:
+            pass
 
     def _upload_play(self, fd: int, duration_ms: int) -> int | None:
         buf = bytearray(rumble_effect(duration_ms))
