@@ -413,8 +413,9 @@ class WakePressTest(unittest.TestCase):
         self.assertFalse(wake_press(100.0, None, 0.4))
         self.assertFalse(wake_press(100.0, 100.0, 0.0))
 
-    def test_default_is_named_and_about_400ms(self) -> None:
-        self.assertAlmostEqual(fp5_qtee_unlock.WAKE_GRACE_S, 0.4)
+    def test_default_covers_the_measured_wake(self) -> None:
+        # Coldest scored wake on 2026-10-10 was 7.5 s after panel-on.
+        self.assertAlmostEqual(fp5_qtee_unlock.WAKE_GRACE_S, 8.0)
 
     def test_down_line(self) -> None:
         self.assertTrue(is_down("AUTH 1 REAL DOWN itype=0x2\n"))
@@ -583,7 +584,23 @@ class FollowTest(unittest.TestCase):
             "AUTH 1 REAL DOWN itype=0x2\n",
             "AUTH FAIL 1 itype=0x2 esd=0 avgv=291 fid=0 rc=-11\n",
             "session_exit:2\n",
-        ], 1.5)
+        ], 8.5)
+        self.assertEqual(self.w.policy.failed, 1)
+        self.assertEqual(self.misses, ["nomatch"])
+
+    def test_second_press_inside_the_window_counts(self) -> None:
+        self._wake_case([
+            "AUTH 1 REAL DOWN itype=0x2\n",
+            "AUTH FAIL 1 itype=0x2 esd=0 avgv=291 fid=0 rc=-11\n",
+            "session_exit:2\n",
+        ], 6.4)
+        self.assertEqual(self.w.policy.failed, 0)
+        self.assertEqual(self.misses, [])
+        self._wake_case([
+            "AUTH 1 REAL DOWN itype=0x2\n",
+            "AUTH FAIL 1 itype=0x2 esd=0 avgv=280 fid=0 rc=-11\n",
+            "session_exit:2\n",
+        ], 6.2)
         self.assertEqual(self.w.policy.failed, 1)
         self.assertEqual(self.misses, ["nomatch"])
 

@@ -40,10 +40,12 @@ PANEL_POLL_S = 0.2
 LOCK_POLL_S = 1.0
 SESSION_ID_TTL_S = 30.0
 # The power key is the fingerprint sensor on FP5, so the press that wakes
-# the panel is often read as a finger. A no-match from a press that went
-# down within this long of panel-on is ignored: no strike, no buzz, no
-# notice. A hit from that press still unlocks.
-WAKE_GRACE_S = float(os.environ.get("FP5_QTEE_WAKE_GRACE_MS", "400")) / 1000.0
+# the panel is often read as a finger. The session is not armed until
+# after the panel is on, so that finger-down is late. On 2026-10-10 the
+# first IRQ of a wake was 1.4 s to 7.5 s after DSI modeset (6.4 s for the
+# cold miss). The first no-match inside this window is ignored: no strike,
+# no buzz, no notice. A later press still counts. A hit still unlocks.
+WAKE_GRACE_S = float(os.environ.get("FP5_QTEE_WAKE_GRACE_MS", "8000")) / 1000.0
 _HIT = re.compile(r"^AUTH HIT \d+ .* fid=(\d+) ")
 _ARM = re.compile(r"^AUTH \d+ arm ")
 # auth_once prints these after a real finger-down (itype 0x2):
@@ -164,6 +166,18 @@ def wake_press(down_at: float, panel_on_at: float | None,
     if panel_on_at is None or grace_s <= 0:
         return False
     return down_at <= panel_on_at + grace_s
+
+
+def consume_wake(claimed: bool, at: float, panel_on_at: float | None,
+                 grace_s: float = WAKE_GRACE_S) -> tuple[bool, bool]:
+    """(ignore this no-match, claimed after).
+
+    Only the first no-match inside the grace is the power-key wake.
+    A second press in the same panel-on period is a real try.
+    """
+    if claimed or not wake_press(at, panel_on_at, grace_s):
+        return False, claimed
+    return True, True
 
 
 def lock_signal(line: str) -> bool:
@@ -641,6 +655,8 @@ class UnlockWatcher:
         self._told_reason: str | None = None
         # monotonic time the panel was last seen going off -> on.
         self.panel_on_at: float | None = None
+        # The first no-match of this panel-on period already took the grace.
+        self._wake_claimed = False
         self._clock: Callable[[], float] = time.monotonic
 
     def note(self, text: str) -> None:
@@ -836,6 +852,9 @@ class UnlockWatcher:
                     down_at = self._clock()
                 fid = hit_fid(line)
                 if fid is not None:
+                    at = self._clock() if down_at is None else down_at
+                    if wake_press(at, self.panel_on_at):
+                        self._wake_claimed = True
                     # A hit in the dark can turn the panel on. A miss never
                     # reaches this, so it cannot wake the screen.
                     if self.dark_arm and should_wake_panel(True, panel_on(), True):
@@ -858,7 +877,10 @@ class UnlockWatcher:
                 if kind is not None:
                     at = self._clock() if down_at is None else down_at
                     down_at = None
-                    if wake_press(at, self.panel_on_at):
+                    ignore, self._wake_claimed = consume_wake(
+                        self._wake_claimed, at, self.panel_on_at
+                    )
+                    if ignore:
                         # The power-key press that woke the panel. Not a try.
                         self.note(f"miss {kind} ignored: wake press")
                         kind = None
@@ -944,6 +966,7 @@ class UnlockWatcher:
             if on and not was_on:
                 was_on = True
                 self.panel_on_at = time.monotonic()
+                self._wake_claimed = False
             elif not on:
                 was_on = False
             now = time.monotonic()
@@ -1124,6 +1147,7 @@ class WarmLoop:
         # When the panel was last seen going off -> on, and when the
         # current press went down. For the wake-press grace.
         self.panel_on_at: float | None = None
+        self.wake_claimed = False
         self.down_at: float | None = None
 
     def _signalled(self) -> bool:
@@ -1191,14 +1215,20 @@ class WarmLoop:
                 continue
             fid = hit_fid(line)
             if fid is not None:
+                at = self.clock() if self.down_at is None else self.down_at
                 self.down_at = None
+                if wake_press(at, self.panel_on_at):
+                    self.wake_claimed = True
                 self.on_hit(fid, panel)
                 continue
             kind = miss_kind(line)
             if kind is not None:
                 at = self.clock() if self.down_at is None else self.down_at
                 self.down_at = None
-                if wake_press(at, self.panel_on_at):
+                ignore, self.wake_claimed = consume_wake(
+                    self.wake_claimed, at, self.panel_on_at
+                )
+                if ignore:
                     # The power-key press that woke the panel. Not a try.
                     self.w.note(f"miss {kind} ignored: wake press")
                     continue
@@ -1269,6 +1299,7 @@ class WarmLoop:
         signalled = self._signalled()
         if panel and self.prev_panel is False:
             self.panel_on_at = now
+            self.wake_claimed = False
         self.drain(panel)
         if not panel and not self.dark_arm:
             self.cancel()
