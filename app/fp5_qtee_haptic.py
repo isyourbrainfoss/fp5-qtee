@@ -213,10 +213,12 @@ def feedbackd_has_haptic() -> bool:
 
 
 def read_bus_profile() -> str:
+    """Session bus. busctl without --user stays on the system bus."""
     try:
         proc = subprocess.run(
             [
                 "busctl",
+                "--user",
                 "get-property",
                 "org.sigxcpu.Feedback",
                 "/org/sigxcpu/Feedback",

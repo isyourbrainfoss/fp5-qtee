@@ -97,6 +97,19 @@ class WaveTest(unittest.TestCase):
         self.assertEqual(parse_profile('s "quiet"\n'), "quiet")
         self.assertEqual(parse_profile("no quotes"), "")
 
+    def test_profile_is_read_on_the_session_bus(self) -> None:
+        completed = fp5_qtee_haptic.subprocess.CompletedProcess(
+            args=[], returncode=0, stdout='s "full"\n'
+        )
+        with mock.patch(
+            "fp5_qtee_haptic.subprocess.run", return_value=completed
+        ) as run:
+            self.assertEqual(fp5_qtee_haptic.read_bus_profile(), "full")
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[0], "busctl")
+        self.assertIn("--user", argv)
+        self.assertEqual(argv[argv.index("--user") + 1], "get-property")
+
 
 class ThemeTest(unittest.TestCase):
     def test_fragment_matches_the_waveform(self) -> None:
