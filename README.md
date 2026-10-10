@@ -1,5 +1,9 @@
 # Fairphone 5 — fingerprint over QTEE
 
+> **Note**
+> This is very experimental. Assume nothing here is written, or necessarily read through or fully understood, by a human unless stated, and that includes this text. Use it at your own risk, but you're encouraged to reuse any parts you find useful. The human work here is mainly ideas, testing in reality, and persistence with a vision.
+
+
 Userspace session for the signed `focal32` trustlet on Fairphone 5
 (Qualcomm SM7325 / sc7280, postmarketOS). A small Finger app enrolls and
 matches through `/dev/tee0`. It does not load `qsee_fingerpr`. Phosh
