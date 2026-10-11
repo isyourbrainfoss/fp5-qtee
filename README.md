@@ -16,6 +16,16 @@ A userspace session over QTEE is the approach in Catcrafts'
 ([fingerprintd](https://forgejo.catcrafts.net/Catcrafts/fingerprintd)).
 The FP6 opcodes are in the table below, beside the FP5 ones.
 
+Marcus Ramberg brought up the same FP5 sensor independently, earlier
+(August 2026), through a different path: a QSEECOM TEE kernel driver, a
+`focaltech-fp` misc driver and device tree node, and a libfprint
+match-on-chip driver for fprintd. See
+[nixos-fairphone-fp5](https://github.com/marcusramberg/nixos-fairphone-fp5),
+his [libfprint fork](https://github.com/marcusramberg/libfprint) (`focaltechqsee`)
+and [fp5-fingerprint-tools](https://github.com/marcusramberg/fp5-fingerprint-tools).
+The core commands agree; some details differ (device id format, enroll
+finger-detect mode, list and save commands) and are worth comparing.
+
 Status: **experimental**. Not an official Fairphone or distribution package.
 
 Enroll can reach samples-remaining 0 and write a template. A finger
