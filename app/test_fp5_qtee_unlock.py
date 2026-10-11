@@ -667,14 +667,63 @@ class FollowTest(unittest.TestCase):
             then_exit=True,
         )
         notes: list[str] = []
+        slept: list[float] = []
         self.w.note = lambda text: notes.append(text)  # type: ignore[method-assign]
         self.w.follow(  # type: ignore[arg-type]
             "c4", proc, lambda: True, poll_s=0.01,
-            panel=lambda: False, wake_wait_s=0,
+            panel=lambda: False, wake_wait_s=0, hit_wait_s=4.0,
+            sleep=lambda dt: slept.append(dt), clock=lambda: 0.0,
         )
         self.assertEqual(self.w.policy.failed, 0)
         self.assertEqual(self.misses, [])
+        self.assertEqual(self.unlocked, [])
+        self.assertEqual(slept, [])
         self.assertTrue(any("panel off" in n for n in notes))
+
+    def test_dark_hit_waits_for_the_panel_without_waking_it(self) -> None:
+        # 21:42Z: AUTH HIT while DSI was still off. The old 1 s wait
+        # dropped the fid and the next listen calibrated again.
+        now = [0.0]
+        on = [False]
+        wakes: list[str] = []
+        self.w.dark_arm = True
+        self.w.wake_panel = lambda: wakes.append("wake")  # type: ignore[method-assign]
+        proc = FakeProc(["AUTH HIT 1 itype=0x2 avgv=305 fid=1558157930 rc=0\n"])
+
+        def sleep(dt: float) -> None:
+            self.assertFalse(proc.stopped)
+            now[0] += dt
+            if now[0] >= 2.0:
+                on[0] = True
+
+        out = self.w.follow(  # type: ignore[arg-type]
+            "c4", proc, lambda: True, poll_s=0.01,
+            panel=lambda: on[0], hit_wait_s=4.0,
+            sleep=sleep, clock=lambda: now[0],
+        )
+        self.assertEqual(out, "hit")
+        self.assertEqual(self.unlocked, [("c4", 1558157930)])
+        self.assertEqual(wakes, [])
+        self.assertGreaterEqual(now[0], 2.0)
+        self.assertLess(now[0], 4.0)
+
+    def test_dark_hit_gives_up_after_four_seconds(self) -> None:
+        now = [0.0]
+        proc = FakeProc(["AUTH HIT 1 itype=0x2 avgv=305 fid=1558157930 rc=0\n"])
+
+        def sleep(dt: float) -> None:
+            self.assertFalse(proc.stopped)
+            now[0] += dt
+
+        out = self.w.follow(  # type: ignore[arg-type]
+            "c4", proc, lambda: True, poll_s=0.01,
+            panel=lambda: False, hit_wait_s=4.0,
+            sleep=sleep, clock=lambda: now[0],
+        )
+        self.assertEqual(out, "stop")
+        self.assertEqual(self.unlocked, [])
+        self.assertGreaterEqual(now[0], 4.0)
+        self.assertLess(now[0], 4.2)
 
     def test_hit_with_panel_staying_off_does_not_unlock(self) -> None:
         proc = FakeProc(["AUTH HIT 1 itype=0x2 avgv=304 fid=1403494260 rc=0\n"])
@@ -1194,7 +1243,7 @@ class WarmLoopTest(unittest.TestCase):
         self.assertEqual(self.unlocks(), [])
         self.assertIn(("miss", "nomatch"), self.events)
 
-    def test_dark_hit_wakes_then_unlocks(self) -> None:
+    def test_dark_hit_unlocks_without_waking_the_panel(self) -> None:
         self.arm_dark()
         self.panel[0] = False
         self.step()
@@ -1203,7 +1252,7 @@ class WarmLoopTest(unittest.TestCase):
         self.step()
         warm.say(self.HIT)
         self.step()
-        self.assertEqual(self.wakes, ["wake"])
+        self.assertEqual(self.wakes, [])
         self.assertEqual(self.unlocks(), [("unlock", "c4", 1403494260)])
 
 
@@ -1216,7 +1265,7 @@ class DarkDecisionTest(unittest.TestCase):
         self.assertFalse(fp5_qtee_unlock.should_wake_panel(False, False, True))
         self.assertFalse(fp5_qtee_unlock.should_wake_panel(True, False, False))
         self.assertFalse(fp5_qtee_unlock.should_wake_panel(True, True, True))
-        self.assertTrue(fp5_qtee_unlock.should_wake_panel(True, False, True))
+        self.assertFalse(fp5_qtee_unlock.should_wake_panel(True, False, True))
 
     def test_request_panel_on_unblanks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

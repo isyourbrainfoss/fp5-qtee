@@ -339,8 +339,8 @@ From the same 2026-10-09 capture, and from the lockout rules in
   PIN is used. The PIN clears the lockout. The PIN is also required
   after boot and at least every 72 h.
 - A partial press does not count. A miss never wakes the screen. Only
-  a hit can unlock, and the panel has to be on or come on within about
-  a second.
+  a hit can unlock, and the panel has to be on or come on within 4 s.
+  The watcher does not turn the panel on.
 - Haptics on the aw86927. A match is one 20 ms pulse, theme event
   `fp5-qtee-match`, magnitude 1.0. A miss is 30 ms on, 100 ms off,
   30 ms on (`fp5-qtee-miss`), so the second pulse starts 130 ms after

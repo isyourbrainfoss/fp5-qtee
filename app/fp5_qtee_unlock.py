@@ -3,11 +3,12 @@
 
 The session stays armed with the panel off, so the wake press is a new
 edge on a sensor calibrated with no finger. A finger already down at
-arm is captured by that session. A real AUTH HIT asks logind to unlock
-the Phosh session once the panel is on. A hit that leaves the panel off
-does not unlock. A miss while the panel stays off is not a strike and
-does not wake the screen. Only a hit can unlock. Does not load
-qsee_fingerpr and does not use the Phosh PAM stack.
+arm is captured by that session. A real AUTH HIT keeps its fid and that session. logind is asked once
+the panel is on, or within 4 s of the hit if DSI was off. The
+fingerprint path does not turn the panel on. A hit that leaves the
+panel off does not unlock. A miss while the panel stays off is not a
+strike and does not wake the screen. Only a hit can unlock. Does not
+load qsee_fingerpr and does not use the Phosh PAM stack.
 """
 
 from __future__ import annotations
@@ -54,10 +55,13 @@ WAKE_GRACE_S = float(os.environ.get("FP5_QTEE_WAKE_GRACE_MS", "1000")) / 1000.0
 # drop it. The reading has to stay unlocked or unknown this long.
 LOCK_FLICKER_S = 2.0
 _SCORE = re.compile(r"FtVerifySubTemplate\(\) score = (-?\d+)")
-# A wake hit can be printed before sysfs says the panel is on. Wait this
-# long, then unlock only if it came on. A miss that never turns the panel
-# on is not a strike.
+# A wake hit can be printed before sysfs says the panel is on. A miss
+# uses this short check. A miss that leaves the panel off is not a strike.
 PANEL_WAKE_WAIT_S = 1.0
+# A hit while DSI is off keeps its fid and the session that matched.
+# Wait this long for the panel. Do not start another session during the
+# wait: that runs calibration again. Do not turn the panel on from here.
+PANEL_HIT_WAIT_S = 4.0
 # One unlock process may stay armed this long. follow() stops it when the
 # seat unlocks. A shorter budget resets and calibrates again while a wake
 # finger can already be down.
@@ -101,8 +105,8 @@ WARM = os.environ.get("FP5_QTEE_WARM", "0") == "1"
 # Screen-off arming. Default off: the focaltech IRQ (gpio34) is not a
 # wakeup source, so a dark press cannot resume s2idle. The kernel change
 # that would make it one is enable_irq_wake() on that IRQ. This tree does
-# not patch the kernel. With the flag on, a hit may ask the panel to come
-# on; a miss never does, and only a hit can unlock.
+# not patch the kernel. A hit never writes the backlight or DSI power
+# files. The power key turns the panel on. A miss never unlocks.
 DARK_ARM = os.environ.get("FP5_QTEE_DARK_ARM", "0") == "1"
 # After the panel goes off, ask LockedHint once a second this many times,
 # so the session can load while the screen is dark. Then stay quiet.
@@ -129,8 +133,13 @@ def should_arm(panel: bool, locked: bool, dark_arm: bool) -> bool:
 
 
 def should_wake_panel(hit: bool, panel_on_now: bool, dark_arm: bool) -> bool:
-    """A miss never wakes. A hit wakes only for an opted-in dark arm."""
-    return bool(hit and dark_arm and not panel_on_now)
+    """The fingerprint path does not turn the panel on.
+
+    The power key does. A miss never does either. The arguments stay so
+    callers can keep the old call shape.
+    """
+    del hit, panel_on_now, dark_arm
+    return False
 
 
 def request_panel_on(backlight: Path = BACKLIGHT, drm: Path = DSI_DPMS) -> None:
@@ -957,7 +966,10 @@ class UnlockWatcher:
     def follow(self, sid: str, proc: subprocess.Popen[str],
                wanted: Callable[[], bool], poll_s: float = PANEL_POLL_S,
                panel: Callable[[], bool] | None = None,
-               wake_wait_s: float = PANEL_WAKE_WAIT_S) -> str:
+               wake_wait_s: float = PANEL_WAKE_WAIT_S,
+               hit_wait_s: float = PANEL_HIT_WAIT_S,
+               sleep: Callable[[float], None] = time.sleep,
+               clock: Callable[[], float] = time.monotonic) -> str:
         """Read the session's lines until a hit, its exit, or not wanted.
 
         The session prints nothing while it waits for a finger, so the
@@ -965,8 +977,9 @@ class UnlockWatcher:
         lock. Unlocking with the PIN stops the session. The panel going
         off does not: the wake press has to land on an armed sensor.
         panel is None in tests, which score as if the screen were on.
-        A hit unlocks only when that panel is on or comes on within
-        wake_wait_s. A miss that leaves it off is not a strike.
+        A hit keeps its fid and this process, and unlocks when the panel
+        is on or comes on within hit_wait_s. Nothing here turns the panel
+        on. A miss that leaves it off is not a strike.
         """
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -1024,17 +1037,17 @@ class UnlockWatcher:
                     at = self._clock() if down_at is None else down_at
                     if self._wake_open and wake_press(at, self._arm_at):
                         self._wake_claimed = True
-                    # A hit in the dark can turn the panel on. A miss never
-                    # reaches this, so it cannot wake the screen.
-                    if self.dark_arm and should_wake_panel(True, panel_on(), True):
-                        self.wake_panel()
                     # PIN unlock, or the seat is no longer one we may listen on.
                     if not wanted():
                         self._listen_why = self._unwanted_reason()
                         outcome = "stop"
                         break
+                    # Keep this fid and this process. Another listen would
+                    # calibrate again. The power key turns DSI on.
+                    if panel is not None and not panel():
+                        self.note(f"hit held fid {fid}: waiting for panel")
                     if panel is not None and not await_panel(
-                        panel, wake_wait_s, wanted
+                        panel, hit_wait_s, wanted, sleep, clock
                     ):
                         self.note("hit ignored: panel stayed off")
                         self._listen_why = "panel stayed off"
@@ -1054,7 +1067,7 @@ class UnlockWatcher:
                     at = self._clock() if down_at is None else down_at
                     down_at = None
                     if panel is not None and not await_panel(
-                        panel, wake_wait_s, wanted
+                        panel, wake_wait_s, wanted, sleep, clock
                     ):
                         # Touched while the screen stayed off. Not a try.
                         self.note(f"miss {kind} ignored: panel off")
