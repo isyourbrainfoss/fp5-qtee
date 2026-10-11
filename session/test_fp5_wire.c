@@ -197,6 +197,54 @@ static void test_decisions(void)
 	expect(!fp5_press_strikes(0), "no scored miss is no strike");
 	expect(fp5_press_strikes(1) == 1, "one scored miss is one strike");
 	expect(fp5_press_strikes(3) == 1, "three scored misses are one strike");
+	{
+		uint32_t full[] = { 332, 298, 283 };
+		uint32_t kept[] = { 269, 263, 255 };
+		uint32_t fell[] = { 158, 158, 165 };
+		uint32_t hole[] = { 189, 223, 837 };
+		uint32_t none[] = { 900, 966, 700 };
+
+		expect(fp5_burst_level(full, 3) == 332, "level is the brightest");
+		expect(fp5_burst_level(hole, 3) == 223, "level skips an empty frame");
+		expect(fp5_burst_level(none, 3) == 0, "level of an empty burst is 0");
+		expect(!fp5_burst_falling(332, 269), "drop of 63 still matches");
+		expect(!fp5_burst_falling(fp5_burst_level(full, 3),
+					   fp5_burst_level(kept, 3)),
+		       "332 to 269 is kept");
+		expect(fp5_burst_falling(241, 158), "drop of 83 is a lift");
+		expect(fp5_burst_falling(fp5_burst_level(full, 3),
+					  fp5_burst_level(fell, 3)),
+		       "332 to 165 is a lift");
+		expect(fp5_burst_falling(316, 184), "316 to 184 is a lift");
+		expect(!fp5_burst_falling(316, 255), "drop of 61 is kept");
+		expect(!fp5_burst_falling(0, 200), "no first burst is not a lift");
+		expect(!fp5_burst_falling(300, 0), "an empty retry is not this skip");
+		expect(!fp5_burst_falling(300, 300), "the same level is kept");
+		expect(!fp5_burst_falling(300, 310), "a brighter retry is kept");
+	}
+	expect(fp5_miss_stays(1, 0), "all-zero miss stays");
+	expect(!fp5_miss_stays(1, 1), "a nonzero score ends the session");
+	expect(!fp5_miss_stays(0, 0), "an unscored press does not stay");
+	{
+		int score = 7;
+		const char *zero =
+			"FtVerifySubTemplate() score = 0, matchCnts = 28";
+		const char *hit =
+			"focaltech-lib FtVerifySubTemplate() score = 24, matchCnts = 8";
+		const uint8_t *miss =
+			(const uint8_t *)"xx FtVerifySubTemplate() score = 0, matchCnts = 1\n"
+			"FtVerifySubTemplate() score = 0, matchCnts = 2";
+		const uint8_t *some =
+			(const uint8_t *)"FtVerifySubTemplate() score = 0, matchCnts = 7\n"
+			"FtVerifySubTemplate() score = 5, matchCnts = 8";
+
+		expect(fp5_log_score(zero, &score) && score == 0, "score 0");
+		expect(fp5_log_score(hit, &score) && score == 24, "score 24");
+		expect(!fp5_log_nonzero_score(miss, strlen((const char *)miss)),
+		       "only zeros stay");
+		expect(fp5_log_nonzero_score(some, strlen((const char *)some)),
+		       "a 5 ends the stay");
+	}
 	expect(fp5_log_is_score(
 		       "FtVerifySubTemplate() score = 40, matchCnts = 2"),
 	       "score diary");

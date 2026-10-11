@@ -29,6 +29,7 @@ from fp5_qtee_unlock import (
     is_locked,
     lock_signal,
     lockout_state_for,
+    keep_session,
     miss_kind,
     parse_locked,
 
@@ -154,6 +155,14 @@ class MissTest(unittest.TestCase):
         self.assertIsNone(miss_kind("AUTH 1 REAL DOWN itype=0x2"))
         # The burst log is not a verdict. One AUTH FAIL later is the strike.
         self.assertIsNone(miss_kind("AUTH 1 burst avgv=328,521,638"))
+        self.assertIsNone(miss_kind("AUTH stay: all-zero miss"))
+        self.assertIsNone(miss_kind("AUTH 1 skip falling avgv=158,158,165 first=241"))
+
+    def test_keep_session_is_an_all_zero_nomatch(self) -> None:
+        self.assertTrue(keep_session("nomatch", False))
+        self.assertFalse(keep_session("nomatch", True))
+        self.assertFalse(keep_session("partial", False))
+        self.assertFalse(keep_session(None, False))
 
     def test_feedback_args(self) -> None:
         self.assertEqual(
@@ -621,6 +630,67 @@ class FollowTest(unittest.TestCase):
         out = self.w.follow("c4", proc, lambda: False, poll_s=0.01)  # type: ignore[arg-type]
         self.assertEqual(out, "stop")
         self.assertEqual(self.unlocked, [])
+
+    def test_all_zero_miss_keeps_the_session_for_the_next_press(self) -> None:
+        notes: list[str] = []
+        counted: list[int] = []
+
+        def note(text: str) -> None:
+            notes.append(text)
+            counted.append(self.w.policy.failed)
+
+        self.w.note = note  # type: ignore[method-assign]
+        proc = FakeProc([
+            "AUTH 1 arm mode=1 irq=4\n",
+            "AUTH 1 REAL DOWN itype=0x2\n",
+            "REPORT_EV5 qsee: FtVerifySubTemplate() score = 0, matchCnts = 28\n",
+            "AUTH FAIL 1 itype=0x2 esd=0 avgv=274 fid=0 rc=-11\n",
+            "AUTH stay: all-zero miss\n",
+            "AUTH 2 arm mode=1 irq=9\n",
+            "AUTH 2 REAL DOWN itype=0x2\n",
+            "REPORT_EV5 qsee: FtVerifySubTemplate() score = 24, matchCnts = 8\n",
+            "AUTH HIT 2 itype=0x2 avgv=292 fid=1979259351 rc=0\n",
+        ])
+        out = self.w.follow("c4", proc, lambda: True, poll_s=0.01)  # type: ignore[arg-type]
+        self.assertEqual(out, "hit")
+        self.assertEqual(counted, [1])
+        self.assertEqual(self.w.policy.failed, 0)
+        self.assertEqual(self.unlocked, [("c4", 1979259351)])
+        self.assertTrue(any("same session" in n for n in notes))
+        self.assertEqual(self.misses, ["nomatch"])
+
+    def test_nonzero_miss_does_not_keep_the_session(self) -> None:
+        notes: list[str] = []
+        self.w.note = lambda text: notes.append(text)  # type: ignore[method-assign]
+        proc = FakeProc([
+            "AUTH 1 arm mode=1 irq=4\n",
+            "AUTH 1 REAL DOWN itype=0x2\n",
+            "REPORT_EV5 qsee: FtVerifySubTemplate() score = 5, matchCnts = 36\n",
+            "AUTH FAIL 1 itype=0x2 esd=0 avgv=283 fid=0 rc=-11\n",
+            "session_exit:2\n",
+        ], then_exit=True)
+        out = self.w.follow("c4", proc, lambda: True, poll_s=0.01)  # type: ignore[arg-type]
+        self.assertEqual(out, "miss")
+        self.assertEqual(self.w.policy.failed, 1)
+        self.assertEqual(self.unlocked, [])
+        self.assertFalse(any("same session" in n for n in notes))
+
+    def test_lockout_still_stops_an_all_zero_miss(self) -> None:
+        notes: list[str] = []
+        self.w.note = lambda text: notes.append(text)  # type: ignore[method-assign]
+        for _ in range(4):
+            self.w.policy.on_miss()
+        proc = FakeProc([
+            "AUTH 1 arm mode=1 irq=4\n",
+            "REPORT_EV5 qsee: FtVerifySubTemplate() score = 0, matchCnts = 8\n",
+            "AUTH FAIL 1 itype=0x2 esd=0 avgv=274 fid=0 rc=-11\n",
+        ])
+        out = self.w.follow("c4", proc, lambda: True, poll_s=0.01)  # type: ignore[arg-type]
+        self.assertEqual(out, "stop")
+        self.assertEqual(self.w.policy.why_not(), "lockout")
+        self.assertTrue(proc.stopped)
+        self.assertEqual(self.unlocked, [])
+        self.assertFalse(any("same session" in n for n in notes))
 
     def test_exit_without_hit_is_miss(self) -> None:
         proc = FakeProc(

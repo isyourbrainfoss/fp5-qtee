@@ -105,8 +105,21 @@ int fp5_held_for_retry(int already, unsigned base, unsigned now,
 		       int saw_itype, uint32_t itype, int esd);
 /* 1 to capture another burst. Stops at 3, and when the finger has lifted. */
 int fp5_retry_more(int bursts_done, int held);
+/* Brightest in-range frame of the first 3. 0 when none is in (0, 600). */
+uint32_t fp5_burst_level(const uint32_t *avgv, int n);
+/* A later burst this far below the first burst's level is a lifting
+ * finger. On 2026-10-11 a second burst 63 below (332 to 269) still
+ * matched. A burst 83 below (241 to 158) did not. 80 keeps the match.
+ */
+#define FP5_FALL_AVGV 80
+/* 1 when now is at least FP5_FALL_AVGV below first. 0 if either is 0. */
+int fp5_burst_falling(uint32_t first, uint32_t now);
 /* One press is one strike, however many scored bursts missed. */
 int fp5_press_strikes(int scored_misses);
+/* 1 when a scored miss had no nonzero subtemplate score, so the same
+ * process should match the next press. A nonzero score ends it.
+ */
+int fp5_miss_stays(int scored, int nonzero);
 
 struct fp5_log {
 	uint32_t itype;
@@ -129,6 +142,10 @@ int fp5_sync_config(char *dst, size_t cap, int native_log);
 
 /* 1 when the line is the subtemplate distance diary. */
 int fp5_log_is_score(const char *line);
+/* 1 and writes *score when line is that diary. 0 leaves *score alone. */
+int fp5_log_score(const char *line, int *score);
+/* 1 when any score diary in buf is not zero. */
+int fp5_log_nonzero_score(const uint8_t *buf, size_t n);
 /* 1 when the session should print this qsee line. Score lines always pass. */
 int fp5_log_keep(const char *line);
 /* Last "there is/are N template(s) loaded" in buf. Returns 1 when the

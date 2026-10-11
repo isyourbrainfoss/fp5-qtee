@@ -2039,14 +2039,14 @@ static int finger_held(struct svc *s, unsigned *irq, int already)
 static int auth_press(struct svc *s, int which, unsigned *irq,
 		      uint32_t itype, int esd, int already)
 {
-	int burst, scored = 0, saw_empty = 0, cut = 0;
+	int burst, scored = 0, saw_empty = 0, cut = 0, nonzero = 0;
 	uint32_t empty_av[3] = { 0, 0, 0 };
-	uint32_t miss_avgv = 0, miss_fid = 0;
+	uint32_t miss_avgv = 0, miss_fid = 0, first_level = 0;
 	int miss_rc = 0;
 
 	for (burst = 0; burst < 3 && !cut; burst++) {
 		uint32_t av[3] = { 0, 0, 0 };
-		uint32_t fid = 0;
+		uint32_t fid = 0, level;
 		int fi, matched, verdict, held;
 
 		if (burst > 0) {
@@ -2087,6 +2087,14 @@ static int auth_press(struct svc *s, int which, unsigned *irq,
 			empty_av[2] = av[2];
 			continue;
 		}
+		level = fp5_burst_level(av, 3);
+		if (fp5_burst_falling(first_level, level)) {
+			logf("AUTH %d skip falling avgv=%u,%u,%u first=%u",
+			     which, av[0], av[1], av[2], first_level);
+			break;
+		}
+		if (first_level == 0)
+			first_level = level;
 		/*
 		 * All three captures are already in the trustlet. Report the
 		 * burst as a whole, including a frame with avgv >= 600.
@@ -2096,6 +2104,9 @@ static int auth_press(struct svc *s, int which, unsigned *irq,
 		if (send_cmd(s, fp5_op_report(), 0x2e0, NULL, "REPORT_EV5"))
 			return -1;
 		qsee_dump_delta("REPORT_EV5");
+		if (qsee_delta && qsee_delta_len &&
+		    fp5_log_nonzero_score(qsee_delta, qsee_delta_len))
+			nonzero = 1;
 		memcpy(&fid, s->req + FP5_PAY_OFF + 0x10, 4);
 		logf("AUTH %d report rc=%d fid=%u", which, (int)s->last_rc, fid);
 		if (serve_on)
@@ -2122,7 +2133,9 @@ static int auth_press(struct svc *s, int which, unsigned *irq,
 	if (fp5_press_strikes(scored)) {
 		logf("AUTH FAIL %d itype=0x%x esd=%d avgv=%u fid=%u rc=%d",
 		     which, itype, esd, miss_avgv, miss_fid, miss_rc);
-		return 2;
+		if (fp5_miss_stays(scored, nonzero))
+			return FP5_ATT_AGAIN;
+		return FP5_ATT_MISS;
 	}
 	if (saw_empty) {
 		logf("AUTH %d empty avgv=%u,%u,%u", which, empty_av[0],
@@ -2314,6 +2327,36 @@ static int auth_once(struct svc *s, int which)
 	}
 	logf("AUTH %d REAL DOWN itype=0x%x", which, itype);
 	return auth_press(s, which, &irq, itype, esd, from_query);
+}
+
+/* After an all-zero miss, do not capture the finger that is still down.
+ * That would be the same press again. Wait until a query is not a real
+ * down. The process timeout and a signal are what end a hold that never
+ * lifts. Returns -1 if the query fails, 0 once the finger is up.
+ */
+static int wait_until_lift(struct svc *s)
+{
+	unsigned irq = read_irq();
+	uint8_t z[4] = { 0 };
+
+	if (send_cmd(s, fp5_op_query(), 4, z, "QEV"))
+		return -1;
+	if (!s->last.saw_itype || !fp5_real_down(s->last.itype, s->last.esd)) {
+		logf("AUTH stay: finger up itype=0x%x", s->last.itype);
+		return 0;
+	}
+	logf("AUTH stay: waiting for lift itype=0x%x", s->last.itype);
+	for (;;) {
+		if (!wait_irq(&irq, 1000))
+			continue;
+		if (send_cmd(s, fp5_op_query(), 4, z, "QEV"))
+			return -1;
+		if (!s->last.saw_itype ||
+		    !fp5_real_down(s->last.itype, s->last.esd)) {
+			logf("AUTH stay: finger up itype=0x%x", s->last.itype);
+			return 0;
+		}
+	}
 }
 
 /*
@@ -2571,21 +2614,30 @@ int main(int argc, char **argv)
 		logf("auth pair %d %d", a, b);
 		rc = (a == 0 && b == 0) ? 0 : 2;
 	} else if (!strcmp(mode, "unlock")) {
-		/* One press for the Phosh lock screen. Match still asks twice.
-		 * Setup and calibration run once. A window with no finger
-		 * arms again in this process, so the next press is not a
-		 * fresh reset with the finger already down. A hit or a
-		 * scored miss ends it; the watcher starts the next one.
+		/* One process for the Phosh lock screen. Setup and
+		 * calibration run once. No finger arms again here. An
+		 * all-zero miss stays: wait until the finger is up, then
+		 * match the next press. A hit, or a miss with a nonzero
+		 * score, ends it. The watcher starts the next process.
 		 */
-		int a, n = 0;
+		int a = FP5_ATT_NONE, n = 0;
 
 		if (set_group(&s, group_path())) {
 			rc = 1;
 			goto done;
 		}
-		do {
+		for (;;) {
+			if (a == FP5_ATT_AGAIN) {
+				logl("AUTH stay: all-zero miss");
+				if (wait_until_lift(&s)) {
+					rc = 1;
+					goto done;
+				}
+			}
 			a = auth_once(&s, ++n);
-		} while (a == FP5_ATT_NONE);
+			if (a != FP5_ATT_NONE && a != FP5_ATT_AGAIN)
+				break;
+		}
 		logf("unlock once %d", a);
 		rc = a == 0 ? 0 : (a < 0 ? 1 : 2);
 	} else if (!strcmp(mode, "serve")) {

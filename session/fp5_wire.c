@@ -302,9 +302,36 @@ int fp5_retry_more(int bursts_done, int held)
 	return 1;
 }
 
+uint32_t fp5_burst_level(const uint32_t *avgv, int n)
+{
+	uint32_t best = 0;
+	int i, lim;
+
+	if (!avgv || n <= 0)
+		return 0;
+	lim = n > 3 ? 3 : n;
+	for (i = 0; i < lim; i++) {
+		if (fp5_score_sample(avgv[i]) && avgv[i] > best)
+			best = avgv[i];
+	}
+	return best;
+}
+
+int fp5_burst_falling(uint32_t first, uint32_t now)
+{
+	if (first == 0 || now == 0 || now >= first)
+		return 0;
+	return first - now >= FP5_FALL_AVGV;
+}
+
 int fp5_press_strikes(int scored_misses)
 {
 	return scored_misses > 0 ? 1 : 0;
+}
+
+int fp5_miss_stays(int scored, int nonzero)
+{
+	return scored > 0 && !nonzero;
 }
 
 /* Parsers stop at end so a token at the end of the buffer is not over-read. */
@@ -483,6 +510,65 @@ int fp5_log_is_score(const char *line)
 		return 0;
 	return strstr(line, "FtVerifySubTemplate") != NULL &&
 	       strstr(line, "score") != NULL;
+}
+
+int fp5_log_score(const char *line, int *score)
+{
+	const char *p;
+	int sign = 1, v = 0, any = 0;
+
+	if (!score || !fp5_log_is_score(line))
+		return 0;
+	p = strstr(line, "score");
+	if (!p)
+		return 0;
+	p = strchr(p, '=');
+	if (!p)
+		return 0;
+	for (p++; *p == ' '; p++)
+		;
+	if (*p == '-') {
+		sign = -1;
+		p++;
+	}
+	while (*p >= '0' && *p <= '9') {
+		any = 1;
+		v = v * 10 + (*p - '0');
+		p++;
+	}
+	if (!any)
+		return 0;
+	*score = sign * v;
+	return 1;
+}
+
+int fp5_log_nonzero_score(const uint8_t *buf, size_t n)
+{
+	size_t i = 0;
+
+	if (!buf)
+		return 0;
+	while (i < n) {
+		size_t a, run;
+		char line[180];
+		int score;
+
+		while (i < n && (buf[i] < 32 || buf[i] >= 127))
+			i++;
+		a = i;
+		while (i < n && buf[i] >= 32 && buf[i] < 127)
+			i++;
+		run = i - a;
+		if (run < 12)
+			continue;
+		if (run > sizeof(line) - 1)
+			run = sizeof(line) - 1;
+		memcpy(line, buf + a, run);
+		line[run] = 0;
+		if (fp5_log_score(line, &score) && score != 0)
+			return 1;
+	}
+	return 0;
 }
 
 int fp5_log_keep(const char *line)

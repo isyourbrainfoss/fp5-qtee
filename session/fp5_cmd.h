@@ -64,6 +64,7 @@ enum {
 	FP5_ATT_MISS = 2,
 	FP5_ATT_CANCELLED = 3,
 	FP5_ATT_NONE = 4,	/* armed, no finger-down in this window */
+	FP5_ATT_AGAIN = 5,	/* all-zero miss: re-arm in this process */
 };
 
 void fp5_att_begin(struct fp5_attempt *a, unsigned irq_now);

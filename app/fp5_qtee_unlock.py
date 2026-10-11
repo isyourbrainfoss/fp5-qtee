@@ -3,12 +3,14 @@
 
 The session stays armed with the panel off, so the wake press is a new
 edge on a sensor calibrated with no finger. A finger already down at
-arm is captured by that session. A real AUTH HIT keeps its fid and that session. logind is asked once
-the panel is on, or within 4 s of the hit if DSI was off. The
-fingerprint path does not turn the panel on. A hit that leaves the
-panel off does not unlock. A miss while the panel stays off is not a
-strike and does not wake the screen. Only a hit can unlock. Does not
-load qsee_fingerpr and does not use the Phosh PAM stack.
+arm is captured by that session. A real AUTH HIT keeps its fid and that
+session. logind is asked once the panel is on, or within 4 s of the hit
+if DSI was off. The fingerprint path does not turn the panel on. A hit
+that leaves the panel off does not unlock. A miss while the panel stays
+off is not a strike and does not wake the screen. An all-zero miss keeps
+this process, so the next press is matched without calibrating again. A
+miss with a nonzero score ends it. Only a hit can unlock. Does not load
+qsee_fingerpr and does not use the Phosh PAM stack.
 """
 
 from __future__ import annotations
@@ -346,6 +348,15 @@ def miss_kind(line: str) -> str | None:
     if _PARTIAL.match(text):
         return "partial"
     return None
+
+
+def keep_session(kind: str | None, nonzero: bool) -> bool:
+    """An all-zero no-match stays in the process that already calibrated.
+
+    A nonzero score, a partial read, and anything that is not a miss
+    still end that process. The caller does not turn the panel on.
+    """
+    return kind == "nomatch" and not nonzero
 
 
 def feedback_args(event: str) -> list[str] | None:
@@ -979,7 +990,8 @@ class UnlockWatcher:
         panel is None in tests, which score as if the screen were on.
         A hit keeps its fid and this process, and unlocks when the panel
         is on or comes on within hit_wait_s. Nothing here turns the panel
-        on. A miss that leaves it off is not a strike.
+        on. A miss that leaves it off is not a strike. An all-zero miss
+        keeps reading this process. A nonzero miss ends when it exits.
         """
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -1063,15 +1075,18 @@ class UnlockWatcher:
                     self.unlock(sid, fid)
                     break
                 kind = miss_kind(line)
+                stay = False
                 if kind is not None:
                     at = self._clock() if down_at is None else down_at
                     down_at = None
+                    stay = keep_session(kind, press_nz)
                     if panel is not None and not await_panel(
                         panel, wake_wait_s, wanted, sleep, clock
                     ):
                         # Touched while the screen stayed off. Not a try.
                         self.note(f"miss {kind} ignored: panel off")
                         kind = None
+                        stay = False
                     else:
                         arm_at = self._arm_at if self._wake_open else None
                         ignore, self._wake_claimed = consume_wake(
@@ -1082,6 +1097,7 @@ class UnlockWatcher:
                             # The power-key press that woke the panel. Not a try.
                             self.note(f"miss {kind} ignored: wake press")
                             kind = None
+                            stay = False
                 if kind is not None:
                     # A screen-on press. The strike still counts if the
                     # seat unlocked while it was scored; the notice does not.
@@ -1103,6 +1119,8 @@ class UnlockWatcher:
                 else:
                     bad_since = None
                     held_note = False
+                    if stay:
+                        self.note("miss nomatch: same session")
         self._stop(proc)
         reader.join(timeout=2)
         if saw_arm and self._wake_open:
