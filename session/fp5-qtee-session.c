@@ -1756,7 +1756,7 @@ static int enroll_finger(struct svc *s)
 				break;
 			}
 		}
-		if (!fp5_burst_ok(av, 3)) {
+		if (!fp5_burst_full(av, 3)) {
 			logf("PRESS REJECT avgv=%u,%u,%u", av[0], av[1], av[2]);
 			if (lift_rearm(s, &irq))
 				return -1;
@@ -1825,7 +1825,7 @@ static int auth_once(struct svc *s, int which)
 	 * enroll command already has the chip scanning.
 	 */
 	uint32_t mode = fp5_wmode_touch();
-	uint32_t av[3];
+	uint32_t av[3], avsel;
 	uint32_t itype = 0;
 	int esd = 0, fi, down = 0;
 	int left = 90000;
@@ -1879,19 +1879,24 @@ static int auth_once(struct svc *s, int which)
 		logf("AUTH %d empty avgv=%u,%u,%u", which, av[0], av[1], av[2]);
 		return 2;
 	}
+	/* Score with an in-range frame only; a light tap may have just one. */
+	avsel = fp5_burst_pick(av, 3);
+	if (!fp5_burst_full(av, 3))
+		logf("AUTH %d light avgv=%u,%u,%u use=%u", which, av[0], av[1],
+		     av[2], avsel);
 	arm_report(s, 5);
 	if (send_cmd(s, fp5_op_report(), 0x2e0, NULL, "REPORT_EV5"))
 		return -1;
 	qsee_dump_delta("REPORT_EV5");
 	memcpy(&fid, s->req + FP5_PAY_OFF + 0x10, 4);
 	logf("AUTH %d report rc=%d fid=%u", which, (int)s->last_rc, fid);
-	if (fp5_auth_match(itype, esd, av[2], s->last_rc, fid)) {
+	if (fp5_auth_match(itype, esd, avsel, s->last_rc, fid)) {
 		logf("AUTH HIT %d itype=0x%x avgv=%u fid=%u rc=%d", which, itype,
-		     av[2], fid, (int)s->last_rc);
+		     avsel, fid, (int)s->last_rc);
 		return 0;
 	}
 	logf("AUTH FAIL %d itype=0x%x esd=%d avgv=%u fid=%u rc=%d", which, itype,
-	     esd, av[2], fid, (int)s->last_rc);
+	     esd, avsel, fid, (int)s->last_rc);
 	return 2;
 }
 

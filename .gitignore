@@ -6,3 +6,4 @@ session/test_fp5_image
 *.ko
 __pycache__/
 *.pyc
+session/test_fp5_cmd

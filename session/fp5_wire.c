@@ -186,7 +186,11 @@ int fp5_score_sample(uint32_t avgv)
 	return avgv > 0 && avgv < 600;
 }
 
-int fp5_burst_ok(const uint32_t *avgv, int n)
+/*
+ * Enrollment: every frame of the burst must be in range, so a template is
+ * only ever built from full, good frames.
+ */
+int fp5_burst_full(const uint32_t *avgv, int n)
 {
 	int i, ok = 0;
 
@@ -197,6 +201,33 @@ int fp5_burst_ok(const uint32_t *avgv, int n)
 			ok++;
 	}
 	return ok == 3;
+}
+
+/*
+ * Authentication: score the burst when at least one frame is in range.
+ * A light tap often gives one or two good frames; requiring all three made
+ * such a tap impossible to match. This is only a host-side quality gate:
+ * the trustlet still does the match and decides the template id, and
+ * fp5_auth_match still demands rc 0 and a real fid. A burst with no frame
+ * in range is still rejected.
+ */
+int fp5_burst_ok(const uint32_t *avgv, int n)
+{
+	return fp5_burst_pick(avgv, n) != 0;
+}
+
+/* The last in-range avgv of the burst, or 0 when none is in range. */
+uint32_t fp5_burst_pick(const uint32_t *avgv, int n)
+{
+	int i;
+
+	if (n > 3)
+		n = 3;
+	for (i = n - 1; i >= 0; i--) {
+		if (fp5_score_sample(avgv[i]))
+			return avgv[i];
+	}
+	return 0;
 }
 
 uint32_t fp5_auth_plen(void) { return 0xe; }
