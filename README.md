@@ -23,6 +23,9 @@ match-on-chip driver for fprintd. See
 [nixos-fairphone-fp5](https://github.com/marcusramberg/nixos-fairphone-fp5),
 his [libfprint fork](https://github.com/marcusramberg/libfprint) (`focaltechqsee`)
 and [fp5-fingerprint-tools](https://github.com/marcusramberg/fp5-fingerprint-tools).
+This repo now reuses parts of that work: FREE_SPI recovery, CANCEL before
+enroll, and his GPL-2.0 kernel patches in `kernel/marcusramberg/`. See
+`docs/ultimate.md` for what came from where.
 The core commands agree; some details differ (device id format, enroll
 finger-detect mode, list and save commands) and are worth comparing.
 
