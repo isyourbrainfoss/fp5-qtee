@@ -30,6 +30,14 @@ only while the panel is on. While a match waits for a finger it keeps
 checking: panel off, or an unlock with the PIN, stops the session at once.
 A hit is checked once more before `unlock-session`.
 
+A real press that does not unlock gives feedback straight away: a
+feedbackd event (`fbcli -A org.fp5.qtee -E bell-terminal`, a short rumble
+in the default theme, nothing in the silent profile) and a transient
+notification ("Not recognized" or "Finger not read"). Set
+`FP5_QTEE_MISS_EVENT` to another event name, or to empty to turn the
+haptic off. `FP5_QTEE_HIT_EVENT` (empty by default) does the same for a
+match. Put either in a systemd drop-in for `fp5-qtee-unlock.service`.
+
 Log scans, the time-listener reply, and the group-path buffer stop at the
 buffer they were given. A group path that does not fit is refused before it
 is sent. The phone session includes those checks and a one-press `unlock` mode.
