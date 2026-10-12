@@ -40,6 +40,8 @@ static void test_opcodes(void)
 	expect(fp5_wmode_touch() == 1, "touch mode");
 	expect(fp5_op_report() != 0x1018, "report is not 0x1018");
 	expect(fp5_op_stats() == 0x100e, "stats opcode");
+	expect(fp5_op_free_spi() == 0x1007, "free spi opcode");
+	expect(fp5_op_cancel() == 0x2004, "cancel opcode");
 
 	{
 		uint8_t hat[0x4a];

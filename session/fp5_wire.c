@@ -39,6 +39,8 @@ uint32_t fp5_op_auth(void) { return 0x2008; }
 
 uint32_t fp5_op_init(void) { return 0x1004; }
 uint32_t fp5_op_init_spi(void) { return 0x1006; }
+uint32_t fp5_op_free_spi(void) { return 0x1007; }
+uint32_t fp5_op_cancel(void) { return 0x2004; }
 uint32_t fp5_op_init_dev(void) { return 0x100b; }
 uint32_t fp5_op_sync(void) { return 0x100d; }
 uint32_t fp5_op_probe(void) { return 0x100a; }
