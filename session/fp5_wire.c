@@ -186,7 +186,11 @@ int fp5_score_sample(uint32_t avgv)
 	return avgv > 0 && avgv < 600;
 }
 
-int fp5_burst_ok(const uint32_t *avgv, int n)
+/*
+ * Enrollment: every frame of the burst must be in range, so a template is
+ * only ever built from full, good frames.
+ */
+int fp5_burst_full(const uint32_t *avgv, int n)
 {
 	int i, ok = 0;
 
@@ -197,6 +201,31 @@ int fp5_burst_ok(const uint32_t *avgv, int n)
 			ok++;
 	}
 	return ok == 3;
+}
+
+/*
+ * Authentication: score the burst when at least one frame is in range.
+ * Android always captures three frames and sends every one of them, including
+ * a frame with avgv >= 600, when another frame is in range. A burst with no
+ * frame in range is still not sent. The trustlet does the match.
+ */
+int fp5_burst_ok(const uint32_t *avgv, int n)
+{
+	return fp5_burst_pick(avgv, n) != 0;
+}
+
+/* The last in-range avgv of the burst, or 0 when none is in range. */
+uint32_t fp5_burst_pick(const uint32_t *avgv, int n)
+{
+	int i;
+
+	if (n > 3)
+		n = 3;
+	for (i = n - 1; i >= 0; i--) {
+		if (fp5_score_sample(avgv[i]))
+			return avgv[i];
+	}
+	return 0;
 }
 
 uint32_t fp5_auth_plen(void) { return 0xe; }
@@ -213,6 +242,44 @@ int fp5_auth_match(uint32_t itype, int esd, uint32_t avgv, int32_t report_rc,
 	if (fid == 0 || fid == 0xaaaaaaaau || fid == 0xa5a5a5a5u)
 		return 0;
 	return 1;
+}
+
+int fp5_auth_burst(uint32_t itype, int esd, const uint32_t *avgv, int n,
+		   int32_t report_rc, uint32_t fid)
+{
+	if (!fp5_real_down(itype, esd))
+		return 0;
+	if (!fp5_burst_ok(avgv, n))
+		return 0;
+	if (report_rc != 0)
+		return 0;
+	if (fid == 0 || fid == 0xaaaaaaaau || fid == 0xa5a5a5a5u)
+		return 0;
+	return 1;
+}
+
+int fp5_finger_held(unsigned base, unsigned now, int saw_itype,
+		    uint32_t itype, int esd)
+{
+	if (now == base)
+		return 1;
+	if (!saw_itype)
+		return 0;
+	return fp5_real_down(itype, esd);
+}
+
+int fp5_retry_more(int bursts_done, int held)
+{
+	if (!held)
+		return 0;
+	if (bursts_done < 1 || bursts_done >= 3)
+		return 0;
+	return 1;
+}
+
+int fp5_press_strikes(int scored_misses)
+{
+	return scored_misses > 0 ? 1 : 0;
 }
 
 /* Parsers stop at end so a token at the end of the buffer is not over-read. */

@@ -67,11 +67,33 @@ void fp5_poison_rem(uint8_t *pay);
 int fp5_real_down(uint32_t itype, int esd);
 /* Average value in (0, 600). */
 int fp5_score_sample(uint32_t avgv);
+/* Enrollment: all 3 frames in range. */
+int fp5_burst_full(const uint32_t *avgv, int n);
+/* Authentication: at least one of the first 3 frames in range.
+ * A sibling at avgv >= 600 does not drop the burst. All 3 frames are sent.
+ */
 int fp5_burst_ok(const uint32_t *avgv, int n);
+/* Last in-range avgv of the first 3 frames, 0 if none. */
+uint32_t fp5_burst_pick(const uint32_t *avgv, int n);
 uint32_t fp5_auth_plen(void); /* 0xe, HAL ff_trustlet_authenticate */
-/* Report rc 0 and a real template id. Poison and fid 0 are not a match. */
+/* Single-frame gate. avgv must itself be in range. */
 int fp5_auth_match(uint32_t itype, int esd, uint32_t avgv, int32_t report_rc,
 		   uint32_t fid);
+/* Burst gate. One in-range frame is enough; a hot sibling is still sent.
+ * Report rc 0 and a real template id. Poison and fid 0 are not a match.
+ */
+int fp5_auth_burst(uint32_t itype, int esd, const uint32_t *avgv, int n,
+		   int32_t report_rc, uint32_t fid);
+/* 1 while this press is still down. An unchanged irq_count is still down.
+ * An edge with no classified type, or any type other than exact 0x2, has
+ * lifted. Do not treat that edge as a new finger-down.
+ */
+int fp5_finger_held(unsigned base, unsigned now, int saw_itype,
+		    uint32_t itype, int esd);
+/* 1 to capture another burst. Stops at 3, and when the finger has lifted. */
+int fp5_retry_more(int bursts_done, int held);
+/* One press is one strike, however many scored bursts missed. */
+int fp5_press_strikes(int scored_misses);
 
 struct fp5_log {
 	uint32_t itype;

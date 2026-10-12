@@ -1,0 +1,17 @@
+# System unit. Not installed and not enabled by this repository.
+# Copy to /etc/systemd/system/ on the phone, then enable it there, only
+# after /home/user/fp5-qtee-keep/load-qcomtee.sh is this tree's script.
+# As root that script does not call sudo. It still refuses qsee_fingerpr,
+# does nothing if qcomtee is already loaded, and exits 1 on any kernel
+# other than 7.2.0-nfc-test+. Do not insmod qcomtee twice on one boot.
+[Unit]
+Description=Load qcomtee so the FP5 fingerprint reader has /dev/tee0
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/home/user/fp5-qtee-keep/load-qcomtee.sh
+
+[Install]
+WantedBy=multi-user.target

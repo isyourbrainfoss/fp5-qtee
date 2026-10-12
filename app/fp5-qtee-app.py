@@ -24,6 +24,7 @@ for p in (
         sys.path.insert(0, p)
 
 from fp5_qtee_coach import Coach  # noqa: E402
+from fp5_qtee_haptic import Haptic, enroll_accept  # noqa: E402
 
 import gi
 
@@ -68,6 +69,7 @@ class FingerWindow(Adw.ApplicationWindow):
         super().__init__(application=app, title=APP_TITLE)
         self.set_default_size(400, 720)
         self._coach = Coach()
+        self._haptic = Haptic()
         self._proc: subprocess.Popen[str] | None = None
         self._lock = threading.Lock()
         self._busy = False
@@ -312,6 +314,9 @@ class FingerWindow(Adw.ApplicationWindow):
 
     def _deliver(self, line: str) -> bool:
         if not self._closed:
+            # One click per counted enroll sample. A reject is not one.
+            if self._coach.mode == "enroll" and enroll_accept(line):
+                self._haptic.play("success")
             self._coach.on_line(line)
             self._paint()
         return False
