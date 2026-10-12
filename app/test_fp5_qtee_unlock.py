@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import queue
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -14,15 +15,19 @@ from unittest import mock
 
 import fp5_qtee_unlock
 from fp5_qtee_unlock import (
+    LockSignals,
     Throttle,
     UnlockPolicy,
     UnlockWatcher,
+    WarmLoop,
+    WarmSession,
     armed,
     choose_phosh,
     feedback_args,
     hit_fid,
     is_down,
     is_locked,
+    lock_signal,
     lockout_state_for,
     miss_kind,
     parse_locked,
@@ -571,6 +576,454 @@ class FollowTest(unittest.TestCase):
         self.assertEqual(len(asks), 1)
         with mock.patch.object(fp5_qtee_unlock, "panel_on", lambda: False):
             self.assertFalse(self.w.still_wanted("c4", lock))
+
+
+class FakeWarm:
+    def __init__(self) -> None:
+        self.lines: queue.Queue[str | None] = queue.Queue()
+        self.sent: list[str] = []
+        self.idle = False
+        self.cancel_sent = False
+        self.closed = False
+        self.dead = False
+
+    def say(self, *lines: str) -> None:
+        for line in lines:
+            self.lines.put(line + "\n")
+
+    def send(self, cmd: str) -> None:
+        self.sent.append(cmd)
+
+    def log(self, line: str) -> None:
+        pass
+
+    def alive(self) -> bool:
+        return not self.dead
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class WarmLoopTest(unittest.TestCase):
+    HIT = "AUTH HIT 1 itype=0x2 avgv=304 fid=1403494260 rc=0"
+    FAIL = "AUTH FAIL 1 itype=0x2 esd=0 avgv=291 fid=0 rc=-11"
+
+    def setUp(self) -> None:
+        self.now = [0.0]
+        self.panel = [True]
+        self.lock = [True]
+        self.lock_asks = 0
+        self.w = UnlockWatcher()
+        self.w.policy = UnlockPolicy(require_pin=False, marker=None,
+                                     clock=lambda: self.now[0])
+        self.events: list[tuple] = []
+        self.w.notify = lambda text: self.events.append(("notify", text))  # type: ignore[method-assign]
+        self.w.note = lambda text: None  # type: ignore[method-assign]
+        self.w.unlock = lambda sid, fid: self.events.append(("unlock", sid, fid))  # type: ignore[method-assign]
+        self.w.feedback = lambda event: None  # type: ignore[method-assign]
+        self.w.tell_miss = lambda kind: self.events.append(("miss", kind))  # type: ignore[method-assign]
+        self.w.session_id = lambda: "c4"  # type: ignore[method-assign]
+        self.started: list[FakeWarm] = []
+
+        def start_warm() -> FakeWarm:
+            warm = FakeWarm()
+            self.started.append(warm)
+            return warm
+
+        self.w.start_warm = start_warm  # type: ignore[method-assign,assignment]
+
+        def is_locked(sid: str) -> bool | None:
+            self.lock_asks += 1
+            return self.lock[0]
+
+        self.loop = WarmLoop(self.w, panel=lambda: self.panel[0],
+                             is_locked=is_locked, clock=lambda: self.now[0])
+
+    def step(self, dt: float = 0.2) -> None:
+        self.loop.step()
+        self.now[0] += dt
+
+    def unlocks(self) -> list[tuple]:
+        return [e for e in self.events if e[0] == "unlock"]
+
+    def test_loads_while_dark_and_rechecks_lock_on_wake(self) -> None:
+        self.step()                      # panel on, locked: starts cold
+        warm = self.started[0]
+        self.panel[0] = False
+        warm.say("SERVE ready", "SERVE idle")
+        self.step()
+        self.assertEqual(warm.sent, [])  # dark: never armed
+        asks = self.lock_asks
+        self.panel[0] = True
+        self.step()
+        self.assertEqual(warm.sent, ["auth"])
+        # LockedHint is read again right before the auth on wake.
+        self.assertEqual(self.lock_asks, asks + 1)
+
+    def test_wake_does_not_arm_when_unlocked_or_unknown(self) -> None:
+        self.step()
+        warm = self.started[0]
+        self.panel[0] = False
+        warm.say("SERVE ready", "SERVE idle")
+        self.step()
+        self.lock[0] = None              # loginctl timed out
+        self.panel[0] = True
+        self.step()
+        self.assertEqual(warm.sent, [])
+        self.assertFalse(warm.closed)    # session kept for the next try
+        self.lock[0] = False             # PIN unlocked while dark
+        self.step(1.1)
+        self.step()
+        self.assertEqual(warm.sent, [])
+        self.assertTrue(warm.closed)
+
+    def test_cancel_after_finger_down_never_unlocks(self) -> None:
+        self.step()
+        warm = self.started[0]
+        warm.say("SERVE idle")
+        self.step()
+        self.assertEqual(warm.sent, ["auth"])
+        warm.say("AUTH 1 REAL DOWN itype=0x2")
+        self.step()
+        self.panel[0] = False            # panel off: cancel
+        self.step()
+        self.assertEqual(warm.sent, ["auth", "cancel"])
+        # Even if the session still printed a hit for that attempt,
+        # dark or after the panel came back on, it must not unlock.
+        warm.say(self.HIT)
+        self.step()
+        self.panel[0] = True
+        warm.say(self.HIT)
+        self.step()
+        self.assertEqual(self.unlocks(), [])
+
+    def test_touch_while_panel_off_does_not_unlock_on_wake(self) -> None:
+        self.step()
+        warm = self.started[0]
+        warm.say("SERVE idle")
+        self.step()
+        self.panel[0] = False
+        self.step()
+        warm.say("AUTH 1 cancelled", "SERVE result 3", "SERVE idle")
+        self.step()
+        # A touch while dark was latched and comes out as a hit just as
+        # the panel comes back on, before the new auth.
+        warm.say(self.HIT, "SERVE result 0", "SERVE idle")
+        self.panel[0] = True
+        self.step()
+        self.assertEqual(self.unlocks(), [])
+        self.assertEqual(warm.sent, ["auth", "cancel", "auth"])
+        # A hit for the new auth, armed on this wake, unlocks.
+        warm.say(self.HIT, "SERVE result 0", "SERVE idle")
+        self.step()
+        self.assertEqual(self.unlocks(), [("unlock", "c4", 1403494260)])
+
+    def test_hit_after_result_is_refused(self) -> None:
+        self.step()
+        warm = self.started[0]
+        warm.say("SERVE idle")
+        self.step()
+        warm.say("SERVE result 2", self.HIT)
+        self.step()
+        self.assertEqual(self.unlocks(), [])
+
+    def test_miss_counts_even_if_panel_went_off(self) -> None:
+        self.step()
+        warm = self.started[0]
+        warm.say("SERVE idle")
+        self.step()
+        self.panel[0] = False
+        warm.say(self.FAIL, "SERVE result 2", "SERVE idle")
+        self.step()
+        self.assertEqual(self.w.policy.failed, 1)
+        self.assertNotIn(("miss", "nomatch"), self.events)
+
+    def test_starts_session_after_panel_off_when_locked(self) -> None:
+        self.lock[0] = False
+        self.step()
+        self.assertEqual(self.started, [])
+        self.lock[0] = True
+        self.panel[0] = False
+        self.step()
+        self.assertEqual(len(self.started), 1)
+
+    def test_hit_unlocks_and_miss_rearms(self) -> None:
+        self.step()
+        warm = self.started[0]
+        warm.say("SERVE ready", "SERVE idle")
+        self.step()
+        self.assertEqual(warm.sent, ["auth"])
+        warm.say(self.FAIL, "SERVE result 2", "SERVE idle")
+        self.step()
+        self.assertIn(("miss", "nomatch"), self.events)
+        self.assertEqual(warm.sent, ["auth", "auth"])
+        warm.say(self.HIT, "SERVE result 0", "SERVE idle")
+        self.step()
+        self.assertEqual(self.unlocks(), [("unlock", "c4", 1403494260)])
+
+    def test_hit_needs_logind_locked(self) -> None:
+        self.step()
+        warm = self.started[0]
+        warm.say("SERVE idle")
+        self.step()
+        self.lock[0] = False
+        warm.say(self.HIT)
+        self.step()
+        self.assertEqual(self.unlocks(), [])
+
+    def test_panel_off_cancels_once(self) -> None:
+        self.step()
+        warm = self.started[0]
+        warm.say("SERVE idle")
+        self.step()
+        self.panel[0] = False
+        self.step()
+        self.step()
+        self.assertEqual(warm.sent, ["auth", "cancel"])
+        warm.say("AUTH 1 cancelled", "SERVE result 3", "SERVE idle")
+        self.step()
+        warm.say(self.HIT)
+        self.step()
+        self.assertEqual(self.unlocks(), [])
+
+    def test_pin_unlock_quits_session(self) -> None:
+        self.step()
+        warm = self.started[0]
+        self.lock[0] = False
+        self.step(1.1)
+        self.step()
+        self.assertTrue(warm.closed)
+        self.assertIsNone(self.loop.warm)
+
+    def test_lockout_stops_arming(self) -> None:
+        self.step()
+        warm = self.started[0]
+        warm.say("SERVE idle")
+        for _ in range(5):
+            self.step()
+            warm.say(self.FAIL, "SERVE result 2", "SERVE idle")
+        self.step()
+        self.step()
+        self.assertEqual(warm.sent.count("auth"), 5)
+        self.assertEqual(self.w.policy.why_not(), "lockout")
+        self.now[0] += 31
+        self.step()
+        self.assertEqual(warm.sent.count("auth"), 6)
+
+    def test_dead_session_waits_before_restart(self) -> None:
+        self.step()
+        self.started[0].dead = True
+        self.step()
+        self.assertEqual(len(self.started), 1)
+        self.now[0] += 5.1
+        self.step()
+        self.step()
+        self.assertEqual(len(self.started), 2)
+
+
+FAKE_SERVE = r"""
+import sys
+print("SERVE ready", flush=True)
+n = 0
+while True:
+    print("SERVE idle", flush=True)
+    line = sys.stdin.readline()
+    if not line or line.strip() == "quit":
+        break
+    if line.strip() == "auth":
+        n += 1
+        print(f"AUTH {n} arm mode=1 irq=4", flush=True)
+        print(f"SERVE result 2", flush=True)
+print("session_exit:0", flush=True)
+"""
+
+
+class FakeSignals:
+    def __init__(self) -> None:
+        self.alive = True
+        self.pending = False
+
+    def poll(self) -> bool:
+        seen, self.pending = self.pending, False
+        return seen
+
+
+class WarmRelockTest(WarmLoopTest.__base__):  # type: ignore[misc]
+    """Unlock frees the sensor; the next lock reloads before the wake."""
+
+    HIT = WarmLoopTest.HIT
+    FAIL = WarmLoopTest.FAIL
+
+    def setUp(self) -> None:
+        WarmLoopTest.setUp(self)  # type: ignore[arg-type]
+        self.sig = FakeSignals()
+        self.loop.signals = self.sig  # type: ignore[assignment]
+
+    step = WarmLoopTest.step
+    unlocks = WarmLoopTest.unlocks
+
+    def _unlock_by_finger(self) -> FakeWarm:
+        self.step()
+        warm = self.started[0]
+        warm.say("SERVE idle")
+        self.step()
+        warm.say(self.HIT, "SERVE result 0", "SERVE idle")
+        self.lock[0] = True
+        self.step()
+        self.assertEqual(len(self.unlocks()), 1)
+        self.lock[0] = False
+        self.sig.pending = True
+        self.step()
+        return warm
+
+    def test_unlock_quits_then_lock_signal_preloads_while_on(self) -> None:
+        warm = self._unlock_by_finger()
+        self.assertTrue(warm.closed)          # sensor released
+        self.assertIsNone(self.loop.warm)
+        for _ in range(20):                   # unlocked: no reload
+            self.step()
+        self.assertEqual(len(self.started), 1)
+        self.lock[0] = True                   # Phosh locks, panel still on
+        self.sig.pending = True
+        self.step()
+        self.assertEqual(len(self.started), 2)
+
+    def test_late_lock_while_dark_preloads(self) -> None:
+        self._unlock_by_finger()
+        self.panel[0] = False
+        for _ in range(100):                  # 20 s dark, still unlocked
+            self.step()
+        self.assertEqual(len(self.started), 1)
+        asks = self.lock_asks
+        self.lock[0] = True                   # lock long after blank
+        self.sig.pending = True
+        self.step()
+        self.assertEqual(len(self.started), 2)
+        self.assertEqual(self.lock_asks, asks + 1)
+        warm = self.started[1]
+        warm.say("SERVE ready", "SERVE idle")
+        self.step()
+        self.assertEqual(warm.sent, [])       # dark: loaded, not armed
+        self.panel[0] = True
+        self.step()
+        self.assertEqual(warm.sent, ["auth"]) # warm on wake
+
+    def test_unlocked_screen_on_polls_slowly_with_signals(self) -> None:
+        self._unlock_by_finger()
+        asks = self.lock_asks
+        for _ in range(25):                   # 5 s
+            self.step()
+        self.assertLessEqual(self.lock_asks - asks, 1)
+
+    def test_without_signals_dark_lock_is_still_found(self) -> None:
+        self._unlock_by_finger()
+        self.sig.alive = False
+        self.panel[0] = False
+        for _ in range(60):
+            self.step()
+        self.lock[0] = True
+        for _ in range(60):                   # within DARK_LOCK_POLL_S
+            self.step()
+        self.assertEqual(len(self.started), 2)
+
+    def test_wake_press_miss_is_ignored_but_hit_unlocks(self) -> None:
+        self.step()
+        warm = self.started[0]
+        warm.say("SERVE idle")
+        self.panel[0] = False
+        self.step()
+        self.panel[0] = True                  # power key wakes the panel
+        self.step()
+        self.assertEqual(warm.sent[-1], "auth")
+        warm.say("AUTH 1 REAL DOWN itype=0x2", self.FAIL,
+                 "SERVE result 2", "SERVE idle")
+        self.step()                           # 0.2 s after panel-on
+        self.assertEqual(self.w.policy.failed, 0)
+        self.assertNotIn(("miss", "nomatch"), self.events)
+        self.now[0] += 1.0
+        warm.say("AUTH 1 REAL DOWN itype=0x2", self.FAIL,
+                 "SERVE result 2", "SERVE idle")
+        self.step()                           # a real try later
+        self.assertEqual(self.w.policy.failed, 1)
+        self.assertIn(("miss", "nomatch"), self.events)
+
+    def test_wake_press_hit_unlocks(self) -> None:
+        self.step()
+        warm = self.started[0]
+        warm.say("SERVE idle")
+        self.panel[0] = False
+        self.step()
+        self.panel[0] = True
+        self.step()
+        warm.say("AUTH 1 REAL DOWN itype=0x2", self.HIT,
+                 "SERVE result 0", "SERVE idle")
+        self.step()
+        self.assertEqual(self.unlocks(), [("unlock", "c4", 1403494260)])
+
+
+class LockSignalTest(unittest.TestCase):
+    def test_lines(self) -> None:
+        self.assertTrue(lock_signal(
+            "/org/freedesktop/login1/session/_32: org.freedesktop.DBus."
+            "Properties.PropertiesChanged ('org.freedesktop.login1.Session',"
+            " {'LockedHint': <true>}, @as [])"))
+        self.assertTrue(lock_signal(
+            "/org/freedesktop/login1/session/c4: "
+            "org.freedesktop.login1.Session.Unlock ()"))
+        self.assertFalse(lock_signal(
+            "/org/freedesktop/login1: org.freedesktop.login1.Manager."
+            "SessionNew ('5', objectpath '/org/freedesktop/login1/session/_35')"))
+
+    def test_process_and_fallback(self) -> None:
+        sig = LockSignals(["sh", "-c", "echo \"x {'LockedHint': <true>}\"; exec sleep 5"])
+        self.addCleanup(sig.close)
+        deadline = time.monotonic() + 3
+        seen = False
+        while time.monotonic() < deadline and not seen:
+            seen = sig.poll()
+            time.sleep(0.02)
+        self.assertTrue(seen)
+        self.assertTrue(sig.alive)
+        self.assertFalse(sig.poll())
+        gone = LockSignals(["/nonexistent/gdbus"])
+        self.assertFalse(gone.alive)
+        ended = LockSignals(["true"])
+        self.addCleanup(ended.close)
+        deadline = time.monotonic() + 3
+        while ended.alive and time.monotonic() < deadline:
+            ended.poll()
+            time.sleep(0.02)
+        self.assertFalse(ended.alive)
+
+
+class WarmSessionPipeTest(unittest.TestCase):
+    """Real pipes against a stand-in for the serve protocol."""
+
+    def test_auth_then_quit(self) -> None:
+        proc = subprocess.Popen(
+            [sys.executable, "-c", FAKE_SERVE],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, bufsize=1,
+            start_new_session=True,
+        )
+        warm = WarmSession(proc, None)
+
+        def until(text: str) -> list[str]:
+            got = []
+            while True:
+                line = warm.lines.get(timeout=5)
+                self.assertIsNotNone(line)
+                got.append(line.strip())
+                if line.strip() == text:
+                    return got
+
+        until("SERVE idle")
+        warm.send("auth")
+        got = until("SERVE idle")
+        self.assertIn("AUTH 1 arm mode=1 irq=4", got)
+        warm.close()
+        self.assertFalse(warm.alive())
+        proc.stdout.close()
 
 
 if __name__ == "__main__":

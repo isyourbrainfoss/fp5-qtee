@@ -69,6 +69,59 @@ The watcher follows Android's rules for when a finger may unlock:
 While one of these applies the sensor is not armed at all, and one
 notification says why.
 
+### Warm mode (opt-in, `FP5_QTEE_WARM=1`)
+
+By default every attempt starts a new `fp5-qtee-session unlock`: mount,
+sensor power-up and reset, `/dev/tee0`, four listener registrations, the
+trustlet load from `focal32.mdt`/`.bXX`, 13 setup commands, then
+SET_GROUP/ENUM. Only then is the sensor armed. That is the wait after
+waking the screen, and it is paid again after every miss.
+
+`fp5-qtee-session serve` does that setup once and then takes line
+commands on stdin: `auth`, `cancel`, `quit` (EOF is `quit`). It prints
+`SERVE ready`, then `SERVE idle` whenever it waits for a command and
+`SERVE result <rc>` after each `auth`. Idle is a blocking read; there is no
+polling and no sensor command. A finger wait also watches stdin, so
+`cancel` ends it at once (`AUTH <n> cancelled`, result 3). stdin is read
+before every interrupt check, after the finger-down query, after each
+capture and before the verdict, so a cancelled attempt never prints
+`AUTH HIT`, even if the finger was already down or had matched
+(`AUTH <n> cancelled after match`). A scored non-match is still printed as
+`AUTH FAIL` so it counts as a strike. Each `auth` starts from the
+interrupt count read when it is armed, so a press while cancelled or dark
+does not carry into it. An `auth` sent while one runs gets
+`SERVE reject auth busy`, an unknown line `SERVE reject unknown`. Serve
+mode does not start the `/dev/qsee_log` watch thread.
+
+With `FP5_QTEE_WARM=1` the watcher starts one serve session when it sees
+the session locked, including in the 10 s after the panel goes off, so
+the load happens while the screen is dark. On wake it reads the panel and
+LockedHint again and only then sends `auth` (one loginctl call, so arming
+waits for it). After a miss it re-arms straight away, again after a fresh
+LockedHint. Panel off sends `cancel`. An unknown LockedHint cancels and
+does not arm. An unlock (finger or PIN) quits the session, which frees the
+sensor for the Finger app; nothing holds the sensor while unlocked. The
+next lock starts a new serve session at once, so it is warm again before
+the next wake: the watcher follows logind's lock signals through one idle
+`gdbus monitor --system --dest org.freedesktop.login1` process (a hint
+only; the state is still read with loginctl), so a lock with the panel on,
+or long after the panel went off, preloads straight away. With the
+signals, an unlocked phone with the panel on is asked LockedHint only
+every 15 s instead of every second. Without `gdbus`, a dark unlocked
+phone is asked every 10 s until a session is loaded. A hit unlocks only if it is from the `auth` sent
+in this panel-on period and not cancelled (no hit after `cancel`, after
+panel-off, or after that attempt's `SERVE result`), and it still has to
+pass the panel, logind and lockout checks. A scored non-match counts as a
+strike even if the panel went off meanwhile.
+
+Enable it with a drop-in:
+
+```sh
+systemctl --user edit fp5-qtee-unlock.service
+# [Service]
+# Environment=FP5_QTEE_WARM=1
+```
+
 Log scans, the time-listener reply, and the group-path buffer stop at the
 buffer they were given. A group path that does not fit is refused before it
 is sent. The phone session includes those checks and a one-press `unlock` mode.
@@ -89,7 +142,7 @@ The signed `focal32` image is not in this repository. Copy `focal32.mdt` and
 ## Repository layout
 
 ```
-session/   fp5-qtee-session, wire helpers, and their host tests
+session/   fp5-qtee-session, wire and serve-command helpers, and their host tests
 app/       Phosh "Finger" app (idle until Enroll or Match)
 scripts/   load-qcomtee.sh for the test phone
 ```
