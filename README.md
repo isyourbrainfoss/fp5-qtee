@@ -87,10 +87,13 @@ Invoke buffers are a 1536-byte request and a 2048-byte response. A pair
 of 2048-byte buffers returns `MAXDATA` (`-95`).
 
 `scripts/load-qcomtee.sh` insmods
-`/home/user/fp5-qtee-keep/qcomtee-bridge.ko` (not in this repo). It
-exits 1 on any kernel other than `7.2.0-nfc-test+`, exits 1 when
-`qsee_fingerpr` is loaded, and does nothing when `qcomtee` is already
-loaded. Do not `rmmod` a live `qsee_fingerpr`.
+`/home/user/fp5-qtee-keep/qcomtee-bridge.ko` (not in this repo) on
+`7.2.0-nfc-test+`. On a kernel where qcomtee is built in, `/dev/tee0`
+or `/sys/bus/platform/drivers/qcomtee` is enough and the script prints
+`qcomtee built-in`. That is the 7.2.9 boot: `CONFIG_QCOMTEE=y` and
+`CONFIG_QCOM_TZMEM_MODE_GENERIC=y`. It exits 1 when `qsee_fingerpr` is
+loaded, and does nothing when the module is already loaded. Do not
+`rmmod` a live `qsee_fingerpr`.
 
 ## Wire format
 
