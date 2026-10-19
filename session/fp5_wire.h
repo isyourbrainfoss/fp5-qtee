@@ -18,7 +18,7 @@ uint32_t fp5_op_wmode(void);      /* 0x101f */
 uint32_t fp5_op_pre_enroll(void); /* 0x2000, ff_trustlet_pre_enroll */
 uint32_t fp5_op_enroll(void);     /* 0x2001, ff_trustlet_enroll */
 uint32_t fp5_op_save(void);       /* 0x1014 */
-uint32_t fp5_save_flag(void);     /* 0x40000000 */
+uint32_t fp5_save_flag(void);     /* 0x40000000, Android HAL save. Not 0x60000000. */
 uint32_t fp5_wmode_detect(void);  /* 9, SPI helper used while enroll is scanning */
 uint32_t fp5_wmode_touch(void);   /* 1, chip wait-touch; TA names it FDT_DOWN_DETECT */
 uint32_t fp5_op_auth(void);       /* 0x2008 */
@@ -35,6 +35,9 @@ uint32_t fp5_op_probe(void);
 uint32_t fp5_op_query(void);
 uint32_t fp5_op_capture(void);
 uint32_t fp5_op_set_group(void);
+/* 0x1028. focal32 answers -203 and does not delete a template.
+ * Marcus Ramberg's list command is 0x2005 (8-byte entries). It is not
+ * sent here. See docs/ultimate.md. */
 uint32_t fp5_op_enum(void);
 uint32_t fp5_op_set_spi(void);
 uint32_t fp5_op_version(void);

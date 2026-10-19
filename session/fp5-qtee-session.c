@@ -1696,8 +1696,10 @@ static int setup_ta(struct svc *s, int native)
 		if (send_cmd(s, fp5_op_free_spi(), 0, NULL, "FREE_SPI") ||
 		    send_cmd(s, fp5_op_init_spi(), 0, NULL, "INIT_SPI2"))
 			return -1;
-		if (s->last_rc != 0)
+		if (s->last_rc != 0) {
 			logf("INIT_SPI retry rc=%d", (int)s->last_rc);
+			return -1;
+		}
 	}
 	spi_held = s->last_rc == 0;
 	if (send_cmd(s, fp5_op_set_spi(), 4, &spd, "SET_SPI"))

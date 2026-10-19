@@ -29,12 +29,71 @@ Not taken: A's libfprint/fprintd path. Phosh cannot use it to unlock today
 The long-term meeting point is one fprintd-facing daemon with a pluggable
 transport.
 
-## Still open between A and B (settle on one phone)
+## Settled on this phone
 
-1. Device id: A sends string `"0x9391"`, B sends integer 37777.
-2. Enroll detect mode: A uses WORK_MODE 1, B uses 9.
-3. ENUMERATE: A uses 0x2005 with 8-byte entries, B uses 0x1028.
-4. Gallery path / save: A uses the `fpdata` path + POST_ENROLL, B uses `""` + SAVE 0x1014|0x40000000.
+Compared with his `focaltechqsee` driver at `e5912e8` and with enroll and
+match logs from this Fairphone 5. The stored finger stays on the path
+that already matched after a reboot. His other choices are written down
+so a later edit does not "fix" them.
+
+1. Device id stays the integer 37777. That is `0x9391`, the `ft93xx`
+   profile. His driver sends the string `"0x9391"` and says an integer
+   is rejected as `JSON_INTEGER`. This phone enrolled and matched with
+   the integer, including after a reboot on 2026-10-08 (fid 1403494260).
+2. Match stays on work mode 1. That is his `FDT_DOWN_DETECT`. Enroll
+   stays on work mode 9. Mode 9 is the SPI helper used while a scan is
+   already running. A match armed with mode 9 does not move the IRQ.
+   Enroll on this phone reached samples-remaining 0 with interrupt type
+   `0x2` under mode 9.
+3. The command sent after a gallery load stays opcode `0x1028`. focal32
+   answers `-203` and does not delete the template. The finger count
+   comes from the SET_GROUP log (`there is N template loaded`), which is
+   what stops a new enroll from replacing slot 0. His list command is
+   `0x2005`. Its return code is the finger count, so `1` is not a
+   failure. Each entry is 8 bytes: the id, then a zero word, and the
+   first id sits at offset 8. A stride of 4 reads the second finger as
+   0. It stays off the unlock path until a probe logs those ids and
+   ignores that status word.
+4. The gallery path stays empty, and the save stays opcode `0x1014` with
+   flag `0x40000000`. The trustlet then stores `/ff_template_0_0.bin`.
+   That object matched after reboot. His path
+   `/data/vendor_de/0/fpdata` looks up a different object on this
+   listener and drops the RAM copy. His save mask is `0x60000000`,
+   because a zero payload saves calibration only. `0x40000000` is the
+   Android HAL flag, and it is the save that wrote this finger (about
+   200 ms, `template=1`). He also sends POST_ENROLL (`0x2002`). This
+   session does not. The finger still persisted.
+
+Also kept, because an enroll on this phone already finished with them:
+`max_enrolling_samples` 20 (he warns that 16 can never finish), image
+columns and rows 0 (he says zero crashes), quality floors 40 and 70,
+and SPI capture at 8030000. SYNC_CONFIG already runs before INIT_SPI,
+which is his order. `enable_hw_reset_b4_scanning` is already false.
+Trusted enrollment is already false.
+
+Not copied: his NixOS module (nixos-fairphone-fp5 publishes no license),
+the QSEECOM driver, ffsupplicant, and the RPMB listeners. The files in
+`kernel/marcusramberg/` are his GPL-2.0-only patches, copied unchanged.
+The C in this repo is a reimplementation under GPL-2.0-only. libfprint
+itself is LGPL-2.1-or-later.
+
+## Test checklist
+
+1. Enroll one finger in the Finger app. It should reach samples-remaining
+   0 and say it saved. The finger that is already stored should still
+   match afterwards.
+2. Lock the phone with the screen on. Press the enrolled finger once.
+   The lock screen should go away.
+3. Lock the phone and let the screen turn off. Press and hold the
+   fingerprint. That button is also the power key, so the screen comes
+   on by itself. The same hold should unlock. Do not press a second time.
+4. Lock the phone with the screen on. Press a finger that is not
+   enrolled. It should say it was not recognized, and the phone should
+   stay locked. Press the enrolled finger next. That press should unlock.
+
+The FREE_SPI and CANCEL checks below are for the same session. CANCEL
+runs at the start of enroll. If the old finger stops matching after
+that, restore the previous session binary and do not enroll again.
 
 ## On-phone checks for this branch
 

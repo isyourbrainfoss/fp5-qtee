@@ -26,8 +26,9 @@ and [fp5-fingerprint-tools](https://github.com/marcusramberg/fp5-fingerprint-too
 This repo now reuses parts of that work: FREE_SPI recovery, CANCEL before
 enroll, and his GPL-2.0 kernel patches in `kernel/marcusramberg/`. See
 `docs/ultimate.md` for what came from where.
-The core commands agree; some details differ (device id format, enroll
-finger-detect mode, list and save commands) and are worth comparing.
+The four differences (device id, enroll detect mode, list command, and
+the gallery path and save flag) are settled in `docs/ultimate.md`. This
+phone keeps the path that already matched.
 
 Status: **experimental**. Not an official Fairphone or distribution package.
 
