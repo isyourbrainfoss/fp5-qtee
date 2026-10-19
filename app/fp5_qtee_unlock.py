@@ -70,7 +70,7 @@ PANEL_HIT_WAIT_S = 4.0
 # seat unlocks. A shorter budget resets and calibrates again while a wake
 # finger can already be down.
 UNLOCK_HOLD_S = 1800
-_HIT = re.compile(r"^AUTH HIT \d+ .* fid=(\d+) ")
+_HIT = re.compile(r"^AUTH HIT (\d+) .* fid=(\d+) ")
 _ARM = re.compile(r"^AUTH \d+ arm ")
 # auth_once prints these after a real finger-down (itype 0x2):
 #   AUTH FAIL <n> itype=0x2 ...   the image was scored and did not match
@@ -171,10 +171,18 @@ def hit_fid(line: str) -> int | None:
     match = _HIT.match(line.strip())
     if match is None:
         return None
-    fid = int(match.group(1))
+    fid = int(match.group(2))
     if fid in POISON:
         return None
     return fid
+
+
+def hit_attempt(line: str) -> int | None:
+    """Attempt number on an AUTH HIT line, or None when it is not one."""
+    match = _HIT.match(line.strip())
+    if match is None:
+        return None
+    return int(match.group(1))
 
 
 def armed(line: str) -> bool:
@@ -1367,9 +1375,10 @@ class WarmLoop:
       while unlocked screen-on or dark, so it is warm again before the next
       wake. LockedHint unknown (loginctl timed out, failed, or printed
       nothing): cancel, keep the session, do not arm.
-    A hit unlocks only if it belongs to the auth we sent in this panel-on
-    period and was not cancelled, the panel is on (or dark_arm is set),
-    logind says locked right now, and the policy allows it. A scored
+    A hit unlocks only if its AUTH HIT attempt number is the auth we
+    just sent and that attempt was not cancelled, the panel is on (or
+    dark_arm is set), logind says locked right now, and the policy
+    allows it. A scored
     non-match is a strike whatever the panel did meanwhile. It never wakes
     the screen. Feedback in the dark is played only when dark_arm is set.
     """
@@ -1390,9 +1399,11 @@ class WarmLoop:
         self.wake = wake if wake is not None else watcher.wake_panel
         self.warm: WarmSession | None = None
         self.armed = False
-        # True from sending auth until that attempt is cancelled, the
-        # panel is seen off, or the session reports its result.
-        self.attempt_live = False
+        # The auth number we are waiting on. None once that attempt is
+        # cancelled, the session reports its result, or it goes idle.
+        # A new serve session starts again at 0, matching the session.
+        self.attempt_n = 0
+        self.live_attempt: int | None = None
         self.believed_locked = False
         self.prev_panel: bool | None = None
         self.off_checks = 0
@@ -1425,7 +1436,8 @@ class WarmLoop:
             return
         self.warm = warm
         self.armed = False
-        self.attempt_live = False
+        self.attempt_n = 0
+        self.live_attempt = None
 
     def stop(self) -> None:
         if self.warm is not None:
@@ -1433,7 +1445,7 @@ class WarmLoop:
             self.warm.close()
         self.warm = None
         self.armed = False
-        self.attempt_live = False
+        self.live_attempt = None
         self._close_armed_listen()
 
     def _close_armed_listen(self) -> None:
@@ -1446,7 +1458,7 @@ class WarmLoop:
 
     def cancel(self) -> None:
         """No hit may unlock from the running attempt any more."""
-        self.attempt_live = False
+        self.live_attempt = None
         warm = self.warm
         if self.armed and warm is not None and not warm.cancel_sent:
             warm.send("cancel")
@@ -1470,12 +1482,12 @@ class WarmLoop:
                 warm.idle = True
                 warm.cancel_sent = False
                 self.armed = False
-                self.attempt_live = False
+                self.live_attempt = None
                 self._close_armed_listen()
                 continue
             if line.startswith("SERVE result"):
                 # That attempt is over. Nothing after this is from it.
-                self.attempt_live = False
+                self.live_attempt = None
                 self._close_armed_listen()
                 continue
             if line.startswith("SERVE reject"):
@@ -1502,7 +1514,7 @@ class WarmLoop:
                 self.down_at = None
                 if self.wake_open and wake_press(at, self.arm_at):
                     self.wake_claimed = True
-                self.on_hit(fid, panel)
+                self.on_hit(fid, panel, hit_attempt(line))
                 continue
             kind = miss_kind(line)
             if kind is not None:
@@ -1523,7 +1535,7 @@ class WarmLoop:
                     self.w.policy.on_miss()
                 # A miss never wakes the panel. In the dark the double
                 # pulse still plays when dark arming is on.
-                if self.believed_locked and self.attempt_live and (
+                if self.believed_locked and self.live_attempt is not None and (
                     panel or self.dark_arm
                 ):
                     self.w.tell_miss(kind)
@@ -1532,15 +1544,14 @@ class WarmLoop:
             self.stop()
             self.retry_at = self.clock() + WARM_RETRY_S
 
-    def on_hit(self, fid: int, panel: bool) -> None:
-        live = self.attempt_live
-        self.attempt_live = False
-        sid = self.sid
-        if not live:
-            # After cancel, after panel-off (unless dark arming), or not
-            # from an auth we sent for this attempt.
+    def on_hit(self, fid: int, panel: bool, attempt: int | None = None) -> None:
+        if self.live_attempt is None or attempt != self.live_attempt:
+            # After cancel, after the result, or a hit from an older auth.
+            # A mismatch does not drop the attempt we are waiting on.
             self.w.note("hit refused: attempt was cancelled or stale")
             return
+        self.live_attempt = None
+        sid = self.sid
         if not self.believed_locked or sid is None:
             return
         if not panel and not self.dark_arm:
@@ -1663,10 +1674,11 @@ class WarmLoop:
                 return
         if self.w.policy.why_not() is not None:
             return
+        self.attempt_n += 1
+        self.live_attempt = self.attempt_n
         warm.send("auth")
         warm.idle = False
         self.armed = True
-        self.attempt_live = True
         self.down_at = None
 
 

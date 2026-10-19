@@ -75,6 +75,14 @@ class UnlockDecisionTest(unittest.TestCase):
     def test_hit_fid(self) -> None:
         line = "AUTH HIT 1 itype=0x2 avgv=304 fid=1403494260 rc=0"
         self.assertEqual(hit_fid(line), 1403494260)
+        self.assertEqual(fp5_qtee_unlock.hit_attempt(line), 1)
+        self.assertEqual(
+            fp5_qtee_unlock.hit_attempt(
+                "AUTH HIT 2 itype=0x2 avgv=304 fid=1403494260 rc=0"
+            ),
+            2,
+        )
+        self.assertIsNone(fp5_qtee_unlock.hit_attempt("AUTH FAIL 1 itype=0x2"))
         self.assertIsNone(hit_fid("AUTH FAIL 1 itype=0x2 esd=0 avgv=291 fid=0 rc=-11"))
         self.assertIsNone(hit_fid("AUTH HIT 1 itype=0x2 avgv=1 fid=0 rc=0"))
         self.assertIsNone(hit_fid("auth success score:0x00000026."))
@@ -1303,7 +1311,10 @@ class WarmLoopTest(unittest.TestCase):
         self.assertEqual(self.unlocks(), [])
         self.assertEqual(warm.sent, ["auth", "cancel", "auth"])
         # A hit for the new auth, armed on this wake, unlocks.
-        warm.say(self.HIT, "SERVE result 0", "SERVE idle")
+        warm.say(
+            "AUTH HIT 2 itype=0x2 avgv=304 fid=1403494260 rc=0",
+            "SERVE result 0", "SERVE idle",
+        )
         self.step()
         self.assertEqual(self.unlocks(), [("unlock", "c4", 1403494260)])
 
@@ -1346,7 +1357,29 @@ class WarmLoopTest(unittest.TestCase):
         self.step()
         self.assertIn(("miss", "nomatch"), self.events)
         self.assertEqual(warm.sent, ["auth", "auth"])
-        warm.say(self.HIT, "SERVE result 0", "SERVE idle")
+        warm.say(
+            "AUTH HIT 2 itype=0x2 avgv=304 fid=1403494260 rc=0",
+            "SERVE result 0", "SERVE idle",
+        )
+        self.step()
+        self.assertEqual(self.unlocks(), [("unlock", "c4", 1403494260)])
+
+    def test_stale_hit_number_does_not_unlock(self) -> None:
+        self.step()
+        warm = self.started[0]
+        warm.say("SERVE idle")
+        self.step()
+        self.panel[0] = False
+        self.step()
+        warm.say("AUTH 1 cancelled", "SERVE result 3", "SERVE idle")
+        self.step()
+        self.panel[0] = True
+        self.step()
+        self.assertEqual(warm.sent, ["auth", "cancel", "auth"])
+        warm.say("AUTH HIT 1 itype=0x2 avgv=304 fid=1403494260 rc=0")
+        self.step()
+        self.assertEqual(self.unlocks(), [])
+        warm.say("AUTH HIT 2 itype=0x2 avgv=304 fid=1403494260 rc=0")
         self.step()
         self.assertEqual(self.unlocks(), [("unlock", "c4", 1403494260)])
 
