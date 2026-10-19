@@ -576,7 +576,7 @@ class FollowTest(unittest.TestCase):
         self.w = UnlockWatcher()
         self.w.notify = lambda text: None  # type: ignore[method-assign]
         self.unlocked: list[tuple[str, int]] = []
-        self.w.unlock = lambda sid, fid: self.unlocked.append((sid, fid))  # type: ignore[method-assign]
+        self.w.unlock = lambda sid, fid: self.unlocked.append((sid, fid)) or True  # type: ignore[method-assign]
         self.w._stop = lambda proc: proc.stop()  # type: ignore[method-assign,assignment]
         self.misses: list[str] = []
         self.w.tell_miss = lambda kind: self.misses.append(kind)  # type: ignore[method-assign]
@@ -614,6 +614,61 @@ class FollowTest(unittest.TestCase):
         out = self.w.follow("c4", proc, lambda: True, poll_s=0.01)  # type: ignore[arg-type]
         self.assertEqual(out, "hit")
         self.assertEqual(self.unlocked, [("c4", 1403494260)])
+
+    def _real_unlock(self, run_result: object) -> None:
+        """Call the real unlock(), with subprocess.run replaced."""
+        hits: list[str] = []
+        self.w.tell_hit = lambda: hits.append("hit")  # type: ignore[method-assign]
+        self.hits = hits
+        self.w.policy.on_miss()
+        self.w.policy.on_miss()
+        self.failed_before = self.w.policy.failed
+        self.w.unlock = lambda sid, fid: UnlockWatcher.unlock(self.w, sid, fid)  # type: ignore[method-assign]
+
+        def run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            if isinstance(run_result, BaseException):
+                raise run_result
+            return run_result  # type: ignore[return-value]
+
+        self._run_patch = mock.patch.object(fp5_qtee_unlock.subprocess, "run", run)
+        self._run_patch.start()
+        self.addCleanup(self._run_patch.stop)
+
+    def test_loginctl_error_does_not_count_as_a_hit(self) -> None:
+        self._real_unlock(subprocess.CompletedProcess(["loginctl"], 1))
+        proc = FakeProc(["AUTH HIT 1 itype=0x2 avgv=304 fid=1403494260 rc=0\n"])
+        out = self.w.follow("c4", proc, lambda: True, poll_s=0.01)  # type: ignore[arg-type]
+        self.assertEqual(out, "stop")
+        self.assertEqual(self.w._listen_why, "unlock failed")
+        self.assertEqual(self.hits, [])
+        self.assertEqual(self.w.policy.failed, self.failed_before)
+        self.assertEqual(self.unlocked, [])
+
+    def test_loginctl_timeout_does_not_count_as_a_hit(self) -> None:
+        self._real_unlock(subprocess.TimeoutExpired(["loginctl"], 5))
+        proc = FakeProc(["AUTH HIT 1 itype=0x2 avgv=304 fid=1403494260 rc=0\n"])
+        out = self.w.follow("c4", proc, lambda: True, poll_s=0.01)  # type: ignore[arg-type]
+        self.assertEqual(out, "stop")
+        self.assertEqual(self.w._listen_why, "unlock failed")
+        self.assertEqual(self.hits, [])
+        self.assertEqual(self.w.policy.failed, self.failed_before)
+
+    def test_loginctl_oserror_does_not_count_as_a_hit(self) -> None:
+        self._real_unlock(OSError("loginctl missing"))
+        proc = FakeProc(["AUTH HIT 1 itype=0x2 avgv=304 fid=1403494260 rc=0\n"])
+        out = self.w.follow("c4", proc, lambda: True, poll_s=0.01)  # type: ignore[arg-type]
+        self.assertEqual(out, "stop")
+        self.assertEqual(self.w._listen_why, "unlock failed")
+        self.assertEqual(self.hits, [])
+        self.assertEqual(self.w.policy.failed, self.failed_before)
+
+    def test_loginctl_ok_resets_strikes_and_buzzes(self) -> None:
+        self._real_unlock(subprocess.CompletedProcess(["loginctl"], 0))
+        proc = FakeProc(["AUTH HIT 1 itype=0x2 avgv=304 fid=1403494260 rc=0\n"])
+        out = self.w.follow("c4", proc, lambda: True, poll_s=0.01)  # type: ignore[arg-type]
+        self.assertEqual(out, "hit")
+        self.assertEqual(self.hits, ["hit"])
+        self.assertEqual(self.w.policy.failed, 0)
 
     def test_hit_after_panel_off_does_not_unlock(self) -> None:
         proc = FakeProc([
@@ -1070,7 +1125,7 @@ class WarmLoopTest(unittest.TestCase):
         self.events: list[tuple] = []
         self.w.notify = lambda text: self.events.append(("notify", text))  # type: ignore[method-assign]
         self.w.note = lambda text: None  # type: ignore[method-assign]
-        self.w.unlock = lambda sid, fid: self.events.append(("unlock", sid, fid))  # type: ignore[method-assign]
+        self.w.unlock = lambda sid, fid: self.events.append(("unlock", sid, fid)) or True  # type: ignore[method-assign]
         self.w.feedback = lambda event: None  # type: ignore[method-assign]
         self.w.tell_hit = lambda: self.events.append(("haptic", "success"))  # type: ignore[method-assign]
         self.w.tell_miss = lambda kind: self.events.append(("miss", kind))  # type: ignore[method-assign]
@@ -1212,6 +1267,29 @@ class WarmLoopTest(unittest.TestCase):
         warm.say(self.HIT, "SERVE result 0", "SERVE idle")
         self.step()
         self.assertEqual(self.unlocks(), [("unlock", "c4", 1403494260)])
+
+    def test_failed_unlock_does_not_reset_or_buzz(self) -> None:
+        self.w.policy.on_miss()
+        self.w.policy.on_miss()
+        failed = self.w.policy.failed
+        buzzed: list[str] = []
+        self.w.tell_hit = lambda: buzzed.append("hit")  # type: ignore[method-assign]
+        self.w.unlock = lambda sid, fid: UnlockWatcher.unlock(self.w, sid, fid)  # type: ignore[method-assign]
+        self.step()
+        warm = self.started[0]
+        warm.say("SERVE idle")
+        self.step()
+
+        def run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(["loginctl"], 1)
+
+        with mock.patch.object(fp5_qtee_unlock.subprocess, "run", run):
+            warm.say(self.HIT)
+            self.step()
+        self.assertEqual(self.unlocks(), [])
+        self.assertEqual(buzzed, [])
+        self.assertEqual(self.w.policy.failed, failed)
+        self.assertTrue(self.loop.believed_locked)
 
     def test_hit_needs_logind_locked(self) -> None:
         self.step()

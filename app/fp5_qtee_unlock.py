@@ -905,13 +905,26 @@ class UnlockWatcher:
         """Ask the panel to come on. Never called for a miss."""
         request_panel_on()
 
-    def unlock(self, sid: str, fid: int) -> None:
+    def unlock(self, sid: str, fid: int) -> bool:
+        """Ask logind to unlock. True only when that command exits 0.
+
+        A timeout or a nonzero status is a failed unlock. The caller
+        must not clear strikes, buzz, or record a success.
+        """
         self.note(f"unlock session {sid} fid {fid}")
-        subprocess.run(
-            ["loginctl", "unlock-session", sid],
-            check=False,
-            timeout=5,
-        )
+        try:
+            proc = subprocess.run(
+                ["loginctl", "unlock-session", sid],
+                check=False,
+                timeout=5,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            self.note(f"unlock session {sid} failed")
+            return False
+        if proc.returncode != 0:
+            self.note(f"unlock session {sid} exit {proc.returncode}")
+            return False
+        return True
 
     def spawn(self, binary: Path) -> subprocess.Popen[str]:
         return subprocess.Popen(
@@ -1069,10 +1082,13 @@ class UnlockWatcher:
                         self._listen_why = self.policy.why_not()
                         outcome = "stop"
                         break
+                    if not self.unlock(sid, fid):
+                        self._listen_why = "unlock failed"
+                        outcome = "stop"
+                        break
                     outcome = "hit"
                     self.policy.on_hit()
                     self.tell_hit()
-                    self.unlock(sid, fid)
                     break
                 kind = miss_kind(line)
                 stay = False
@@ -1517,9 +1533,10 @@ class WarmLoop:
             return
         if should_wake_panel(True, panel, self.dark_arm):
             self.wake()
+        if not self.w.unlock(sid, fid):
+            return
         self.w.policy.on_hit()
         self.w.tell_hit()
-        self.w.unlock(sid, fid)
         self.believed_locked = False
 
     def ask_lock(self) -> bool | None:
