@@ -1661,6 +1661,9 @@ static int open_and_load(struct svc *s, const char *dir)
 	return rc == 0 ? 0 : -1;
 }
 
+/* Set once INIT_SPI succeeds, so exit only hands back a bus it holds. */
+static int spi_held;
+
 static int setup_ta(struct svc *s, int native)
 {
 	uint8_t ver[4] = { 2, 0, 0, 0 };
@@ -1679,6 +1682,24 @@ static int setup_ta(struct svc *s, int native)
 		return -1;
 	if (send_cmd(s, fp5_op_init_spi(), 0, NULL, "INIT_SPI"))
 		return -1;
+	/*
+	 * focal32 keeps the SPI bus it opened for as long as it stays
+	 * loaded and answers a second INIT_SPI with -5. A serve session
+	 * that was killed, or a TA that survived ALREADY_LOADED handling,
+	 * leaves it held. Give it back and take it again rather than run
+	 * on with a sensor that cannot be read. From Marcus Ramberg's
+	 * focaltechqsee bring_up() (libfprint, LGPL-2.1+), reimplemented.
+	 */
+	if (s->last_rc != 0) {
+		logf("INIT_SPI rc=%d: bus still held, FREE_SPI and retry",
+		     (int)s->last_rc);
+		if (send_cmd(s, fp5_op_free_spi(), 0, NULL, "FREE_SPI") ||
+		    send_cmd(s, fp5_op_init_spi(), 0, NULL, "INIT_SPI2"))
+			return -1;
+		if (s->last_rc != 0)
+			logf("INIT_SPI retry rc=%d", (int)s->last_rc);
+	}
+	spi_held = s->last_rc == 0;
 	if (send_cmd(s, fp5_op_set_spi(), 4, &spd, "SET_SPI"))
 		return -1;
 	if (send_cmd(s, fp5_op_probe(), 1, zero, "PROBE"))
@@ -1773,6 +1794,15 @@ static int open_enroll(struct svc *s)
 	char cfg[2048];
 	int n;
 
+	/*
+	 * focal32's enroll state is global and outlives the client. An
+	 * enroll that was aborted (killed app, timeout) leaves it armed and
+	 * the next PRE_ENROLL/ENROLL can be rejected or mixed up. CANCEL
+	 * first; its rc is only logged. From Marcus Ramberg's
+	 * focaltechqsee driver (libfprint commit e5912e8), reimplemented.
+	 */
+	if (send_cmd(s, fp5_op_cancel(), 0, NULL, "CANCEL_STALE"))
+		return -1;
 	n = fp5_sync_config(cfg, sizeof(cfg), 1);
 	if (n > 0)
 		send_cmd(s, fp5_op_sync(), (uint32_t)n + 1, cfg, "SYNC_ENROLL");
@@ -2647,6 +2677,13 @@ int main(int argc, char **argv)
 		rc = 1;
 	}
 done:
+	/*
+	 * Hand the SPI bus back before the session goes, as Marcus
+	 * Ramberg's driver does on close: the TA can outlive us, and the
+	 * next session's INIT_SPI would otherwise see -5.
+	 */
+	if (spi_held && !send_cmd(&s, fp5_op_free_spi(), 0, NULL, "FREE_SPI_EXIT"))
+		spi_held = 0;
 	s.stop = 1;
 	watch_stop = 1;
 	fp5_tee_close(&s.tee);

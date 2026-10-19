@@ -25,6 +25,10 @@ uint32_t fp5_op_auth(void);       /* 0x2008 */
 
 uint32_t fp5_op_init(void);
 uint32_t fp5_op_init_spi(void);
+/* 0x1007 FF_CMD_TA_FREE_SPI and 0x2004 CANCEL. Both from Marcus
+ * Ramberg's libfprint focaltechqsee driver (focaltech-qsee-proto.h). */
+uint32_t fp5_op_free_spi(void);
+uint32_t fp5_op_cancel(void);
 uint32_t fp5_op_init_dev(void);
 uint32_t fp5_op_sync(void);
 uint32_t fp5_op_probe(void);
