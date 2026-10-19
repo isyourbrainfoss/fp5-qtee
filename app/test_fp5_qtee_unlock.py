@@ -205,9 +205,25 @@ class MissTest(unittest.TestCase):
 
 
 class PolicyTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._dirs: list[tempfile.TemporaryDirectory[str]] = []
+        self.addCleanup(self._close_dirs)
+
+    def _close_dirs(self) -> None:
+        while self._dirs:
+            self._dirs.pop().cleanup()
+
     def make(self, require_pin: bool = True, marker: Path | None = None) -> tuple[UnlockPolicy, list[float]]:
         now = [1000.0]
-        return UnlockPolicy(require_pin=require_pin, marker=marker, clock=lambda: now[0]), now
+        if marker is None:
+            tmp = tempfile.TemporaryDirectory()
+            self._dirs.append(tmp)
+            state: Path | None = Path(tmp.name) / "fp5-qtee-lockout"
+        else:
+            state = lockout_state_for(marker)
+        return UnlockPolicy(
+            require_pin=require_pin, marker=marker, clock=lambda: now[0], state=state,
+        ), now
 
     def test_pin_needed_after_boot(self) -> None:
         pol, _ = self.make()
@@ -390,6 +406,19 @@ class PolicyTest(unittest.TestCase):
         pol, _ = self.make(require_pin=False)
         pol.observe_lock(True)
         self.assertIsNone(pol.why_not())
+
+    def test_no_state_path_refuses_finger_unlock(self) -> None:
+        pol = UnlockPolicy(require_pin=False, marker=None, clock=lambda: 1000.0, state=None)
+        self.assertEqual(pol.why_not(), "no-state")
+        pol.on_miss()
+        pol.on_hit()
+        pol.observe_lock(True)
+        pol.observe_lock(False)
+        self.assertEqual(pol.why_not(), "no-state")
+        self.assertEqual(pol.failed, 0)
+        pinned = UnlockPolicy(require_pin=True, marker=None, clock=lambda: 1000.0, state=None)
+        self.assertEqual(pinned.why_not(), "no-state")
+        self.assertIn("saved", fp5_qtee_unlock.POLICY_TEXT["no-state"])
 
 
 class PumpAndThrottleTest(unittest.TestCase):
@@ -582,7 +611,12 @@ class FollowTest(unittest.TestCase):
         self.w.tell_miss = lambda kind: self.misses.append(kind)  # type: ignore[method-assign]
         self.w.tell_hit = lambda: None  # type: ignore[method-assign]
         self.w.feedback = lambda event: None  # type: ignore[method-assign]
-        self.w.policy = UnlockPolicy(require_pin=False, marker=None)
+        state_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(state_dir.cleanup)
+        self.w.policy = UnlockPolicy(
+            require_pin=False, marker=None,
+            state=Path(state_dir.name) / "fp5-qtee-lockout",
+        )
 
     @staticmethod
     def _close_procs() -> None:
@@ -1120,8 +1154,12 @@ class WarmLoopTest(unittest.TestCase):
         self.lock = [True]
         self.lock_asks = 0
         self.w = UnlockWatcher()
-        self.w.policy = UnlockPolicy(require_pin=False, marker=None,
-                                     clock=lambda: self.now[0])
+        state_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(state_dir.cleanup)
+        self.w.policy = UnlockPolicy(
+            require_pin=False, marker=None, clock=lambda: self.now[0],
+            state=Path(state_dir.name) / "fp5-qtee-lockout",
+        )
         self.events: list[tuple] = []
         self.w.notify = lambda text: self.events.append(("notify", text))  # type: ignore[method-assign]
         self.w.note = lambda text: None  # type: ignore[method-assign]

@@ -99,6 +99,7 @@ POLICY_TEXT = {
     "pin-72h": "Fingerprint unlock needs your PIN every 72 hours.",
     "lockout": "Too many attempts. Try again in 30 seconds, or use your PIN.",
     "lockout-permanent": "Too many attempts. Unlock with your PIN.",
+    "no-state": "Fingerprint unlock is off until the lockout state can be saved.",
 }
 # Warm mode keeps one "serve" session loaded while the phone is locked,
 # so a wake only has to arm the sensor. Opt in until it is proven on more
@@ -421,6 +422,8 @@ class UnlockPolicy:
       A state file that cannot be read, or a miss that cannot be saved,
       locks fingerprint unlock until the PIN (fail closed).
     - Only a scored non-match counts. A partial press does not.
+    - With no state path the strikes would live only in this process.
+      Finger unlock is refused until a path exists.
     """
 
     def __init__(self, require_pin: bool = REQUIRE_PIN,
@@ -543,6 +546,8 @@ class UnlockPolicy:
 
     def why_not(self) -> str | None:
         """None when a finger may unlock now, else the reason."""
+        if self.state is None:
+            return "no-state"
         now = self.clock()
         if self.require_pin:
             at = self.pin_at()
