@@ -225,20 +225,33 @@ class PolicyTest(unittest.TestCase):
             require_pin=require_pin, marker=marker, clock=lambda: now[0], state=state,
         ), now
 
+    def credit_pin(self, pol: UnlockPolicy, now: list[float]) -> None:
+        """Locked, then unlocked, then still unlocked after the flicker window."""
+        pol.observe_lock(True)
+        pol.observe_lock(False)
+        now[0] += fp5_qtee_unlock.LOCK_FLICKER_S
+        pol.observe_lock(False)
+
     def test_pin_needed_after_boot(self) -> None:
-        pol, _ = self.make()
+        pol, now = self.make()
         pol.observe_lock(True)
         self.assertEqual(pol.why_not(), "pin-after-boot")
-        pol.observe_lock(False)  # PIN
+        pol.observe_lock(False)
+        self.assertEqual(pol.why_not(), "pin-after-boot")
+        now[0] += fp5_qtee_unlock.LOCK_FLICKER_S
+        pol.observe_lock(False)
         self.assertIsNone(pol.why_not())
 
     def test_first_sample_is_not_pin(self) -> None:
-        pol, _ = self.make()
+        pol, now = self.make()
         pol.observe_lock(False)
         self.assertEqual(pol.why_not(), "pin-after-boot")
         pol.observe_lock(False)
         self.assertEqual(pol.why_not(), "pin-after-boot")
         pol.observe_lock(True)
+        pol.observe_lock(False)
+        self.assertEqual(pol.why_not(), "pin-after-boot")
+        now[0] += fp5_qtee_unlock.LOCK_FLICKER_S
         pol.observe_lock(False)
         self.assertIsNone(pol.why_not())
 
@@ -253,8 +266,7 @@ class PolicyTest(unittest.TestCase):
 
     def test_loginctl_timeout_does_not_clear_lockout(self) -> None:
         pol, now = self.make()
-        pol.observe_lock(True)
-        pol.observe_lock(False)  # PIN
+        self.credit_pin(pol, now)
         for _ in range(20):
             pol.on_miss()
             now[0] += 31
@@ -275,8 +287,7 @@ class PolicyTest(unittest.TestCase):
 
     def test_our_unlock_with_lagging_hint_is_not_pin(self) -> None:
         pol, now = self.make()
-        pol.observe_lock(True)
-        pol.observe_lock(False)  # PIN
+        self.credit_pin(pol, now)
         pin = pol.pin_at()
         now[0] += 100
         pol.observe_lock(True)
@@ -286,16 +297,22 @@ class PolicyTest(unittest.TestCase):
         now[0] += 0.5
         pol.observe_lock(False)
         self.assertEqual(pol.pin_at(), pin)
-        # A later PIN unlock still counts.
+        # Staying unlocked is still our unlock, not a new PIN.
+        now[0] += fp5_qtee_unlock.LOCK_FLICKER_S
+        pol.observe_lock(False)
+        self.assertEqual(pol.pin_at(), pin)
+        # A later PIN unlock still counts, once it holds.
         pol.observe_lock(True)
         now[0] += 1
+        pol.observe_lock(False)
+        self.assertEqual(pol.pin_at(), pin)
+        now[0] += fp5_qtee_unlock.LOCK_FLICKER_S
         pol.observe_lock(False)
         self.assertNotEqual(pol.pin_at(), pin)
 
     def test_finger_unlock_is_not_pin(self) -> None:
         pol, now = self.make()
-        pol.observe_lock(True)
-        pol.observe_lock(False)  # PIN
+        self.credit_pin(pol, now)
         pol.observe_lock(True)
         now[0] += 71 * 3600
         pol.on_hit()
@@ -303,7 +320,26 @@ class PolicyTest(unittest.TestCase):
         pol.observe_lock(True)
         now[0] += 2 * 3600
         self.assertEqual(pol.why_not(), "pin-72h")
-        pol.observe_lock(False)  # PIN again
+        pol.observe_lock(False)
+        self.assertEqual(pol.why_not(), "pin-72h")
+        now[0] += fp5_qtee_unlock.LOCK_FLICKER_S
+        pol.observe_lock(False)
+        self.assertIsNone(pol.why_not())
+
+    def test_unlock_flicker_is_not_a_pin(self) -> None:
+        pol, now = self.make()
+        pol.observe_lock(True)
+        pol.observe_lock(False)
+        now[0] += 1.0
+        pol.observe_lock(True)
+        self.assertEqual(pol.why_not(), "pin-after-boot")
+        self.assertIsNone(pol.pin_at())
+        pol.observe_lock(False)
+        pol.forget_session()
+        now[0] += fp5_qtee_unlock.LOCK_FLICKER_S
+        pol.observe_lock(False)
+        self.assertEqual(pol.why_not(), "pin-after-boot")
+        self.credit_pin(pol, now)
         self.assertIsNone(pol.why_not())
 
     def test_timed_and_permanent_lockout(self) -> None:
@@ -323,8 +359,12 @@ class PolicyTest(unittest.TestCase):
         self.assertEqual(pol.failed, 20)
         self.assertEqual(pol.why_not(), "lockout-permanent")
         pol.observe_lock(True)
-        pol.observe_lock(False)  # PIN clears it
+        pol.observe_lock(False)
+        self.assertEqual(pol.why_not(), "lockout-permanent")
+        now[0] += fp5_qtee_unlock.LOCK_FLICKER_S
+        pol.observe_lock(False)
         self.assertIsNone(pol.why_not())
+        self.assertEqual(pol.failed, 0)
 
     def test_hit_resets_count(self) -> None:
         pol, _ = self.make(require_pin=False)
@@ -338,9 +378,11 @@ class PolicyTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             marker = Path(tmp) / "pin-ok"
             pol, now = self.make(marker=marker)
-            pol.observe_lock(True)
-            pol.observe_lock(False)
-            again, _ = self.make(marker=marker)
+            self.credit_pin(pol, now)
+            again = UnlockPolicy(
+                require_pin=True, marker=marker, clock=lambda: now[0],
+                state=lockout_state_for(marker),
+            )
             self.assertIsNone(again.why_not())
             marker.write_text("999999.0\n")  # later than now: earlier boot
             self.assertEqual(again.why_not(), "pin-after-boot")
@@ -354,8 +396,7 @@ class PolicyTest(unittest.TestCase):
             now = [1000.0]
             clock = lambda: now[0]
             pol = UnlockPolicy(require_pin=True, marker=marker, clock=clock, state=state)
-            pol.observe_lock(True)
-            pol.observe_lock(False)  # PIN
+            self.credit_pin(pol, now)
             for _ in range(5):
                 pol.on_miss()
             self.assertEqual(pol.why_not(), "lockout")
@@ -372,6 +413,9 @@ class PolicyTest(unittest.TestCase):
             self.assertEqual(third.why_not(), "lockout-permanent")
             # Only a PIN clears it, and that is saved too.
             third.observe_lock(True)
+            third.observe_lock(False)
+            self.assertEqual(third.why_not(), "lockout-permanent")
+            now[0] += fp5_qtee_unlock.LOCK_FLICKER_S
             third.observe_lock(False)
             fourth = UnlockPolicy(require_pin=True, marker=marker, clock=clock, state=state)
             self.assertIsNone(fourth.why_not())

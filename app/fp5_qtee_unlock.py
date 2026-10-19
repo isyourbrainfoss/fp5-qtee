@@ -55,6 +55,8 @@ SESSION_ID_TTL_S = 30.0
 WAKE_GRACE_S = float(os.environ.get("FP5_QTEE_WAKE_GRACE_MS", "1000")) / 1000.0
 # One LockedHint miss while a session is already armed is not a reason to
 # drop it. The reading has to stay unlocked or unknown this long.
+# A locked -> unlocked change counts as the PIN only after the unlocked
+# reading has held this long too. A flicker back does not.
 LOCK_FLICKER_S = 2.0
 _SCORE = re.compile(r"FtVerifySubTemplate\(\) score = (-?\d+)")
 # A wake hit can be printed before sysfs says the panel is on. A miss
@@ -412,10 +414,12 @@ class UnlockPolicy:
       tmpfs, so a reboot forgets it. The file holds CLOCK_BOOTTIME, so a
       wall-clock jump does not change the age.
     - Only a confirmed locked -> unlocked change between two LockedHint
-      samples of the same session counts as the PIN. An unknown sample
-      (loginctl timed out, failed, or printed nothing) is never an unlock
-      and breaks the chain. The first sample is never evidence of the PIN.
-      A change within OUR_UNLOCK_GRACE_S of our own unlock is ours.
+      samples of the same session counts as the PIN, and only after the
+      unlocked reading has held for LOCK_FLICKER_S. A return to locked
+      or unknown before that drops it. An unknown sample (loginctl timed
+      out, failed, or printed nothing) is never an unlock and breaks the
+      chain. The first sample is never evidence of the PIN. A change
+      within OUR_UNLOCK_GRACE_S of our own unlock is ours.
     - 5 rejected fingers in a row: 30 s lockout. 20: until the PIN.
       The count and the lockout end are kept in a state file next to the
       PIN marker, so a watcher crash or restart does not clear them.
@@ -439,6 +443,9 @@ class UnlockPolicy:
         self.prev_locked: bool | None = None
         self._pin_at: float | None = None
         self._our_unlock_at: float | None = None
+        # When the current unlocked hold started. None until a confirmed
+        # locked -> unlocked sample that is not our own unlock.
+        self._unlock_since: float | None = None
         # True while the newest strike count is not on disk.
         self._unsaved = False
         self._load_state()
@@ -512,22 +519,30 @@ class UnlockPolicy:
     def forget_session(self) -> None:
         """A different (or unknown) session: no transition carries over."""
         self.prev_locked = None
+        self._unlock_since = None
 
     def observe_lock(self, is_locked: bool | None) -> None:
         """Feed one LockedHint sample: True, False, or None for unknown."""
         was = self.prev_locked
         self.prev_locked = is_locked
         if is_locked is None or is_locked:
+            self._unlock_since = None
             return
-        # Unlocked now. Only a confirmed locked sample right before it
-        # makes this an unlock we saw happen.
+        # Unlocked now. The first sample of a hold needs a confirmed
+        # locked sample right before it. A later sample credits the PIN
+        # only after that hold has lasted LOCK_FLICKER_S.
+        if self._unlock_since is not None:
+            if self.clock() - self._unlock_since >= LOCK_FLICKER_S:
+                self._unlock_since = None
+                self._pin_seen()
+            return
         if was is not True:
             return
         ours_at = self._our_unlock_at
         self._our_unlock_at = None
         if ours_at is not None and self.clock() - ours_at <= OUR_UNLOCK_GRACE_S:
             return
-        self._pin_seen()
+        self._unlock_since = self.clock()
 
     # -- fingers -----------------------------------------------------
 
