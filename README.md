@@ -99,6 +99,19 @@ or `/sys/bus/platform/drivers/qcomtee` is enough and the script prints
 loaded, and does nothing when the module is already loaded. Do not
 `rmmod` a live `qsee_fingerpr`.
 
+The built-in 7.2.9 driver does not load saved templates. `qcomtee-bridge.ko`
+is not the plain upstream driver. At probe it registers a QSEE log
+buffer (`/dev/qsee_log`) and a legacy SCM RPMB listener `0x2000` on a
+tzmem buffer. Its SMC invoke loop serves QTEE's blocked-on-listener
+returns (`0xee02`) for `0x2000` in the kernel, over the UFS RPMB LUN.
+That is why the session's own `0x2000` register returns qret 12 there.
+Mainline qcomtee has neither piece. On 7.2.9 `focal32` answers GPFILE
+command 12, never reads the `misc/..._Alt` store, and every finger
+misses. Registering `0x2000` through mink, or not registering it,
+does not change that. Saved fingers need the 7.2.0 boot with that
+module, or a 7.2.9 qcomtee built with the same RPMB listener and
+invoke loop.
+
 ## Wire format
 
 Little-endian. Payload starts at offset `0x10`.
