@@ -327,10 +327,6 @@ static void test_gpfile(void)
 	expect(fp5_gp_decode(sb, sizeof(sb), &gp) == 0, "unlink decode");
 	expect(gp.act == FP5_GP_UNLINK, "unlink act");
 	expect(fp5_gp_unlink_performs() == 0, "unlink does not delete");
-	expect(!fp5_rpmb_listener_wanted(NULL), "rpmb listener off by default");
-	expect(!fp5_rpmb_listener_wanted(""), "rpmb listener off when empty");
-	expect(!fp5_rpmb_listener_wanted("0"), "rpmb listener off for 0");
-	expect(fp5_rpmb_listener_wanted("1"), "rpmb listener on for 1");
 	expect(strcmp(gp.rel, "data/ft_fp_serial_id.bin") == 0, "unlink path");
 	expect((fp5_gp_write_oflags() & O_TRUNC) == 0, "write is not O_TRUNC");
 	expect((fp5_gp_write_oflags() & (O_RDWR | O_CREAT | O_SYNC)) ==

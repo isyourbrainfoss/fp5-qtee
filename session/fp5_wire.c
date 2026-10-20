@@ -671,11 +671,6 @@ int fp5_gp_unlink_performs(void)
 	return 0;
 }
 
-int fp5_rpmb_listener_wanted(const char *env)
-{
-	return env && !strcmp(env, "1");
-}
-
 int fp5_gp_write_oflags(void)
 {
 	return O_RDWR | O_CREAT | O_SYNC;

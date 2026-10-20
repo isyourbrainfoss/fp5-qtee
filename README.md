@@ -79,15 +79,13 @@ Before the load, register four listeners. One registration per boot.
 | id | role | buffer |
 | --- | --- | --- |
 | `0x7000` | GPFILE | `0x7e000` |
-| `0x2000` | RPMB | `0x6400`, only with `FP5_QTEE_RPMB_LISTENER=1` |
+| `0x2000` | RPMB | `0x6400` |
 | `11` | time | `0x5000` |
 | `0x3000` | SSD | `0x1000` |
 
-On `7.2.0-nfc-test+` SCM already owns RPMB id `0x2000` and the mink
-register returns qret 12. On 7.2.9 (built-in qcomtee) the register
-succeeds, and `focal32` then reads no template from the GPFILE store,
-so every finger misses. The session leaves `0x2000` unregistered
-unless `FP5_QTEE_RPMB_LISTENER=1`. Do not register the listeners twice on the same boot.
+SCM may already own RPMB id `0x2000`. The session continues if that
+register fails, and requests for that id are not delivered on this
+buffer. Do not register the listeners twice on the same boot.
 
 Invoke buffers are a 1536-byte request and a 2048-byte response. A pair
 of 2048-byte buffers returns `MAXDATA` (`-95`).
