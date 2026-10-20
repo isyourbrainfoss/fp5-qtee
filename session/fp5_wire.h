@@ -184,6 +184,11 @@ void fp5_gp_init_reply(uint8_t *sb);
 size_t fp5_gp_init_resp_len(void);
 const char *fp5_gp_root(uint32_t root);
 int fp5_gp_unlink_performs(void);
+/*
+ * Register the RPMB listener 0x2000 only when asked (value "1").
+ * With it registered focal32 reads no template from the GPFILE store.
+ */
+int fp5_rpmb_listener_wanted(const char *env);
 int fp5_gp_write_oflags(void);
 int fp5_gp_is_template(const char *rel);
 /* Object header (first page), not the GPFILE relative name. */

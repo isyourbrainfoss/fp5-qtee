@@ -1636,11 +1636,17 @@ static int open_and_load(struct svc *s, const char *dir)
 	if (reg_listener(s, env, LID_GP, 0x7e000))
 		return -1;
 	/*
-	 * SCM REGISTER_LISTENER already owns id 0x2000 on a 64K tzmem
-	 * buffer (mink then returns qret 12). Do not abort the load.
-	 * Requests for that id are not delivered on this shm.
+	 * On 7.2.0-nfc-test+ SCM REGISTER_LISTENER already owns id 0x2000
+	 * on a 64K tzmem buffer, mink returns qret 12, and focal32 reads
+	 * its templates from the GPFILE store (persist misc/..._Alt).
+	 * On 7.2.9 (built-in qcomtee) nothing owns 0x2000, the register
+	 * succeeds, and focal32 then makes no GPFILE read at all: no
+	 * template is loaded and every finger misses. Leave 0x2000
+	 * unregistered unless FP5_QTEE_RPMB_LISTENER=1.
 	 */
-	if (reg_listener(s, env, LID_RPMB, 0x6400))
+	if (!fp5_rpmb_listener_wanted(getenv("FP5_QTEE_RPMB_LISTENER")))
+		logl("rpmb listener not registered");
+	else if (reg_listener(s, env, LID_RPMB, 0x6400))
 		logl("rpmb mink register failed; continue");
 	if (reg_listener(s, env, LID_TIME, 0x5000) ||
 	    reg_listener(s, env, LID_SSD, 0x1000))
