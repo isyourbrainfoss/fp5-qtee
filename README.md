@@ -26,6 +26,8 @@ and [fp5-fingerprint-tools](https://github.com/marcusramberg/fp5-fingerprint-too
 This repo now reuses parts of that work: FREE_SPI recovery, CANCEL before
 enroll, and his GPL-2.0 kernel patches in `kernel/marcusramberg/`. See
 `docs/ultimate.md` for what came from where.
+Enrolled fingers: `fp5-qtee list` (read-only); removing one is
+implemented but not yet run on the phone. See `docs/finger-manage.md`.
 The four differences (device id, enroll detect mode, list command, and
 the gallery path and save flag) are settled in `docs/ultimate.md`. This
 phone keeps the path that already matched.

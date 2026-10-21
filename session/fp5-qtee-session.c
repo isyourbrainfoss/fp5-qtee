@@ -1,4 +1,5 @@
 #include "fp5_cmd.h"
+#include "fp5_finger.h"
 #include "fp5_image.h"
 #include "fp5_tee.h"
 #include "fp5_wire.h"
@@ -483,6 +484,39 @@ static struct listener *find_ls(struct svc *s, uint64_t id)
 	return NULL;
 }
 
+/*
+ * list sets persist_ro before the trustlet is opened. Every GPFILE
+ * write or unlink and every RPMB write the trustlet asks for is then
+ * refused (EROFS) and counted, never performed, so a list cannot change
+ * /mnt/persist/misc or the RPMB partition. Reads are served as usual.
+ * Object names read are kept so list can say which ones the gallery
+ * load touched.
+ */
+static int persist_ro;
+static unsigned ro_refused;
+#define GP_SEEN_MAX 16
+static char gp_seen[GP_SEEN_MAX][320];
+static unsigned gp_seen_size[GP_SEEN_MAX];
+static int gp_nseen;
+
+static void gp_note_read(const char *full, ssize_t n)
+{
+	int i;
+
+	for (i = 0; i < gp_nseen; i++) {
+		if (!strcmp(gp_seen[i], full)) {
+			if (n > 0)
+				gp_seen_size[i] += (unsigned)n;
+			return;
+		}
+	}
+	if (gp_nseen >= GP_SEEN_MAX)
+		return;
+	snprintf(gp_seen[gp_nseen], sizeof(gp_seen[0]), "%s", full);
+	gp_seen_size[gp_nseen] = n > 0 ? (unsigned)n : 0;
+	gp_nseen++;
+}
+
 static void serve_gp(struct svc *s, uint8_t *sb, size_t len)
 {
 	struct fp5_gp gp;
@@ -505,6 +539,13 @@ static void serve_gp(struct svc *s, uint8_t *sb, size_t len)
 	}
 	root = fp5_gp_root(gp.root);
 	snprintf(full, sizeof(full), "/mnt/persist/%s/%s", root, gp.rel);
+	if (persist_ro && (gp.act == FP5_GP_UNLINK || gp.act == FP5_GP_WRITE)) {
+		__atomic_add_fetch(&ro_refused, 1, __ATOMIC_SEQ_CST);
+		logf("GPFILE RO refuse %s '%s'",
+		     gp.act == FP5_GP_WRITE ? "WRITE" : "UNLINK", full);
+		fp5_gp_reply(sb, EROFS, 0);
+		return;
+	}
 	if (gp.act == FP5_GP_UNLINK) {
 		logf("GPFILE UNLINK '%s'", full);
 		if (fp5_gp_unlink_performs())
@@ -571,6 +612,7 @@ static void serve_gp(struct svc *s, uint8_t *sb, size_t len)
 		else
 			got = (uint32_t)n;
 		logf("GPFILE READ '%s' n=%zd", full, n);
+		gp_note_read(full, n);
 		fp5_gp_reply(sb, (uint32_t)err, got);
 	}
 }
@@ -632,6 +674,15 @@ static void serve_rpmb(struct svc *s, uint8_t *sb, size_t len)
 	if (plan.kind == FP5_RPMB_FAIL) {
 		fp5_rpmb_reply_err(sb, (uint32_t)(-EIO));
 		logf("RPMB cmd=0x%x no frame", plan.cmd);
+		note_rpmb(s, plan.cmd, 0xffff, 0, 0);
+		return;
+	}
+	if (persist_ro && (plan.cmd == 0x103 ||
+			   plan.kind == FP5_RPMB_MULTI_WRITE ||
+			   plan.single_rr3_persist)) {
+		__atomic_add_fetch(&ro_refused, 1, __ATOMIC_SEQ_CST);
+		logf("RPMB RO refuse write cmd=0x%x", plan.cmd);
+		fp5_rpmb_reply_err(sb, (uint32_t)(-EROFS));
 		note_rpmb(s, plan.cmd, 0xffff, 0, 0);
 		return;
 	}
@@ -1916,6 +1967,139 @@ static int enroll_load_gallery(struct svc *s)
 	return 0;
 }
 
+/*
+ * ENUMERATE (0x2005, see fp5_finger.h). The payload is cleared past
+ * plen, because the trustlet answers in up to FP5_LIST_REPLY bytes and
+ * the request buffer still holds the previous command's payload.
+ * Returns the finger count, or -1.
+ */
+static int list_fingers(struct svc *s, struct fp5_finger *out, const char *tag)
+{
+	uint8_t *pay = s->req + FP5_PAY_OFF;
+	uint32_t w[12];
+	int n, i;
+
+	fp5_build_list(pay, REQ_SZ - FP5_PAY_OFF, FP5_LIST_MAX);
+	if (send_cmd(s, FP5_OP_LIST, FP5_LIST_PLEN, NULL, tag))
+		return -1;
+	for (i = 0; i < 12; i++)
+		memcpy(&w[i], pay + (size_t)i * 4, 4);
+	logf("%s raw status=%d pay %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x",
+	     tag, (int)s->last_rc, w[0], w[1], w[2], w[3], w[4], w[5], w[6],
+	     w[7], w[8], w[9], w[10]);
+	n = fp5_parse_list(pay, REQ_SZ - FP5_PAY_OFF, s->last_rc, FP5_LIST_MAX,
+			   out, FP5_LIST_MAX);
+	if (n < 0)
+		logf("%s not a finger list (status=%d word0=%u)", tag,
+		     (int)s->last_rc, w[0]);
+	return n;
+}
+
+/* SET_GROUP on the unlock path, without the 0x1028 that follows it
+ * there. Writes the "there is N template loaded" count, or -1. */
+static int load_gallery_only(struct svc *s, int *loaded)
+{
+	uint8_t g[FP5_GROUP_CAP];
+	int n = fp5_build_group(g, sizeof(g), group_path());
+
+	*loaded = -1;
+	if (n < 0)
+		return -1;
+	if (send_cmd(s, fp5_op_set_group(), (uint32_t)n, g, "SET_GROUP"))
+		return -1;
+	if (!gallery_in_cmd(s, loaded))
+		*loaded = -1;
+	return 0;
+}
+
+static void print_fingers(const struct fp5_finger *f, int n, int loaded)
+{
+	int i;
+
+	logf("FINGERS count=%d loaded_log=%d", n, loaded);
+	for (i = 0; i < n; i++)
+		logf("FINGER index=%d gid=%u fid=%u slot=%u", i, f[i].gid,
+		     f[i].fid, f[i].fid % 10);
+}
+
+static int list_mode(struct svc *s)
+{
+	struct fp5_finger f[FP5_LIST_MAX];
+	int loaded, n, i;
+
+	if (load_gallery_only(s, &loaded))
+		return 1;
+	n = list_fingers(s, f, "LIST");
+	if (n < 0)
+		return 2;
+	print_fingers(f, n, loaded);
+	for (i = 0; i < gp_nseen; i++)
+		logf("OBJECT read='%s' bytes=%u", gp_seen[i], gp_seen_size[i]);
+	logf("LIST ro_refused=%u", __atomic_load_n(&ro_refused, __ATOMIC_SEQ_CST));
+	if (loaded >= 0 && loaded != n)
+		logf("LIST warning: SET_GROUP logged %d loaded, ENUMERATE %d",
+		     loaded, n);
+	return 0;
+}
+
+/*
+ * remove <dir> <fid> --yes-really [--allow-last]. The arguments were
+ * checked in main before anything was opened. Here: load the gallery,
+ * list, require the id in that list, REMOVE {gid, fid}, SAVE with the
+ * same flag enroll uses, and list again. Not run on the phone yet; it
+ * needs a copy of /mnt/persist/misc first (see docs/finger-manage.md).
+ */
+static int remove_mode(struct svc *s, uint32_t fid, int allow_last)
+{
+	struct fp5_finger f[FP5_LIST_MAX];
+	uint8_t pay[FP5_REMOVE_PLEN];
+	uint32_t gid = 0, flag = fp5_save_flag();
+	int loaded, n, gate;
+
+	if (load_gallery_only(s, &loaded))
+		return 1;
+	n = list_fingers(s, f, "LIST_BEFORE");
+	if (n < 0)
+		return 2;
+	print_fingers(f, n, loaded);
+	gate = fp5_remove_check(f, n, fid, allow_last, &gid);
+	if (gate != FP5_RM_OK) {
+		logf("REMOVE refuse fid=%u: %s", fid, fp5_remove_reason(gate));
+		return 2;
+	}
+	if (send_cmd(s, fp5_op_cancel(), 0, NULL, "CANCEL_STALE"))
+		return 1;
+	fp5_build_remove(pay, sizeof(pay), gid, fid);
+	logf("REMOVE gid=%u fid=%u", gid, fid);
+	if (send_cmd(s, FP5_OP_REMOVE, FP5_REMOVE_PLEN, pay, "REMOVE"))
+		return 1;
+	if (s->last_rc != 0) {
+		logf("REMOVE status=%d; not saving", (int)s->last_rc);
+		return 2;
+	}
+	memset(s->req + FP5_PAY_OFF, 0, 0x230);
+	memcpy(s->req + FP5_PAY_OFF, &flag, 4);
+	pthread_mutex_lock(&s->mu);
+	s->template_write = 0;
+	s->persist_write = 0;
+	pthread_mutex_unlock(&s->mu);
+	logf("SAVE opcode=0x%x flag=0x%x", fp5_op_save(), flag);
+	if (send_cmd(s, fp5_op_save(), 4, NULL, "SAVE"))
+		return 1;
+	logf("SAVE status=%d template=%d persist=%d name=%s", (int)s->last_rc,
+	     s->template_write, s->persist_write, s->template_name);
+	n = list_fingers(s, f, "LIST_AFTER");
+	if (n < 0)
+		return 2;
+	print_fingers(f, n, -1);
+	if (!fp5_list_lacks(f, n, fid)) {
+		logf("REMOVE fid=%u still listed", fid);
+		return 2;
+	}
+	logf("REMOVE done fid=%u", fid);
+	return 0;
+}
+
 static int enroll_finger(struct svc *s)
 {
 	unsigned irq = read_irq();
@@ -2476,6 +2660,8 @@ int main(int argc, char **argv)
 	const char *dir = argc > 2 ? argv[2] : "/lib/firmware/qsee";
 	struct svc s;
 	int rc, i;
+	uint32_t rm_fid = 0;
+	int rm_last = 0;
 
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	{
@@ -2484,6 +2670,21 @@ int main(int argc, char **argv)
 		memset(&sa, 0, sizeof(sa));
 		sa.sa_handler = sigusr1_nop;
 		sigaction(SIGUSR1, &sa, NULL);
+	}
+	if (!strcmp(mode, "list")) {
+		persist_ro = 1;
+	} else if (!strcmp(mode, "remove")) {
+		int g = fp5_remove_args(argc > 3 ? argc - 3 : 0, argv + 3,
+					&rm_fid);
+
+		for (i = 3; i < argc; i++)
+			if (!strcmp(argv[i], "--allow-last"))
+				rm_last = 1;
+		if (g != FP5_RM_OK) {
+			logf("remove: %s", fp5_remove_reason(g));
+			logl("usage: fp5-qtee-session remove <fw-dir> <fid> --yes-really [--allow-last]");
+			return 1;
+		}
 	}
 	memset(&s, 0, sizeof(s));
 	s.tee.fd = -1;
@@ -2674,6 +2875,10 @@ int main(int argc, char **argv)
 		rc = a == 0 ? 0 : (a < 0 ? 1 : 2);
 	} else if (!strcmp(mode, "serve")) {
 		rc = serve_loop(&s);
+	} else if (!strcmp(mode, "list")) {
+		rc = list_mode(&s);
+	} else if (!strcmp(mode, "remove")) {
+		rc = remove_mode(&s, rm_fid, rm_last);
 	} else {
 		logf("unknown mode %s", mode);
 		rc = 1;

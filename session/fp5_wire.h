@@ -35,9 +35,10 @@ uint32_t fp5_op_probe(void);
 uint32_t fp5_op_query(void);
 uint32_t fp5_op_capture(void);
 uint32_t fp5_op_set_group(void);
-/* 0x1028. focal32 answers -203 and does not delete a template.
- * Marcus Ramberg's list command is 0x2005 (8-byte entries). It is not
- * sent here. See docs/ultimate.md. */
+/* 0x1028. Not a focal32 command: the HAL table has no 0x1028 and the
+ * TA answers its default -203. Still sent after SET_GROUP on the unlock
+ * path, unchanged. The real ENUMERATE is 0x2005 (fp5_finger.h), used by
+ * the list mode. See docs/finger-manage.md. */
 uint32_t fp5_op_enum(void);
 uint32_t fp5_op_set_spi(void);
 uint32_t fp5_op_version(void);

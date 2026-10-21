@@ -1,0 +1,166 @@
+#!/bin/sh
+# fp5-qtee: see and manage enrolled fingers on the Fairphone 5.
+#
+#   fp5-qtee list                 enrolled fingers, from the trustlet (read-only)
+#   fp5-qtee files                fingerprint storage files (read-only, no trustlet)
+#   fp5-qtee backup               copy /mnt/persist/misc to ~/fp5-qtee-keep/backup/<UTC>
+#   fp5-qtee remove <fid> --yes-really [--allow-last]
+#                                 remove one finger; needs a current backup
+#
+# list and remove stop fp5-qtee-unlock.service for a few seconds (the
+# trustlet takes one session), hold /tmp/fp5-qtee-phone.lock, and start
+# the service again. list refuses every storage write the trustlet asks
+# for. Full session output goes to ~/fp5-qtee-keep/logs/.
+set -eu
+
+SESSION=${FP5_QTEE_SESSION:-/home/user/fp5-qtee-keep/session/fp5-qtee-session}
+FW=${FP5_QTEE_FW:-/lib/firmware/qsee}
+LOCK=${FP5_QTEE_LOCK:-/tmp/fp5-qtee-phone.lock}
+UNIT=fp5-qtee-unlock.service
+KEEP=${FP5_QTEE_KEEP:-/home/user/fp5-qtee-keep}
+STORE=/mnt/persist/misc
+LOGS=$KEEP/logs
+: "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
+export XDG_RUNTIME_DIR
+[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] || \
+	export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+
+die() { echo "fp5-qtee: $*" >&2; exit 1; }
+stamp() { date -u +%Y%m%dT%H%M%SZ; }
+
+usage() {
+	sed -n '3,9p' "$0" | sed 's/^# \{0,1\}//'
+	exit "${1:-0}"
+}
+
+# Hash every regular file under the store, relative names, sorted.
+store_manifest() {
+	sudo -n sh -c "cd '$STORE' && find . -type f -print0 | sort -z | xargs -0 -r sha256sum"
+}
+
+was_active=0
+restart_unit() {
+	if [ "$was_active" = 1 ]; then
+		systemctl --user start "$UNIT" || true
+		sleep 1
+		if systemctl --user is-active --quiet "$UNIT"; then
+			echo "fp5-qtee: $UNIT active again" >&2
+		else
+			echo "fp5-qtee: WARNING $UNIT did not come back; run: systemctl --user start $UNIT" >&2
+		fi
+		was_active=0
+	fi
+}
+
+# Run the session with the trustlet to ourselves. $1 is a log tag.
+run_session() {
+	tag=$1; shift
+	[ -x "$SESSION" ] || die "no session binary at $SESSION (set FP5_QTEE_SESSION)"
+	mkdir -p "$LOGS"
+	log="$LOGS/$tag-$(stamp).log"
+	exec 9>"$LOCK"
+	flock -w 120 9 || die "another fp5-qtee job holds $LOCK"
+	if systemctl --user is-active --quiet "$UNIT"; then
+		was_active=1
+		trap restart_unit EXIT INT TERM
+		systemctl --user stop "$UNIT"
+	fi
+	i=0
+	while pgrep -f 'fp5-qtee-session (unlock|serve|enroll|auth)' >/dev/null 2>&1; do
+		i=$((i + 1))
+		[ "$i" -le 20 ] || die "a session is still running; not opening the trustlet"
+		sleep 0.5
+	done
+	rc=0
+	sudo -n timeout -k 10 120 "$SESSION" "$@" >"$log" 2>&1 || rc=$?
+	restart_unit
+	flock -u 9
+	echo "fp5-qtee: log $log" >&2
+	return $rc
+}
+
+cmd_list() {
+	rc=0
+	run_session list list "$FW" || rc=$?
+	if ! grep -q '^FINGERS ' "$log"; then
+		grep -E 'LIST|SET_GROUP cmd|RO refuse|session_exit' "$log" | tail -n 12 >&2 || true
+		die "the trustlet did not give a finger list (rc=$rc)"
+	fi
+	awk '
+		/^FINGERS / { split($2, c, "="); split($3, l, "=");
+			printf "%s enrolled finger(s)", c[2];
+			if (l[2] != "-1") printf " (gallery load logged %s)", l[2];
+			printf "\n" }
+		/^FINGER / { for (i = 2; i <= NF; i++) { split($i, kv, "="); v[kv[1]] = kv[2] }
+			printf "  #%s  finger id %s  (group %s, slot %s)\n", v["index"], v["fid"], v["gid"], v["slot"] }
+		/^OBJECT / { sub(/^OBJECT /, ""); objs = objs "  " $0 "\n" }
+		/^LIST ro_refused=/ { split($2, r, "="); ro = r[2] }
+		END { if (objs != "") printf "storage objects read while loading:\n%s", objs;
+		      if (ro != "" && ro != "0") printf "refused %s storage write(s) (read-only list)\n", ro }
+	' "$log"
+	return $rc
+}
+
+cmd_files() {
+	echo "$STORE (secure-file-system objects; names are the TEE's, not per finger):"
+	sudo -n find "$STORE" -type f -printf '  %TY-%Tm-%Td %TH:%TM UTC  %8s  %P\n' | sort -k4
+	echo "sha256:"
+	store_manifest | sed 's/^/  /'
+}
+
+cmd_backup() {
+	dst="$KEEP/backup/$(stamp)"
+	mkdir -p "$dst"
+	chmod 700 "$dst"
+	exec 9>"$LOCK"
+	flock -w 120 9 || die "another fp5-qtee job holds $LOCK"
+	sudo -n cp -a "$STORE" "$dst/misc"
+	sudo -n chown -R "$(id -u):$(id -g)" "$dst/misc"
+	store_manifest >"$dst/MANIFEST.sha256"
+	(cd "$dst/misc" && sha256sum -c --quiet "../MANIFEST.sha256") ||
+		die "backup in $dst does not match $STORE"
+	flock -u 9
+	echo "$dst"
+}
+
+# The newest backup must match the store byte for byte right now.
+require_backup() {
+	last=$(ls -1d "$KEEP"/backup/*/ 2>/dev/null | sort | tail -n 1)
+	[ -n "$last" ] || die "no backup; run: fp5-qtee backup"
+	[ -f "$last/MANIFEST.sha256" ] || die "backup $last has no MANIFEST.sha256"
+	now=$(store_manifest)
+	if [ "$now" != "$(cat "$last/MANIFEST.sha256")" ]; then
+		die "storage changed since backup $last; run: fp5-qtee backup"
+	fi
+	echo "fp5-qtee: backup $last matches $STORE" >&2
+}
+
+cmd_remove() {
+	fid=""; yes=0; last=""
+	for a in "$@"; do
+		case $a in
+		--yes-really) yes=1 ;;
+		--allow-last) last=--allow-last ;;
+		-*) die "unknown flag $a" ;;
+		*) [ -z "$fid" ] || die "one finger id only"; fid=$a ;;
+		esac
+	done
+	[ -n "$fid" ] || die "usage: fp5-qtee remove <fid> --yes-really"
+	[ "$yes" = 1 ] || die "refusing without --yes-really (see: fp5-qtee list)"
+	require_backup
+	rc=0
+	run_session remove remove "$FW" "$fid" --yes-really $last || rc=$?
+	grep -E '^(FINGER|REMOVE|SAVE|GPFILE (WRITE|UNLINK)|RPMB cmd=0x103)' "$log" || true
+	return $rc
+}
+
+[ $# -ge 1 ] || usage 1
+sub=$1; shift
+case $sub in
+list) cmd_list ;;
+files) cmd_files ;;
+backup) cmd_backup ;;
+remove) cmd_remove "$@" ;;
+-h|--help|help) usage 0 ;;
+*) usage 1 ;;
+esac
