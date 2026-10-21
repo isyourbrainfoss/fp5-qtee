@@ -40,6 +40,8 @@ static void test_opcodes(void)
 	expect(fp5_wmode_touch() == 1, "touch mode");
 	expect(fp5_op_report() != 0x1018, "report is not 0x1018");
 	expect(fp5_op_stats() == 0x100e, "stats opcode");
+	expect(fp5_op_free_spi() == 0x1007, "free spi opcode");
+	expect(fp5_op_cancel() == 0x2004, "cancel opcode");
 
 	{
 		uint8_t hat[0x4a];
@@ -92,6 +94,17 @@ static void test_decisions(void)
 	expect(!fp5_real_down(0x212, 0), "0x212 leftover");
 	expect(!fp5_real_down(0x2, 1), "esd blocks down");
 	expect(!fp5_real_down(0x12, 0), "0x12 is not down");
+	expect(fp5_down_at_arm(1, 0x2, 0), "held finger at arm");
+	expect(!fp5_down_at_arm(0, 0x2, 0), "query with no type is not a finger");
+	expect(!fp5_down_at_arm(1, 0x212, 0), "0x212 at arm is leftover");
+	expect(!fp5_down_at_arm(1, 0x2, 1), "esd at arm is not a finger");
+	expect(!fp5_down_at_arm(1, 0x0, 0), "idle 0 at arm");
+	expect(!fp5_down_at_arm(1, 0x1, 0), "idle 1 at arm");
+	expect(!fp5_down_at_arm(1, 0x210, 0), "0x210 at arm is not a down");
+	expect(fp5_query_on_panel_rise(0, 1), "panel rise queries");
+	expect(!fp5_query_on_panel_rise(1, 1), "panel staying on does not");
+	expect(!fp5_query_on_panel_rise(0, 0), "panel staying off does not");
+	expect(!fp5_query_on_panel_rise(1, 0), "panel fall does not");
 	expect(fp5_score_sample(300), "avgv 300");
 	expect(!fp5_score_sample(966), "empty avgv");
 	expect(!fp5_score_sample(0), "avgv 0");
@@ -167,9 +180,73 @@ static void test_decisions(void)
 	expect(fp5_retry_more(2, 1), "retry after the second burst");
 	expect(!fp5_retry_more(3, 1), "three bursts is the limit");
 	expect(!fp5_retry_more(1, 0), "a lift stops the retry");
+	expect(fp5_held_for_retry(1, 4, 5, 1, 0, 0),
+	       "already-down idle query stays down");
+	expect(fp5_held_for_retry(1, 4, 5, 1, 0x2, 0),
+	       "already-down exact down stays down");
+	expect(fp5_held_for_retry(1, 4, 4, 0, 0, 0),
+	       "already-down unchanged irq stays down");
+	expect(!fp5_held_for_retry(1, 4, 5, 1, 0x4, 0),
+	       "already-down lift stops");
+	expect(!fp5_held_for_retry(1, 4, 5, 1, 0x10, 0),
+	       "already-down other edge stops");
+	expect(!fp5_held_for_retry(1, 4, 5, 1, 0, 1),
+	       "already-down esd stops");
+	expect(!fp5_held_for_retry(1, 4, 5, 0, 0, 0),
+	       "already-down unclassified edge stops");
+	expect(!fp5_held_for_retry(0, 4, 5, 1, 0, 0),
+	       "a fresh edge does not treat idle as down");
 	expect(!fp5_press_strikes(0), "no scored miss is no strike");
 	expect(fp5_press_strikes(1) == 1, "one scored miss is one strike");
 	expect(fp5_press_strikes(3) == 1, "three scored misses are one strike");
+	{
+		uint32_t full[] = { 332, 298, 283 };
+		uint32_t kept[] = { 269, 263, 255 };
+		uint32_t fell[] = { 158, 158, 165 };
+		uint32_t hole[] = { 189, 223, 837 };
+		uint32_t none[] = { 900, 966, 700 };
+
+		expect(fp5_burst_level(full, 3) == 332, "level is the brightest");
+		expect(fp5_burst_level(hole, 3) == 223, "level skips an empty frame");
+		expect(fp5_burst_level(none, 3) == 0, "level of an empty burst is 0");
+		expect(!fp5_burst_falling(332, 269), "drop of 63 still matches");
+		expect(!fp5_burst_falling(fp5_burst_level(full, 3),
+					   fp5_burst_level(kept, 3)),
+		       "332 to 269 is kept");
+		expect(fp5_burst_falling(241, 158), "drop of 83 is a lift");
+		expect(fp5_burst_falling(fp5_burst_level(full, 3),
+					  fp5_burst_level(fell, 3)),
+		       "332 to 165 is a lift");
+		expect(fp5_burst_falling(316, 184), "316 to 184 is a lift");
+		expect(!fp5_burst_falling(316, 255), "drop of 61 is kept");
+		expect(!fp5_burst_falling(0, 200), "no first burst is not a lift");
+		expect(!fp5_burst_falling(300, 0), "an empty retry is not this skip");
+		expect(!fp5_burst_falling(300, 300), "the same level is kept");
+		expect(!fp5_burst_falling(300, 310), "a brighter retry is kept");
+	}
+	expect(fp5_miss_stays(1, 0), "all-zero miss stays");
+	expect(!fp5_miss_stays(1, 1), "a nonzero score ends the session");
+	expect(!fp5_miss_stays(0, 0), "an unscored press does not stay");
+	{
+		int score = 7;
+		const char *zero =
+			"FtVerifySubTemplate() score = 0, matchCnts = 28";
+		const char *hit =
+			"focaltech-lib FtVerifySubTemplate() score = 24, matchCnts = 8";
+		const uint8_t *miss =
+			(const uint8_t *)"xx FtVerifySubTemplate() score = 0, matchCnts = 1\n"
+			"FtVerifySubTemplate() score = 0, matchCnts = 2";
+		const uint8_t *some =
+			(const uint8_t *)"FtVerifySubTemplate() score = 0, matchCnts = 7\n"
+			"FtVerifySubTemplate() score = 5, matchCnts = 8";
+
+		expect(fp5_log_score(zero, &score) && score == 0, "score 0");
+		expect(fp5_log_score(hit, &score) && score == 24, "score 24");
+		expect(!fp5_log_nonzero_score(miss, strlen((const char *)miss)),
+		       "only zeros stay");
+		expect(fp5_log_nonzero_score(some, strlen((const char *)some)),
+		       "a 5 ends the stay");
+	}
 	expect(fp5_log_is_score(
 		       "FtVerifySubTemplate() score = 40, matchCnts = 2"),
 	       "score diary");
@@ -177,6 +254,44 @@ static void test_decisions(void)
 		       "focaltech-lib FtVerifySubTemplate() score = 40, matchCnts = 2"),
 	       "score line is kept");
 	expect(!fp5_log_keep("0123456789abcdef0123"), "long hex is dropped");
+	expect(fp5_log_keep("there is 1 template loaded."),
+	       "gallery count is kept");
+	expect(fp5_log_keep("new fid (= 1558157931) generated."),
+	       "new fid is kept");
+	expect(fp5_log_keep("template saved at slot 1. gid = 0, fid = 1"),
+	       "saved slot is kept");
+	expect(fp5_log_keep("removing 'ff_template_0_0.bin'"),
+	       "remove is kept");
+	{
+		int count = 7;
+		const char *one = "xx there is 1 template loaded. yy";
+		const char *two = "there are 2 templates loaded.";
+		const char *none = "not exist, skip";
+		const char *both =
+			"there is 1 template loaded.\nthere are 2 templates loaded.";
+
+		expect(fp5_gallery_loaded((const uint8_t *)one, strlen(one),
+					  &count) && count == 1,
+		       "one template");
+		expect(fp5_gallery_loaded((const uint8_t *)two, strlen(two),
+					  &count) && count == 2,
+		       "two templates");
+		count = 7;
+		expect(!fp5_gallery_loaded((const uint8_t *)none, strlen(none),
+					   &count) && count == 7,
+		       "a skip is not a count");
+		expect(fp5_gallery_loaded((const uint8_t *)both, strlen(both),
+					  &count) && count == 2,
+		       "the later count wins");
+		{
+			const char *zero = "there is 0 template loaded.";
+
+			count = 7;
+			expect(fp5_gallery_loaded((const uint8_t *)zero, strlen(zero),
+						  &count) && count == 0,
+			       "an empty gallery is a count of zero");
+		}
+	}
 
 	memset(log, 0, sizeof(log));
 	memcpy(log, "interrupt type: 0x212 avgv = 966", 32);

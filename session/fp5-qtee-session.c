@@ -3,6 +3,7 @@
 #include "fp5_tee.h"
 #include "fp5_wire.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -298,19 +299,22 @@ static int wait_irq(unsigned *prev, int ms)
 	return 0;
 }
 
-/* Same wait, and subtract the time actually spent from the caller's budget. */
-static int wait_budget(unsigned *prev, int *left_ms)
+/* Wait at most slice ms. Subtract the time actually spent from left. */
+static int wait_slice(unsigned *prev, int *left_ms, int slice)
 {
 	struct timespec a, b;
 	long used;
+	int budget, got;
 
 	if (*left_ms <= 0)
 		return 0;
+	budget = slice;
+	if (budget > *left_ms)
+		budget = *left_ms;
+	if (budget < 1)
+		budget = 1;
 	clock_gettime(CLOCK_MONOTONIC, &a);
-	if (!wait_irq(prev, *left_ms)) {
-		*left_ms = 0;
-		return 0;
-	}
+	got = wait_irq(prev, budget);
 	clock_gettime(CLOCK_MONOTONIC, &b);
 	used = (b.tv_sec - a.tv_sec) * 1000L +
 	       (b.tv_nsec - a.tv_nsec) / 1000000L;
@@ -320,7 +324,7 @@ static int wait_budget(unsigned *prev, int *left_ms)
 		*left_ms = 0;
 	else
 		*left_ms -= (int)used;
-	return 1;
+	return got;
 }
 
 static int mkdir_p(char *path)
@@ -1657,6 +1661,9 @@ static int open_and_load(struct svc *s, const char *dir)
 	return rc == 0 ? 0 : -1;
 }
 
+/* Set once INIT_SPI succeeds, so exit only hands back a bus it holds. */
+static int spi_held;
+
 static int setup_ta(struct svc *s, int native)
 {
 	uint8_t ver[4] = { 2, 0, 0, 0 };
@@ -1675,6 +1682,26 @@ static int setup_ta(struct svc *s, int native)
 		return -1;
 	if (send_cmd(s, fp5_op_init_spi(), 0, NULL, "INIT_SPI"))
 		return -1;
+	/*
+	 * focal32 keeps the SPI bus it opened for as long as it stays
+	 * loaded and answers a second INIT_SPI with -5. A serve session
+	 * that was killed, or a TA that survived ALREADY_LOADED handling,
+	 * leaves it held. Give it back and take it again rather than run
+	 * on with a sensor that cannot be read. From Marcus Ramberg's
+	 * focaltechqsee bring_up() (libfprint, LGPL-2.1+), reimplemented.
+	 */
+	if (s->last_rc != 0) {
+		logf("INIT_SPI rc=%d: bus still held, FREE_SPI and retry",
+		     (int)s->last_rc);
+		if (send_cmd(s, fp5_op_free_spi(), 0, NULL, "FREE_SPI") ||
+		    send_cmd(s, fp5_op_init_spi(), 0, NULL, "INIT_SPI2"))
+			return -1;
+		if (s->last_rc != 0) {
+			logf("INIT_SPI retry rc=%d", (int)s->last_rc);
+			return -1;
+		}
+	}
+	spi_held = s->last_rc == 0;
 	if (send_cmd(s, fp5_op_set_spi(), 4, &spd, "SET_SPI"))
 		return -1;
 	if (send_cmd(s, fp5_op_probe(), 1, zero, "PROBE"))
@@ -1730,7 +1757,11 @@ static int lift_rearm(struct svc *s, unsigned *irq)
 	return send_cmd(s, fp5_op_wmode(), 4, &mode, "WMODE_DETECT");
 }
 
-/* Trustlet stores "%s/%s". With no base that is /ff_template_0_0.bin.
+/* Trustlet stores "%s/ff_template_%d_%d.bin". With no base the file is
+ * /ff_template_<gid>_<fid % 10>.bin. Unlock loads this empty path.
+ * Enroll has to load it before the fid is chosen: the new id's last
+ * digit is the first empty RAM slot, and an empty gallery is always
+ * slot 0, which replaces ff_template_0_0.bin.
  * /data/vendor_de/0/fpdata looks up a different object and drops the RAM copy.
  */
 static const char *group_path(void)
@@ -1765,6 +1796,15 @@ static int open_enroll(struct svc *s)
 	char cfg[2048];
 	int n;
 
+	/*
+	 * focal32's enroll state is global and outlives the client. An
+	 * enroll that was aborted (killed app, timeout) leaves it armed and
+	 * the next PRE_ENROLL/ENROLL can be rejected or mixed up. CANCEL
+	 * first; its rc is only logged. From Marcus Ramberg's
+	 * focaltechqsee driver (libfprint commit e5912e8), reimplemented.
+	 */
+	if (send_cmd(s, fp5_op_cancel(), 0, NULL, "CANCEL_STALE"))
+		return -1;
 	n = fp5_sync_config(cfg, sizeof(cfg), 1);
 	if (n > 0)
 		send_cmd(s, fp5_op_sync(), (uint32_t)n + 1, cfg, "SYNC_ENROLL");
@@ -1835,6 +1875,47 @@ static int probe_capture(struct svc *s)
 	return s->last_rc == 0 ? 0 : 2;
 }
 
+/* SET_GROUP on the unlock path, then the bytes from that command only.
+ * The full qsee ring still holds older "there is 1 template loaded"
+ * lines, which must not count. ENUM is sent only after a real load:
+ * it returns -203 and does not remove a template.
+ */
+static int gallery_in_cmd(struct svc *s, int *count)
+{
+	if (qsee_delta && qsee_delta_len &&
+	    fp5_gallery_loaded(qsee_delta, qsee_delta_len, count))
+		return 1;
+	if (s->rsp_out && fp5_gallery_loaded(s->rsp_out, RSP_SZ, count))
+		return 1;
+	if (s->req && fp5_gallery_loaded(s->req, REQ_SZ, count))
+		return 1;
+	return 0;
+}
+
+static int enroll_load_gallery(struct svc *s)
+{
+	uint8_t g[FP5_GROUP_CAP];
+	int n = fp5_build_group(g, sizeof(g), group_path());
+	int count = -1;
+
+	if (n < 0)
+		return -1;
+	if (send_cmd(s, fp5_op_set_group(), (uint32_t)n, g, "SET_GROUP"))
+		return -1;
+	if (!gallery_in_cmd(s, &count)) {
+		logl("enroll refuse: trustlet did not report a template count");
+		return 2;
+	}
+	if (count < 1) {
+		logf("enroll refuse: loaded=%d; not minting a finger", count);
+		return 2;
+	}
+	logf("enroll gallery loaded=%d", count);
+	if (send_cmd(s, fp5_op_enum(), 0, NULL, "ENUM"))
+		return -1;
+	return 0;
+}
+
 static int enroll_finger(struct svc *s)
 {
 	unsigned irq = read_irq();
@@ -1842,7 +1923,16 @@ static int enroll_finger(struct svc *s)
 	int sample;
 	int wrote = 0;
 	long save_ms = 0;
+	int loaded;
 
+	/* Fill RAM before PRE_ENROLL. The trustlet then gives the new
+	 * finger the next free slot instead of replacing slot 0. A load
+	 * that does not see the current finger stops here, before any
+	 * fid is generated and before SAVE.
+	 */
+	loaded = enroll_load_gallery(s);
+	if (loaded)
+		return loaded;
 	if (open_enroll(s))
 		return -1;
 	if (s->last_rc != 0) {
@@ -1950,7 +2040,7 @@ static int enroll_finger(struct svc *s)
  * A new edge is classified with QEV and is not passed to fp5_att_irq, so a
  * lift cannot look like another finger-down of this attempt.
  */
-static int finger_held(struct svc *s, unsigned *irq)
+static int finger_held(struct svc *s, unsigned *irq, int already)
 {
 	unsigned now = read_irq();
 	unsigned base = *irq;
@@ -1961,8 +2051,11 @@ static int finger_held(struct svc *s, unsigned *irq)
 		return 1;
 	if (send_cmd(s, fp5_op_query(), 4, z, "QEV"))
 		return -1;
-	held = fp5_finger_held(base, now, s->last.saw_itype, s->last.itype,
-			       s->last.esd);
+	held = fp5_held_for_retry(already, base, now, s->last.saw_itype,
+				  s->last.itype, s->last.esd);
+	if (held && !fp5_finger_held(base, now, s->last.saw_itype,
+				     s->last.itype, s->last.esd))
+		logf("still down after idle query itype=0x%x", s->last.itype);
 	if (s->last.saw_itype)
 		*irq = now;
 	return held;
@@ -1976,16 +2069,16 @@ static int finger_held(struct svc *s, unsigned *irq)
  * Cancel before any scored report returns cancelled and prints no FAIL.
  */
 static int auth_press(struct svc *s, int which, unsigned *irq,
-		      uint32_t itype, int esd)
+		      uint32_t itype, int esd, int already)
 {
-	int burst, scored = 0, saw_empty = 0, cut = 0;
+	int burst, scored = 0, saw_empty = 0, cut = 0, nonzero = 0;
 	uint32_t empty_av[3] = { 0, 0, 0 };
-	uint32_t miss_avgv = 0, miss_fid = 0;
+	uint32_t miss_avgv = 0, miss_fid = 0, first_level = 0;
 	int miss_rc = 0;
 
 	for (burst = 0; burst < 3 && !cut; burst++) {
 		uint32_t av[3] = { 0, 0, 0 };
-		uint32_t fid = 0;
+		uint32_t fid = 0, level;
 		int fi, matched, verdict, held;
 
 		if (burst > 0) {
@@ -1996,7 +2089,7 @@ static int auth_press(struct svc *s, int which, unsigned *irq,
 				}
 				break;
 			}
-			held = finger_held(s, irq);
+			held = finger_held(s, irq, already);
 			if (held < 0)
 				return -1;
 			if (!fp5_retry_more(burst, held))
@@ -2026,6 +2119,14 @@ static int auth_press(struct svc *s, int which, unsigned *irq,
 			empty_av[2] = av[2];
 			continue;
 		}
+		level = fp5_burst_level(av, 3);
+		if (fp5_burst_falling(first_level, level)) {
+			logf("AUTH %d skip falling avgv=%u,%u,%u first=%u",
+			     which, av[0], av[1], av[2], first_level);
+			break;
+		}
+		if (first_level == 0)
+			first_level = level;
 		/*
 		 * All three captures are already in the trustlet. Report the
 		 * burst as a whole, including a frame with avgv >= 600.
@@ -2035,6 +2136,9 @@ static int auth_press(struct svc *s, int which, unsigned *irq,
 		if (send_cmd(s, fp5_op_report(), 0x2e0, NULL, "REPORT_EV5"))
 			return -1;
 		qsee_dump_delta("REPORT_EV5");
+		if (qsee_delta && qsee_delta_len &&
+		    fp5_log_nonzero_score(qsee_delta, qsee_delta_len))
+			nonzero = 1;
 		memcpy(&fid, s->req + FP5_PAY_OFF + 0x10, 4);
 		logf("AUTH %d report rc=%d fid=%u", which, (int)s->last_rc, fid);
 		if (serve_on)
@@ -2061,7 +2165,9 @@ static int auth_press(struct svc *s, int which, unsigned *irq,
 	if (fp5_press_strikes(scored)) {
 		logf("AUTH FAIL %d itype=0x%x esd=%d avgv=%u fid=%u rc=%d",
 		     which, itype, esd, miss_avgv, miss_fid, miss_rc);
-		return 2;
+		if (fp5_miss_stays(scored, nonzero))
+			return FP5_ATT_AGAIN;
+		return FP5_ATT_MISS;
 	}
 	if (saw_empty) {
 		logf("AUTH %d empty avgv=%u,%u,%u", which, empty_av[0],
@@ -2069,6 +2175,60 @@ static int auth_press(struct svc *s, int which, unsigned *irq,
 		return 2;
 	}
 	return 2;
+}
+
+/* DSI dpms "On". Missing sysfs is off. The path is cached. */
+static int dsi_is_on(void)
+{
+	static char path[256];
+	char buf[8];
+	int fd, n;
+
+	if (!path[0]) {
+		DIR *dir = opendir("/sys/class/drm");
+		struct dirent *ent;
+
+		if (!dir)
+			return 0;
+		while ((ent = readdir(dir)) != NULL) {
+			if (strncmp(ent->d_name, "card", 4) != 0)
+				continue;
+			if (strstr(ent->d_name, "-DSI-") == NULL)
+				continue;
+			n = snprintf(path, sizeof(path),
+				     "/sys/class/drm/%s/dpms", ent->d_name);
+			if (n < 0 || (size_t)n >= sizeof(path))
+				path[0] = 0;
+			break;
+		}
+		closedir(dir);
+		if (!path[0])
+			return 0;
+	}
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return 0;
+	n = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (n < 2)
+		return 0;
+	buf[n] = 0;
+	return (buf[0] == 'O' || buf[0] == 'o') &&
+	       (buf[1] == 'n' || buf[1] == 'N');
+}
+
+/* 1 when a query says a finger is down, 0 when it does not, -1 on invoke. */
+static int query_held(struct svc *s, uint32_t *itype, int *esd)
+{
+	uint8_t z[4] = { 0 };
+
+	if (send_cmd(s, fp5_op_query(), 4, z, "QEV"))
+		return -1;
+	if (!fp5_down_at_arm(s->last.saw_itype, s->last.itype, s->last.esd))
+		return 0;
+	*itype = s->last.itype;
+	*esd = s->last.esd;
+	return 1;
 }
 
 static int auth_once(struct svc *s, int which)
@@ -2082,7 +2242,7 @@ static int auth_once(struct svc *s, int which)
 	 */
 	uint32_t mode = fp5_wmode_touch();
 	uint32_t itype = 0;
-	int esd = 0, down = 0;
+	int esd = 0, down = 0, from_query = 0;
 	int left = 90000;
 	uint8_t hat[0x4a];
 	uint8_t z[4] = { 0 };
@@ -2102,9 +2262,9 @@ static int auth_once(struct svc *s, int which)
 	}
 	if (serve_on) {
 		/*
-		 * Fresh attempt: the baseline is this arm's irq_count, so a
-		 * press while cancelled or with the panel off is not a down
-		 * here, and nothing from the last attempt carries over.
+		 * Fresh attempt: the baseline is this arm's irq_count. An irq
+		 * change while cancelled is ignored. A finger already down
+		 * is the query below, and cancel still refuses the capture.
 		 * Commands that came in with "auth" are applied now.
 		 */
 		fp5_att_begin(&serve_att, irq);
@@ -2116,19 +2276,73 @@ static int auth_once(struct svc *s, int which)
 	logf("AUTH %d arm mode=%u irq=%u", which, mode, irq);
 	if (send_cmd(s, fp5_op_wmode(), 4, &mode, "WMODE_TOUCH"))
 		return -1;
-	while (left > 0) {
-		if (!wait_budget(&irq, &left))
-			break;
-		if (send_cmd(s, fp5_op_query(), 4, z, "QEV"))
+	if (serve_on && serve_poll_cmds()) {
+		logf("AUTH %d cancelled", which);
+		return FP5_ATT_CANCELLED;
+	}
+	/*
+	 * irq was sampled before AUTH_ARM. A finger already down sits
+	 * inside that baseline, and wait_irq will not see it. Ask once.
+	 * A mode-switch leftover is not a finger.
+	 */
+	{
+		int held = query_held(s, &itype, &esd);
+
+		if (held < 0)
 			return -1;
-		itype = s->last.itype;
-		esd = s->last.esd;
-		if (fp5_real_down(itype, esd)) {
+		if (held) {
 			down = 1;
-			break;
+			from_query = 1;
+			logf("AUTH %d already down itype=0x%x", which, itype);
+		} else if (s->last.saw_itype) {
+			logf("skip leftover itype=0x%x esd=%d",
+			     s->last.itype, s->last.esd);
 		}
-		/* Keep the screen on PRESS. An AUTH-prefixed skip would say LIFT. */
-		logf("skip leftover itype=0x%x esd=%d", itype, esd);
+	}
+	{
+		int panel = dsi_is_on();
+
+		while (!down && left > 0) {
+			int got = wait_slice(&irq, &left, 200);
+			int now_panel;
+
+			if (serve_on && serve_att.cancelled) {
+				logf("AUTH %d cancelled", which);
+				return FP5_ATT_CANCELLED;
+			}
+			if (got) {
+				if (send_cmd(s, fp5_op_query(), 4, z, "QEV"))
+					return -1;
+				itype = s->last.itype;
+				esd = s->last.esd;
+				if (fp5_real_down(itype, esd)) {
+					down = 1;
+					break;
+				}
+				/* Keep the screen on PRESS. An AUTH-prefixed skip would say LIFT. */
+				logf("skip leftover itype=0x%x esd=%d", itype, esd);
+				continue;
+			}
+			/*
+			 * The power key turned the panel on. The GPIO edge
+			 * can be missing when the CPU was suspended. Ask
+			 * once on that rise.
+			 */
+			now_panel = dsi_is_on();
+			if (fp5_query_on_panel_rise(panel, now_panel)) {
+				int held = query_held(s, &itype, &esd);
+
+				if (held < 0)
+					return -1;
+				if (held) {
+					down = 1;
+					from_query = 1;
+					logf("AUTH %d held at panel itype=0x%x",
+					     which, itype);
+				}
+			}
+			panel = now_panel;
+		}
 	}
 	if (!down) {
 		if (serve_on && serve_att.cancelled) {
@@ -2136,7 +2350,7 @@ static int auth_once(struct svc *s, int which)
 			return FP5_ATT_CANCELLED;
 		}
 		logf("AUTH %d no finger", which);
-		return 2;
+		return FP5_ATT_NONE;
 	}
 	/* The QEV round trip takes time; a cancel may have come in. */
 	if (serve_on && (serve_poll_cmds() || !fp5_att_down(&serve_att))) {
@@ -2144,7 +2358,37 @@ static int auth_once(struct svc *s, int which)
 		return FP5_ATT_CANCELLED;
 	}
 	logf("AUTH %d REAL DOWN itype=0x%x", which, itype);
-	return auth_press(s, which, &irq, itype, esd);
+	return auth_press(s, which, &irq, itype, esd, from_query);
+}
+
+/* After an all-zero miss, do not capture the finger that is still down.
+ * That would be the same press again. Wait until a query is not a real
+ * down. The process timeout and a signal are what end a hold that never
+ * lifts. Returns -1 if the query fails, 0 once the finger is up.
+ */
+static int wait_until_lift(struct svc *s)
+{
+	unsigned irq = read_irq();
+	uint8_t z[4] = { 0 };
+
+	if (send_cmd(s, fp5_op_query(), 4, z, "QEV"))
+		return -1;
+	if (!s->last.saw_itype || !fp5_real_down(s->last.itype, s->last.esd)) {
+		logf("AUTH stay: finger up itype=0x%x", s->last.itype);
+		return 0;
+	}
+	logf("AUTH stay: waiting for lift itype=0x%x", s->last.itype);
+	for (;;) {
+		if (!wait_irq(&irq, 1000))
+			continue;
+		if (send_cmd(s, fp5_op_query(), 4, z, "QEV"))
+			return -1;
+		if (!s->last.saw_itype ||
+		    !fp5_real_down(s->last.itype, s->last.esd)) {
+			logf("AUTH stay: finger up itype=0x%x", s->last.itype);
+			return 0;
+		}
+	}
 }
 
 /*
@@ -2402,14 +2646,30 @@ int main(int argc, char **argv)
 		logf("auth pair %d %d", a, b);
 		rc = (a == 0 && b == 0) ? 0 : 2;
 	} else if (!strcmp(mode, "unlock")) {
-		/* One press for the Phosh lock screen. Match still asks twice. */
-		int a;
+		/* One process for the Phosh lock screen. Setup and
+		 * calibration run once. No finger arms again here. An
+		 * all-zero miss stays: wait until the finger is up, then
+		 * match the next press. A hit, or a miss with a nonzero
+		 * score, ends it. The watcher starts the next process.
+		 */
+		int a = FP5_ATT_NONE, n = 0;
 
 		if (set_group(&s, group_path())) {
 			rc = 1;
 			goto done;
 		}
-		a = auth_once(&s, 1);
+		for (;;) {
+			if (a == FP5_ATT_AGAIN) {
+				logl("AUTH stay: all-zero miss");
+				if (wait_until_lift(&s)) {
+					rc = 1;
+					goto done;
+				}
+			}
+			a = auth_once(&s, ++n);
+			if (a != FP5_ATT_NONE && a != FP5_ATT_AGAIN)
+				break;
+		}
 		logf("unlock once %d", a);
 		rc = a == 0 ? 0 : (a < 0 ? 1 : 2);
 	} else if (!strcmp(mode, "serve")) {
@@ -2419,6 +2679,13 @@ int main(int argc, char **argv)
 		rc = 1;
 	}
 done:
+	/*
+	 * Hand the SPI bus back before the session goes, as Marcus
+	 * Ramberg's driver does on close: the TA can outlive us, and the
+	 * next session's INIT_SPI would otherwise see -5.
+	 */
+	if (spi_held && !send_cmd(&s, fp5_op_free_spi(), 0, NULL, "FREE_SPI_EXIT"))
+		spi_held = 0;
 	s.stop = 1;
 	watch_stop = 1;
 	fp5_tee_close(&s.tee);

@@ -29,12 +29,16 @@ from fp5_qtee_unlock import (
     is_locked,
     lock_signal,
     lockout_state_for,
+    keep_session,
     miss_kind,
     parse_locked,
 
     notify_args,
     pump_lines,
     screen_is_on,
+    armed_hold,
+    listen_done_text,
+    verify_score,
     wake_press,
 )
 
@@ -71,6 +75,14 @@ class UnlockDecisionTest(unittest.TestCase):
     def test_hit_fid(self) -> None:
         line = "AUTH HIT 1 itype=0x2 avgv=304 fid=1403494260 rc=0"
         self.assertEqual(hit_fid(line), 1403494260)
+        self.assertEqual(fp5_qtee_unlock.hit_attempt(line), 1)
+        self.assertEqual(
+            fp5_qtee_unlock.hit_attempt(
+                "AUTH HIT 2 itype=0x2 avgv=304 fid=1403494260 rc=0"
+            ),
+            2,
+        )
+        self.assertIsNone(fp5_qtee_unlock.hit_attempt("AUTH FAIL 1 itype=0x2"))
         self.assertIsNone(hit_fid("AUTH FAIL 1 itype=0x2 esd=0 avgv=291 fid=0 rc=-11"))
         self.assertIsNone(hit_fid("AUTH HIT 1 itype=0x2 avgv=1 fid=0 rc=0"))
         self.assertIsNone(hit_fid("auth success score:0x00000026."))
@@ -151,6 +163,14 @@ class MissTest(unittest.TestCase):
         self.assertIsNone(miss_kind("AUTH 1 REAL DOWN itype=0x2"))
         # The burst log is not a verdict. One AUTH FAIL later is the strike.
         self.assertIsNone(miss_kind("AUTH 1 burst avgv=328,521,638"))
+        self.assertIsNone(miss_kind("AUTH stay: all-zero miss"))
+        self.assertIsNone(miss_kind("AUTH 1 skip falling avgv=158,158,165 first=241"))
+
+    def test_keep_session_is_an_all_zero_nomatch(self) -> None:
+        self.assertTrue(keep_session("nomatch", False))
+        self.assertFalse(keep_session("nomatch", True))
+        self.assertFalse(keep_session("partial", False))
+        self.assertFalse(keep_session(None, False))
 
     def test_feedback_args(self) -> None:
         self.assertEqual(
@@ -193,24 +213,53 @@ class MissTest(unittest.TestCase):
 
 
 class PolicyTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._dirs: list[tempfile.TemporaryDirectory[str]] = []
+        self.addCleanup(self._close_dirs)
+
+    def _close_dirs(self) -> None:
+        while self._dirs:
+            self._dirs.pop().cleanup()
+
     def make(self, require_pin: bool = True, marker: Path | None = None) -> tuple[UnlockPolicy, list[float]]:
         now = [1000.0]
-        return UnlockPolicy(require_pin=require_pin, marker=marker, clock=lambda: now[0]), now
+        if marker is None:
+            tmp = tempfile.TemporaryDirectory()
+            self._dirs.append(tmp)
+            state: Path | None = Path(tmp.name) / "fp5-qtee-lockout"
+        else:
+            state = lockout_state_for(marker)
+        return UnlockPolicy(
+            require_pin=require_pin, marker=marker, clock=lambda: now[0], state=state,
+        ), now
+
+    def credit_pin(self, pol: UnlockPolicy, now: list[float]) -> None:
+        """Locked, then unlocked, then still unlocked after the flicker window."""
+        pol.observe_lock(True)
+        pol.observe_lock(False)
+        now[0] += fp5_qtee_unlock.LOCK_FLICKER_S
+        pol.observe_lock(False)
 
     def test_pin_needed_after_boot(self) -> None:
-        pol, _ = self.make()
+        pol, now = self.make()
         pol.observe_lock(True)
         self.assertEqual(pol.why_not(), "pin-after-boot")
-        pol.observe_lock(False)  # PIN
+        pol.observe_lock(False)
+        self.assertEqual(pol.why_not(), "pin-after-boot")
+        now[0] += fp5_qtee_unlock.LOCK_FLICKER_S
+        pol.observe_lock(False)
         self.assertIsNone(pol.why_not())
 
     def test_first_sample_is_not_pin(self) -> None:
-        pol, _ = self.make()
+        pol, now = self.make()
         pol.observe_lock(False)
         self.assertEqual(pol.why_not(), "pin-after-boot")
         pol.observe_lock(False)
         self.assertEqual(pol.why_not(), "pin-after-boot")
         pol.observe_lock(True)
+        pol.observe_lock(False)
+        self.assertEqual(pol.why_not(), "pin-after-boot")
+        now[0] += fp5_qtee_unlock.LOCK_FLICKER_S
         pol.observe_lock(False)
         self.assertIsNone(pol.why_not())
 
@@ -225,8 +274,7 @@ class PolicyTest(unittest.TestCase):
 
     def test_loginctl_timeout_does_not_clear_lockout(self) -> None:
         pol, now = self.make()
-        pol.observe_lock(True)
-        pol.observe_lock(False)  # PIN
+        self.credit_pin(pol, now)
         for _ in range(20):
             pol.on_miss()
             now[0] += 31
@@ -247,8 +295,7 @@ class PolicyTest(unittest.TestCase):
 
     def test_our_unlock_with_lagging_hint_is_not_pin(self) -> None:
         pol, now = self.make()
-        pol.observe_lock(True)
-        pol.observe_lock(False)  # PIN
+        self.credit_pin(pol, now)
         pin = pol.pin_at()
         now[0] += 100
         pol.observe_lock(True)
@@ -258,16 +305,22 @@ class PolicyTest(unittest.TestCase):
         now[0] += 0.5
         pol.observe_lock(False)
         self.assertEqual(pol.pin_at(), pin)
-        # A later PIN unlock still counts.
+        # Staying unlocked is still our unlock, not a new PIN.
+        now[0] += fp5_qtee_unlock.LOCK_FLICKER_S
+        pol.observe_lock(False)
+        self.assertEqual(pol.pin_at(), pin)
+        # A later PIN unlock still counts, once it holds.
         pol.observe_lock(True)
         now[0] += 1
+        pol.observe_lock(False)
+        self.assertEqual(pol.pin_at(), pin)
+        now[0] += fp5_qtee_unlock.LOCK_FLICKER_S
         pol.observe_lock(False)
         self.assertNotEqual(pol.pin_at(), pin)
 
     def test_finger_unlock_is_not_pin(self) -> None:
         pol, now = self.make()
-        pol.observe_lock(True)
-        pol.observe_lock(False)  # PIN
+        self.credit_pin(pol, now)
         pol.observe_lock(True)
         now[0] += 71 * 3600
         pol.on_hit()
@@ -275,7 +328,26 @@ class PolicyTest(unittest.TestCase):
         pol.observe_lock(True)
         now[0] += 2 * 3600
         self.assertEqual(pol.why_not(), "pin-72h")
-        pol.observe_lock(False)  # PIN again
+        pol.observe_lock(False)
+        self.assertEqual(pol.why_not(), "pin-72h")
+        now[0] += fp5_qtee_unlock.LOCK_FLICKER_S
+        pol.observe_lock(False)
+        self.assertIsNone(pol.why_not())
+
+    def test_unlock_flicker_is_not_a_pin(self) -> None:
+        pol, now = self.make()
+        pol.observe_lock(True)
+        pol.observe_lock(False)
+        now[0] += 1.0
+        pol.observe_lock(True)
+        self.assertEqual(pol.why_not(), "pin-after-boot")
+        self.assertIsNone(pol.pin_at())
+        pol.observe_lock(False)
+        pol.forget_session()
+        now[0] += fp5_qtee_unlock.LOCK_FLICKER_S
+        pol.observe_lock(False)
+        self.assertEqual(pol.why_not(), "pin-after-boot")
+        self.credit_pin(pol, now)
         self.assertIsNone(pol.why_not())
 
     def test_timed_and_permanent_lockout(self) -> None:
@@ -295,8 +367,12 @@ class PolicyTest(unittest.TestCase):
         self.assertEqual(pol.failed, 20)
         self.assertEqual(pol.why_not(), "lockout-permanent")
         pol.observe_lock(True)
-        pol.observe_lock(False)  # PIN clears it
+        pol.observe_lock(False)
+        self.assertEqual(pol.why_not(), "lockout-permanent")
+        now[0] += fp5_qtee_unlock.LOCK_FLICKER_S
+        pol.observe_lock(False)
         self.assertIsNone(pol.why_not())
+        self.assertEqual(pol.failed, 0)
 
     def test_hit_resets_count(self) -> None:
         pol, _ = self.make(require_pin=False)
@@ -310,9 +386,11 @@ class PolicyTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             marker = Path(tmp) / "pin-ok"
             pol, now = self.make(marker=marker)
-            pol.observe_lock(True)
-            pol.observe_lock(False)
-            again, _ = self.make(marker=marker)
+            self.credit_pin(pol, now)
+            again = UnlockPolicy(
+                require_pin=True, marker=marker, clock=lambda: now[0],
+                state=lockout_state_for(marker),
+            )
             self.assertIsNone(again.why_not())
             marker.write_text("999999.0\n")  # later than now: earlier boot
             self.assertEqual(again.why_not(), "pin-after-boot")
@@ -326,8 +404,7 @@ class PolicyTest(unittest.TestCase):
             now = [1000.0]
             clock = lambda: now[0]
             pol = UnlockPolicy(require_pin=True, marker=marker, clock=clock, state=state)
-            pol.observe_lock(True)
-            pol.observe_lock(False)  # PIN
+            self.credit_pin(pol, now)
             for _ in range(5):
                 pol.on_miss()
             self.assertEqual(pol.why_not(), "lockout")
@@ -344,6 +421,9 @@ class PolicyTest(unittest.TestCase):
             self.assertEqual(third.why_not(), "lockout-permanent")
             # Only a PIN clears it, and that is saved too.
             third.observe_lock(True)
+            third.observe_lock(False)
+            self.assertEqual(third.why_not(), "lockout-permanent")
+            now[0] += fp5_qtee_unlock.LOCK_FLICKER_S
             third.observe_lock(False)
             fourth = UnlockPolicy(require_pin=True, marker=marker, clock=clock, state=state)
             self.assertIsNone(fourth.why_not())
@@ -379,6 +459,19 @@ class PolicyTest(unittest.TestCase):
         pol.observe_lock(True)
         self.assertIsNone(pol.why_not())
 
+    def test_no_state_path_refuses_finger_unlock(self) -> None:
+        pol = UnlockPolicy(require_pin=False, marker=None, clock=lambda: 1000.0, state=None)
+        self.assertEqual(pol.why_not(), "no-state")
+        pol.on_miss()
+        pol.on_hit()
+        pol.observe_lock(True)
+        pol.observe_lock(False)
+        self.assertEqual(pol.why_not(), "no-state")
+        self.assertEqual(pol.failed, 0)
+        pinned = UnlockPolicy(require_pin=True, marker=None, clock=lambda: 1000.0, state=None)
+        self.assertEqual(pinned.why_not(), "no-state")
+        self.assertIn("saved", fp5_qtee_unlock.POLICY_TEXT["no-state"])
+
 
 class PumpAndThrottleTest(unittest.TestCase):
     def test_pump_ends_with_none(self) -> None:
@@ -404,6 +497,80 @@ class PumpAndThrottleTest(unittest.TestCase):
         self.assertEqual(t.get(), 3)
 
 
+class AwaitPanelTest(unittest.TestCase):
+    def test_already_on(self) -> None:
+        self.assertTrue(fp5_qtee_unlock.await_panel(
+            lambda: True, 1.0, lambda: True, sleep=lambda _s: None,
+            clock=lambda: 0.0,
+        ))
+
+    def test_comes_on_within_the_grace(self) -> None:
+        now = [0.0]
+        on = [False]
+
+        def clock() -> float:
+            return now[0]
+
+        def sleep(dt: float) -> None:
+            now[0] += dt
+            if now[0] >= 0.2:
+                on[0] = True
+
+        self.assertTrue(fp5_qtee_unlock.await_panel(
+            lambda: on[0], 1.0, lambda: True, sleep=sleep, clock=clock,
+        ))
+        self.assertLess(now[0], 1.0)
+
+    def test_staying_off(self) -> None:
+        now = [0.0]
+
+        def sleep(dt: float) -> None:
+            now[0] += dt
+
+        self.assertFalse(fp5_qtee_unlock.await_panel(
+            lambda: False, 1.0, lambda: True, sleep=sleep, clock=lambda: now[0],
+        ))
+        self.assertGreaterEqual(now[0], 1.0)
+
+    def test_stops_when_no_longer_wanted(self) -> None:
+        now = [0.0]
+
+        def sleep(dt: float) -> None:
+            now[0] += dt
+
+        self.assertFalse(fp5_qtee_unlock.await_panel(
+            lambda: False, 5.0, lambda: now[0] < 0.1,
+            sleep=sleep, clock=lambda: now[0],
+        ))
+        self.assertLess(now[0], 1.0)
+
+    def test_zero_wait_checks_once(self) -> None:
+        self.assertFalse(fp5_qtee_unlock.await_panel(
+            lambda: False, 0.0, lambda: True,
+        ))
+
+
+class PanelRiseTest(unittest.TestCase):
+    def test_rise_before_arm_opens_the_wake_window(self) -> None:
+        w = fp5_qtee_unlock.UnlockWatcher()
+        w._panel_was_on = False
+        self.assertTrue(w._note_panel(True, False))
+        self.assertTrue(w._wake_open)
+
+    def test_rise_after_arm_is_scored(self) -> None:
+        w = fp5_qtee_unlock.UnlockWatcher()
+        w._panel_was_on = False
+        w._wake_open = False
+        self.assertTrue(w._note_panel(True, True))
+        self.assertFalse(w._wake_open)
+
+    def test_already_on_at_start_is_not_a_wake(self) -> None:
+        w = fp5_qtee_unlock.UnlockWatcher()
+        self.assertIsNone(w._panel_was_on)
+        self.assertFalse(w._note_panel(True, False))
+        self.assertFalse(w._wake_open)
+
+
 class WakePressTest(unittest.TestCase):
     def test_window(self) -> None:
         # Already down at the arm line, or the IRQ within ~300 ms.
@@ -417,6 +584,60 @@ class WakePressTest(unittest.TestCase):
     def test_default_is_one_second_from_arm(self) -> None:
         # Fallback when the session cannot say the finger was already down.
         self.assertAlmostEqual(fp5_qtee_unlock.WAKE_GRACE_S, 1.0)
+
+    def test_nonzero_score(self) -> None:
+        line = "REPORT_EV5 qsee: FtVerifySubTemplate() score = 5, matchCnts = 13"
+        self.assertEqual(verify_score(line), 5)
+        self.assertEqual(
+            verify_score("FtVerifySubTemplate() score = 0, matchCnts = 17"), 0
+        )
+        self.assertIsNone(verify_score("AUTH FAIL 1 itype=0x2 esd=0 avgv=259 fid=0 rc=-11"))
+
+    def test_nonzero_score_is_not_ignored(self) -> None:
+        ignore, claimed = fp5_qtee_unlock.consume_wake(
+            False, 10.2, 10.0, 1.0, nonzero=True
+        )
+        self.assertFalse(ignore)
+        self.assertTrue(claimed)
+
+    def test_zero_score_wake_is_still_ignored(self) -> None:
+        ignore, claimed = fp5_qtee_unlock.consume_wake(
+            False, 10.2, 10.0, 1.0, nonzero=False
+        )
+        self.assertTrue(ignore)
+        self.assertTrue(claimed)
+
+    def test_flicker_hold(self) -> None:
+        stop, since = armed_hold(True, "seat unlocked", None, 10.0)
+        self.assertFalse(stop)
+        self.assertEqual(since, 10.0)
+        stop, since = armed_hold(True, "seat unlocked", 10.0, 11.9)
+        self.assertFalse(stop)
+        stop, since = armed_hold(True, "lock unknown", 10.0, 12.0)
+        self.assertTrue(stop)
+        self.assertEqual(since, 10.0)
+        stop, _since = armed_hold(False, "seat unlocked", None, 10.0)
+        self.assertTrue(stop)
+        stop, since = armed_hold(True, "qsee_fingerpr loaded", 10.0, 10.1)
+        self.assertTrue(stop)
+        self.assertIsNone(since)
+        stop, _since = armed_hold(True, "not wanted", None, 10.0)
+        self.assertTrue(stop)
+
+    def test_listen_stop_names_the_reason(self) -> None:
+        self.assertEqual(
+            listen_done_text("stop", "seat unlocked"),
+            "listen done stop: seat unlocked",
+        )
+        self.assertEqual(
+            listen_done_text("stop", None),
+            "listen done stop: unspecified",
+        )
+        self.assertEqual(listen_done_text("miss", None), "listen done miss")
+        self.assertEqual(
+            listen_done_text("error", "qcomtee load failed"),
+            "listen done error: qcomtee load failed",
+        )
 
     def test_down_line(self) -> None:
         self.assertTrue(is_down("AUTH 1 REAL DOWN itype=0x2\n"))
@@ -436,13 +657,18 @@ class FollowTest(unittest.TestCase):
         self.w = UnlockWatcher()
         self.w.notify = lambda text: None  # type: ignore[method-assign]
         self.unlocked: list[tuple[str, int]] = []
-        self.w.unlock = lambda sid, fid: self.unlocked.append((sid, fid))  # type: ignore[method-assign]
+        self.w.unlock = lambda sid, fid: self.unlocked.append((sid, fid)) or True  # type: ignore[method-assign]
         self.w._stop = lambda proc: proc.stop()  # type: ignore[method-assign,assignment]
         self.misses: list[str] = []
         self.w.tell_miss = lambda kind: self.misses.append(kind)  # type: ignore[method-assign]
         self.w.tell_hit = lambda: None  # type: ignore[method-assign]
         self.w.feedback = lambda event: None  # type: ignore[method-assign]
-        self.w.policy = UnlockPolicy(require_pin=False, marker=None)
+        state_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(state_dir.cleanup)
+        self.w.policy = UnlockPolicy(
+            require_pin=False, marker=None,
+            state=Path(state_dir.name) / "fp5-qtee-lockout",
+        )
 
     @staticmethod
     def _close_procs() -> None:
@@ -475,6 +701,61 @@ class FollowTest(unittest.TestCase):
         self.assertEqual(out, "hit")
         self.assertEqual(self.unlocked, [("c4", 1403494260)])
 
+    def _real_unlock(self, run_result: object) -> None:
+        """Call the real unlock(), with subprocess.run replaced."""
+        hits: list[str] = []
+        self.w.tell_hit = lambda: hits.append("hit")  # type: ignore[method-assign]
+        self.hits = hits
+        self.w.policy.on_miss()
+        self.w.policy.on_miss()
+        self.failed_before = self.w.policy.failed
+        self.w.unlock = lambda sid, fid: UnlockWatcher.unlock(self.w, sid, fid)  # type: ignore[method-assign]
+
+        def run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            if isinstance(run_result, BaseException):
+                raise run_result
+            return run_result  # type: ignore[return-value]
+
+        self._run_patch = mock.patch.object(fp5_qtee_unlock.subprocess, "run", run)
+        self._run_patch.start()
+        self.addCleanup(self._run_patch.stop)
+
+    def test_loginctl_error_does_not_count_as_a_hit(self) -> None:
+        self._real_unlock(subprocess.CompletedProcess(["loginctl"], 1))
+        proc = FakeProc(["AUTH HIT 1 itype=0x2 avgv=304 fid=1403494260 rc=0\n"])
+        out = self.w.follow("c4", proc, lambda: True, poll_s=0.01)  # type: ignore[arg-type]
+        self.assertEqual(out, "stop")
+        self.assertEqual(self.w._listen_why, "unlock failed")
+        self.assertEqual(self.hits, [])
+        self.assertEqual(self.w.policy.failed, self.failed_before)
+        self.assertEqual(self.unlocked, [])
+
+    def test_loginctl_timeout_does_not_count_as_a_hit(self) -> None:
+        self._real_unlock(subprocess.TimeoutExpired(["loginctl"], 5))
+        proc = FakeProc(["AUTH HIT 1 itype=0x2 avgv=304 fid=1403494260 rc=0\n"])
+        out = self.w.follow("c4", proc, lambda: True, poll_s=0.01)  # type: ignore[arg-type]
+        self.assertEqual(out, "stop")
+        self.assertEqual(self.w._listen_why, "unlock failed")
+        self.assertEqual(self.hits, [])
+        self.assertEqual(self.w.policy.failed, self.failed_before)
+
+    def test_loginctl_oserror_does_not_count_as_a_hit(self) -> None:
+        self._real_unlock(OSError("loginctl missing"))
+        proc = FakeProc(["AUTH HIT 1 itype=0x2 avgv=304 fid=1403494260 rc=0\n"])
+        out = self.w.follow("c4", proc, lambda: True, poll_s=0.01)  # type: ignore[arg-type]
+        self.assertEqual(out, "stop")
+        self.assertEqual(self.w._listen_why, "unlock failed")
+        self.assertEqual(self.hits, [])
+        self.assertEqual(self.w.policy.failed, self.failed_before)
+
+    def test_loginctl_ok_resets_strikes_and_buzzes(self) -> None:
+        self._real_unlock(subprocess.CompletedProcess(["loginctl"], 0))
+        proc = FakeProc(["AUTH HIT 1 itype=0x2 avgv=304 fid=1403494260 rc=0\n"])
+        out = self.w.follow("c4", proc, lambda: True, poll_s=0.01)  # type: ignore[arg-type]
+        self.assertEqual(out, "hit")
+        self.assertEqual(self.hits, ["hit"])
+        self.assertEqual(self.w.policy.failed, 0)
+
     def test_hit_after_panel_off_does_not_unlock(self) -> None:
         proc = FakeProc([
             "AUTH 1 arm mode=1 irq=4\n",
@@ -490,6 +771,67 @@ class FollowTest(unittest.TestCase):
         out = self.w.follow("c4", proc, lambda: False, poll_s=0.01)  # type: ignore[arg-type]
         self.assertEqual(out, "stop")
         self.assertEqual(self.unlocked, [])
+
+    def test_all_zero_miss_keeps_the_session_for_the_next_press(self) -> None:
+        notes: list[str] = []
+        counted: list[int] = []
+
+        def note(text: str) -> None:
+            notes.append(text)
+            counted.append(self.w.policy.failed)
+
+        self.w.note = note  # type: ignore[method-assign]
+        proc = FakeProc([
+            "AUTH 1 arm mode=1 irq=4\n",
+            "AUTH 1 REAL DOWN itype=0x2\n",
+            "REPORT_EV5 qsee: FtVerifySubTemplate() score = 0, matchCnts = 28\n",
+            "AUTH FAIL 1 itype=0x2 esd=0 avgv=274 fid=0 rc=-11\n",
+            "AUTH stay: all-zero miss\n",
+            "AUTH 2 arm mode=1 irq=9\n",
+            "AUTH 2 REAL DOWN itype=0x2\n",
+            "REPORT_EV5 qsee: FtVerifySubTemplate() score = 24, matchCnts = 8\n",
+            "AUTH HIT 2 itype=0x2 avgv=292 fid=1979259351 rc=0\n",
+        ])
+        out = self.w.follow("c4", proc, lambda: True, poll_s=0.01)  # type: ignore[arg-type]
+        self.assertEqual(out, "hit")
+        self.assertEqual(counted, [1])
+        self.assertEqual(self.w.policy.failed, 0)
+        self.assertEqual(self.unlocked, [("c4", 1979259351)])
+        self.assertTrue(any("same session" in n for n in notes))
+        self.assertEqual(self.misses, ["nomatch"])
+
+    def test_nonzero_miss_does_not_keep_the_session(self) -> None:
+        notes: list[str] = []
+        self.w.note = lambda text: notes.append(text)  # type: ignore[method-assign]
+        proc = FakeProc([
+            "AUTH 1 arm mode=1 irq=4\n",
+            "AUTH 1 REAL DOWN itype=0x2\n",
+            "REPORT_EV5 qsee: FtVerifySubTemplate() score = 5, matchCnts = 36\n",
+            "AUTH FAIL 1 itype=0x2 esd=0 avgv=283 fid=0 rc=-11\n",
+            "session_exit:2\n",
+        ], then_exit=True)
+        out = self.w.follow("c4", proc, lambda: True, poll_s=0.01)  # type: ignore[arg-type]
+        self.assertEqual(out, "miss")
+        self.assertEqual(self.w.policy.failed, 1)
+        self.assertEqual(self.unlocked, [])
+        self.assertFalse(any("same session" in n for n in notes))
+
+    def test_lockout_still_stops_an_all_zero_miss(self) -> None:
+        notes: list[str] = []
+        self.w.note = lambda text: notes.append(text)  # type: ignore[method-assign]
+        for _ in range(4):
+            self.w.policy.on_miss()
+        proc = FakeProc([
+            "AUTH 1 arm mode=1 irq=4\n",
+            "REPORT_EV5 qsee: FtVerifySubTemplate() score = 0, matchCnts = 8\n",
+            "AUTH FAIL 1 itype=0x2 esd=0 avgv=274 fid=0 rc=-11\n",
+        ])
+        out = self.w.follow("c4", proc, lambda: True, poll_s=0.01)  # type: ignore[arg-type]
+        self.assertEqual(out, "stop")
+        self.assertEqual(self.w.policy.why_not(), "lockout")
+        self.assertTrue(proc.stopped)
+        self.assertEqual(self.unlocked, [])
+        self.assertFalse(any("same session" in n for n in notes))
 
     def test_exit_without_hit_is_miss(self) -> None:
         proc = FakeProc(
@@ -517,14 +859,106 @@ class FollowTest(unittest.TestCase):
         self.assertEqual(self.w.policy.failed, 4)
         self.assertIsNone(self.w.policy.why_not())
 
-    def test_miss_counts_even_after_panel_off(self) -> None:
+    def test_miss_counts_when_the_screen_was_on(self) -> None:
+        # The seat can unlock as the line arrives. The press still counts.
         proc = FakeProc(
             ["AUTH FAIL 1 itype=0x2 esd=0 avgv=291 fid=0 rc=-11\n", "session_exit:2\n"],
             then_exit=True,
         )
-        self.w.follow("c4", proc, lambda: False, poll_s=0.01)  # type: ignore[arg-type]
+        self.w.follow(  # type: ignore[arg-type]
+            "c4", proc, lambda: False, poll_s=0.01,
+            panel=lambda: True, wake_wait_s=0,
+        )
         self.assertEqual(self.w.policy.failed, 1)
         self.assertEqual(self.misses, [])
+
+    def test_miss_with_panel_off_is_not_a_strike(self) -> None:
+        proc = FakeProc(
+            ["AUTH FAIL 1 itype=0x2 esd=0 avgv=291 fid=0 rc=-11\n", "session_exit:2\n"],
+            then_exit=True,
+        )
+        notes: list[str] = []
+        slept: list[float] = []
+        self.w.note = lambda text: notes.append(text)  # type: ignore[method-assign]
+        self.w.follow(  # type: ignore[arg-type]
+            "c4", proc, lambda: True, poll_s=0.01,
+            panel=lambda: False, wake_wait_s=0, hit_wait_s=4.0,
+            sleep=lambda dt: slept.append(dt), clock=lambda: 0.0,
+        )
+        self.assertEqual(self.w.policy.failed, 0)
+        self.assertEqual(self.misses, [])
+        self.assertEqual(self.unlocked, [])
+        self.assertEqual(slept, [])
+        self.assertTrue(any("panel off" in n for n in notes))
+
+    def test_dark_hit_waits_for_the_panel_without_waking_it(self) -> None:
+        # 21:42Z: AUTH HIT while DSI was still off. The old 1 s wait
+        # dropped the fid and the next listen calibrated again.
+        now = [0.0]
+        on = [False]
+        wakes: list[str] = []
+        self.w.dark_arm = True
+        self.w.wake_panel = lambda: wakes.append("wake")  # type: ignore[method-assign]
+        proc = FakeProc(["AUTH HIT 1 itype=0x2 avgv=305 fid=1558157930 rc=0\n"])
+
+        def sleep(dt: float) -> None:
+            self.assertFalse(proc.stopped)
+            now[0] += dt
+            if now[0] >= 2.0:
+                on[0] = True
+
+        out = self.w.follow(  # type: ignore[arg-type]
+            "c4", proc, lambda: True, poll_s=0.01,
+            panel=lambda: on[0], hit_wait_s=4.0,
+            sleep=sleep, clock=lambda: now[0],
+        )
+        self.assertEqual(out, "hit")
+        self.assertEqual(self.unlocked, [("c4", 1558157930)])
+        self.assertEqual(wakes, [])
+        self.assertGreaterEqual(now[0], 2.0)
+        self.assertLess(now[0], 4.0)
+
+    def test_dark_hit_gives_up_after_four_seconds(self) -> None:
+        now = [0.0]
+        proc = FakeProc(["AUTH HIT 1 itype=0x2 avgv=305 fid=1558157930 rc=0\n"])
+
+        def sleep(dt: float) -> None:
+            self.assertFalse(proc.stopped)
+            now[0] += dt
+
+        out = self.w.follow(  # type: ignore[arg-type]
+            "c4", proc, lambda: True, poll_s=0.01,
+            panel=lambda: False, hit_wait_s=4.0,
+            sleep=sleep, clock=lambda: now[0],
+        )
+        self.assertEqual(out, "stop")
+        self.assertEqual(self.unlocked, [])
+        self.assertGreaterEqual(now[0], 4.0)
+        self.assertLess(now[0], 4.2)
+
+    def test_hit_with_panel_staying_off_does_not_unlock(self) -> None:
+        proc = FakeProc(["AUTH HIT 1 itype=0x2 avgv=304 fid=1403494260 rc=0\n"])
+        out = self.w.follow(  # type: ignore[arg-type]
+            "c4", proc, lambda: True, poll_s=0.01,
+            panel=lambda: False, wake_wait_s=0,
+        )
+        self.assertEqual(out, "stop")
+        self.assertEqual(self.unlocked, [])
+
+    def test_hit_unlocks_when_the_panel_comes_on(self) -> None:
+        calls = [0]
+
+        def panel() -> bool:
+            calls[0] += 1
+            return calls[0] >= 2
+
+        proc = FakeProc(["AUTH HIT 1 itype=0x2 avgv=304 fid=1403494260 rc=0\n"])
+        out = self.w.follow(  # type: ignore[arg-type]
+            "c4", proc, lambda: True, poll_s=0.01,
+            panel=panel, wake_wait_s=1.0,
+        )
+        self.assertEqual(out, "hit")
+        self.assertEqual(self.unlocked, [("c4", 1403494260)])
 
     def test_unknown_lock_state_stops(self) -> None:
         lock = Throttle(60.0, lambda: None)
@@ -577,6 +1011,34 @@ class FollowTest(unittest.TestCase):
         self.assertEqual(self.misses, [])
         self.assertTrue(any("wake press" in n for n in self.notes))
         self.assertFalse(self.w._wake_open)
+
+    def test_wake_nonzero_score_is_a_strike(self) -> None:
+        # 20:18:02Z: one subtemplate scored 5 and the wake rule dropped it.
+        out = self._wake_case([
+            "AUTH 1 arm mode=1 irq=4\n",
+            "AUTH 1 REAL DOWN itype=0x2\n",
+            "REPORT_EV5 qsee: FtVerifySubTemplate() score = 0, matchCnts = 12\n",
+            "REPORT_EV5 qsee: FtVerifySubTemplate() score = 5, matchCnts = 13\n",
+            "AUTH FAIL 1 itype=0x2 esd=0 avgv=259 fid=0 rc=-11\n",
+            "session_exit:2\n",
+        ], [22.0, 22.2], reopen=True)
+        self.assertEqual(out, "miss")
+        self.assertEqual(self.w.policy.failed, 1)
+        self.assertEqual(self.misses, ["nomatch"])
+        self.assertFalse(any("ignored" in n for n in self.notes))
+
+    def test_wake_all_zero_scores_stay_ignored(self) -> None:
+        out = self._wake_case([
+            "AUTH 1 arm mode=1 irq=4\n",
+            "AUTH 1 REAL DOWN itype=0x2\n",
+            "REPORT_EV5 qsee: FtVerifySubTemplate() score = 0, matchCnts = 17\n",
+            "AUTH FAIL 1 itype=0x2 esd=0 avgv=241 fid=0 rc=-11\n",
+            "session_exit:2\n",
+        ], [22.0, 22.2], reopen=True)
+        self.assertEqual(out, "miss")
+        self.assertEqual(self.w.policy.failed, 0)
+        self.assertEqual(self.misses, [])
+        self.assertTrue(any("wake press" in n for n in self.notes))
 
     def test_wake_press_partial_is_silent(self) -> None:
         self._wake_case([
@@ -668,7 +1130,44 @@ class FollowTest(unittest.TestCase):
                 self.assertTrue(self.w.still_wanted("c4", lock))
         self.assertEqual(len(asks), 1)
         with mock.patch.object(fp5_qtee_unlock, "panel_on", lambda: False):
-            self.assertFalse(self.w.still_wanted("c4", lock))
+            # Locked, screen off: keep the sensor armed for the wake press.
+            self.assertTrue(self.w.still_wanted("c4", lock))
+        self.assertEqual(len(asks), 1)
+
+    def test_unlock_before_arm_stops_at_once(self) -> None:
+        notes: list[str] = []
+        self.w.note = lambda text: notes.append(text)  # type: ignore[method-assign]
+        self.w._lock_state = lambda: False
+        self.w._clock = lambda: 0.0  # type: ignore[method-assign]
+        proc = FakeProc(["booting\n"])
+        t0 = time.monotonic()
+        out = self.w.follow("c4", proc, lambda: False, poll_s=0.01)  # type: ignore[arg-type]
+        self.assertEqual(out, "stop")
+        self.assertEqual(self.w._listen_why, "seat unlocked")
+        self.assertFalse(any("holding" in n for n in notes))
+        self.assertLess(time.monotonic() - t0, 1.0)
+
+    def test_armed_flicker_holds_then_stops(self) -> None:
+        ticks = [0.0]
+        calls = [0]
+        notes: list[str] = []
+        self.w.note = lambda text: notes.append(text)  # type: ignore[method-assign]
+        self.w._clock = lambda: ticks[0]  # type: ignore[method-assign]
+        self.w._lock_state = lambda: False
+
+        def wanted() -> bool:
+            calls[0] += 1
+            if calls[0] >= 2:
+                ticks[0] = 2.0
+            return False
+
+        proc = FakeProc(["AUTH 1 arm mode=1 irq=4\n"])
+        t0 = time.monotonic()
+        out = self.w.follow("c4", proc, wanted, poll_s=0.01)  # type: ignore[arg-type]
+        self.assertEqual(out, "stop")
+        self.assertEqual(self.w._listen_why, "seat unlocked")
+        self.assertTrue(any("holding armed session: seat unlocked" in n for n in notes))
+        self.assertLess(time.monotonic() - t0, 1.0)
 
 
 class FakeWarm:
@@ -707,12 +1206,16 @@ class WarmLoopTest(unittest.TestCase):
         self.lock = [True]
         self.lock_asks = 0
         self.w = UnlockWatcher()
-        self.w.policy = UnlockPolicy(require_pin=False, marker=None,
-                                     clock=lambda: self.now[0])
+        state_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(state_dir.cleanup)
+        self.w.policy = UnlockPolicy(
+            require_pin=False, marker=None, clock=lambda: self.now[0],
+            state=Path(state_dir.name) / "fp5-qtee-lockout",
+        )
         self.events: list[tuple] = []
         self.w.notify = lambda text: self.events.append(("notify", text))  # type: ignore[method-assign]
         self.w.note = lambda text: None  # type: ignore[method-assign]
-        self.w.unlock = lambda sid, fid: self.events.append(("unlock", sid, fid))  # type: ignore[method-assign]
+        self.w.unlock = lambda sid, fid: self.events.append(("unlock", sid, fid)) or True  # type: ignore[method-assign]
         self.w.feedback = lambda event: None  # type: ignore[method-assign]
         self.w.tell_hit = lambda: self.events.append(("haptic", "success"))  # type: ignore[method-assign]
         self.w.tell_miss = lambda kind: self.events.append(("miss", kind))  # type: ignore[method-assign]
@@ -808,7 +1311,10 @@ class WarmLoopTest(unittest.TestCase):
         self.assertEqual(self.unlocks(), [])
         self.assertEqual(warm.sent, ["auth", "cancel", "auth"])
         # A hit for the new auth, armed on this wake, unlocks.
-        warm.say(self.HIT, "SERVE result 0", "SERVE idle")
+        warm.say(
+            "AUTH HIT 2 itype=0x2 avgv=304 fid=1403494260 rc=0",
+            "SERVE result 0", "SERVE idle",
+        )
         self.step()
         self.assertEqual(self.unlocks(), [("unlock", "c4", 1403494260)])
 
@@ -851,9 +1357,54 @@ class WarmLoopTest(unittest.TestCase):
         self.step()
         self.assertIn(("miss", "nomatch"), self.events)
         self.assertEqual(warm.sent, ["auth", "auth"])
-        warm.say(self.HIT, "SERVE result 0", "SERVE idle")
+        warm.say(
+            "AUTH HIT 2 itype=0x2 avgv=304 fid=1403494260 rc=0",
+            "SERVE result 0", "SERVE idle",
+        )
         self.step()
         self.assertEqual(self.unlocks(), [("unlock", "c4", 1403494260)])
+
+    def test_stale_hit_number_does_not_unlock(self) -> None:
+        self.step()
+        warm = self.started[0]
+        warm.say("SERVE idle")
+        self.step()
+        self.panel[0] = False
+        self.step()
+        warm.say("AUTH 1 cancelled", "SERVE result 3", "SERVE idle")
+        self.step()
+        self.panel[0] = True
+        self.step()
+        self.assertEqual(warm.sent, ["auth", "cancel", "auth"])
+        warm.say("AUTH HIT 1 itype=0x2 avgv=304 fid=1403494260 rc=0")
+        self.step()
+        self.assertEqual(self.unlocks(), [])
+        warm.say("AUTH HIT 2 itype=0x2 avgv=304 fid=1403494260 rc=0")
+        self.step()
+        self.assertEqual(self.unlocks(), [("unlock", "c4", 1403494260)])
+
+    def test_failed_unlock_does_not_reset_or_buzz(self) -> None:
+        self.w.policy.on_miss()
+        self.w.policy.on_miss()
+        failed = self.w.policy.failed
+        buzzed: list[str] = []
+        self.w.tell_hit = lambda: buzzed.append("hit")  # type: ignore[method-assign]
+        self.w.unlock = lambda sid, fid: UnlockWatcher.unlock(self.w, sid, fid)  # type: ignore[method-assign]
+        self.step()
+        warm = self.started[0]
+        warm.say("SERVE idle")
+        self.step()
+
+        def run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(["loginctl"], 1)
+
+        with mock.patch.object(fp5_qtee_unlock.subprocess, "run", run):
+            warm.say(self.HIT)
+            self.step()
+        self.assertEqual(self.unlocks(), [])
+        self.assertEqual(buzzed, [])
+        self.assertEqual(self.w.policy.failed, failed)
+        self.assertTrue(self.loop.believed_locked)
 
     def test_hit_needs_logind_locked(self) -> None:
         self.step()
@@ -955,7 +1506,7 @@ class WarmLoopTest(unittest.TestCase):
         self.assertEqual(self.unlocks(), [])
         self.assertIn(("miss", "nomatch"), self.events)
 
-    def test_dark_hit_wakes_then_unlocks(self) -> None:
+    def test_dark_hit_unlocks_without_waking_the_panel(self) -> None:
         self.arm_dark()
         self.panel[0] = False
         self.step()
@@ -964,7 +1515,7 @@ class WarmLoopTest(unittest.TestCase):
         self.step()
         warm.say(self.HIT)
         self.step()
-        self.assertEqual(self.wakes, ["wake"])
+        self.assertEqual(self.wakes, [])
         self.assertEqual(self.unlocks(), [("unlock", "c4", 1403494260)])
 
 
@@ -977,7 +1528,7 @@ class DarkDecisionTest(unittest.TestCase):
         self.assertFalse(fp5_qtee_unlock.should_wake_panel(False, False, True))
         self.assertFalse(fp5_qtee_unlock.should_wake_panel(True, False, False))
         self.assertFalse(fp5_qtee_unlock.should_wake_panel(True, True, True))
-        self.assertTrue(fp5_qtee_unlock.should_wake_panel(True, False, True))
+        self.assertFalse(fp5_qtee_unlock.should_wake_panel(True, False, True))
 
     def test_request_panel_on_unblanks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

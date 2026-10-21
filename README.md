@@ -23,8 +23,12 @@ match-on-chip driver for fprintd. See
 [nixos-fairphone-fp5](https://github.com/marcusramberg/nixos-fairphone-fp5),
 his [libfprint fork](https://github.com/marcusramberg/libfprint) (`focaltechqsee`)
 and [fp5-fingerprint-tools](https://github.com/marcusramberg/fp5-fingerprint-tools).
-The core commands agree; some details differ (device id format, enroll
-finger-detect mode, list and save commands) and are worth comparing.
+This repo now reuses parts of that work: FREE_SPI recovery, CANCEL before
+enroll, and his GPL-2.0 kernel patches in `kernel/marcusramberg/`. See
+`docs/ultimate.md` for what came from where.
+The four differences (device id, enroll detect mode, list command, and
+the gallery path and save flag) are settled in `docs/ultimate.md`. This
+phone keeps the path that already matched.
 
 Status: **experimental**. Not an official Fairphone or distribution package.
 
@@ -87,10 +91,26 @@ Invoke buffers are a 1536-byte request and a 2048-byte response. A pair
 of 2048-byte buffers returns `MAXDATA` (`-95`).
 
 `scripts/load-qcomtee.sh` insmods
-`/home/user/fp5-qtee-keep/qcomtee-bridge.ko` (not in this repo). It
-exits 1 on any kernel other than `7.2.0-nfc-test+`, exits 1 when
-`qsee_fingerpr` is loaded, and does nothing when `qcomtee` is already
-loaded. Do not `rmmod` a live `qsee_fingerpr`.
+`/home/user/fp5-qtee-keep/qcomtee-bridge.ko` (not in this repo) on
+`7.2.0-nfc-test+`. On a kernel where qcomtee is built in, `/dev/tee0`
+or `/sys/bus/platform/drivers/qcomtee` is enough and the script prints
+`qcomtee built-in`. That is the 7.2.9 boot: `CONFIG_QCOMTEE=y` and
+`CONFIG_QCOM_TZMEM_MODE_GENERIC=y`. It exits 1 when `qsee_fingerpr` is
+loaded, and does nothing when the module is already loaded. Do not
+`rmmod` a live `qsee_fingerpr`.
+
+The built-in 7.2.9 driver does not load saved templates. `qcomtee-bridge.ko`
+is not the plain upstream driver. At probe it registers a QSEE log
+buffer (`/dev/qsee_log`) and a legacy SCM RPMB listener `0x2000` on a
+tzmem buffer. Its SMC invoke loop serves QTEE's blocked-on-listener
+returns (`0xee02`) for `0x2000` in the kernel, over the UFS RPMB LUN.
+That is why the session's own `0x2000` register returns qret 12 there.
+Mainline qcomtee has neither piece. On 7.2.9 `focal32` answers GPFILE
+command 12, never reads the `misc/..._Alt` store, and every finger
+misses. Registering `0x2000` through mink, or not registering it,
+does not change that. Saved fingers need the 7.2.0 boot with that
+module, or a 7.2.9 qcomtee built with the same RPMB listener and
+invoke loop.
 
 ## Wire format
 
@@ -349,8 +369,8 @@ From the same 2026-10-09 capture, and from the lockout rules in
   PIN is used. The PIN clears the lockout. The PIN is also required
   after boot and at least every 72 h.
 - A partial press does not count. A miss never wakes the screen. Only
-  a hit can unlock, and the panel has to be on or come on within about
-  a second.
+  a hit can unlock, and the panel has to be on or come on within 4 s.
+  The watcher does not turn the panel on.
 - Haptics on the aw86927. A match is one 20 ms pulse, theme event
   `fp5-qtee-match`, magnitude 1.0. A miss is 30 ms on, 100 ms off,
   30 ms on (`fp5-qtee-miss`), so the second pulse starts 130 ms after
@@ -405,8 +425,124 @@ The Phosh pieces only call the session above.
 - `app/fp5-qtee-feedback.json` for the two vibration events.
 - `FP5_QTEE_WARM` and `FP5_QTEE_DARK_ARM` default off. Warm keeps one
   `serve` session and reads `auth`, `cancel`, and `quit` on stdin.
-  Dark-arm may write the backlight `bl_power` file and the DSI `dpms`
-  file on a hit. Neither flag wakes a suspended CPU.
+  Dark-arm does not write the backlight `bl_power` file or the DSI
+  `dpms` file. The power key turns the panel on. Neither flag wakes
+  a suspended CPU.
+
+## Settings
+
+All of these are read from the environment when the watcher starts.
+
+- `FP5_QTEE_REQUIRE_PIN_AFTER_BOOT` defaults on. Set it to `0` to skip
+  the once-per-boot and 72-hour PIN rule. The 5-miss and 20-miss
+  lockout still applies.
+- `FP5_QTEE_HAPTIC` defaults to `1`. Set it to `0` to play no vibration.
+  The waveforms live in `app/fp5_qtee_haptic.py`: one 20 ms pulse on a
+  hit, two 30 ms pulses on a miss.
+- `FP5_QTEE_HAPTIC_PROFILE` overrides the feedbackd profile. `silent`,
+  and a profile that cannot be read, play nothing. When this is unset
+  the player reads the profile from feedbackd.
+- `FP5_QTEE_MISS_EVENT` defaults to `bell-terminal`.
+  `FP5_QTEE_HIT_EVENT` defaults to empty. They name fbcli events for a
+  drop-in. An empty name plays nothing through fbcli. The buzz the
+  watcher plays is the haptic player above, not these names.
+- `FP5_QTEE_WARM=1` keeps one `serve` session. `FP5_QTEE_DARK_ARM=1`
+  arms while the panel is off. Neither turns the panel on, and neither
+  wakes a suspended CPU. `FP5_QTEE_WAKE_GRACE_MS` (default 1000) is how
+  long after arm the first no-match can be the power-key press.
+
+## Lockout state
+
+The PIN mark and the strike count live on tmpfs, so a reboot forgets
+them. That is why the PIN is required again after boot.
+
+The directory is `$XDG_RUNTIME_DIR`, or `/run/user/<uid>` when that
+variable is unset. The files are `fp5-qtee-pin-ok` and
+`fp5-qtee-lockout`, mode `0600`. The PIN file holds `CLOCK_BOOTTIME`.
+
+If that directory is missing there is no state path. Finger unlock
+stays off (`no-state`) until one exists. Strikes are not kept only in
+memory. A state file that cannot be read, a PIN mark with no lockout
+file, or a miss that cannot be saved, locks fingerprint unlock until
+the PIN. Five rejected fingers lock it for 30 seconds. Twenty lock it
+until the PIN.
+
+A locked-to-unlocked change counts as the PIN only after the unlocked
+reading has held for about 2 seconds. A flicker back to locked does
+not. An unlock this watcher just asked for does not count either.
+
+## Install
+
+The pieces on the phone live under `/home/user/fp5-qtee-keep/`:
+`load-qcomtee.sh`, `qcomtee-bridge.ko` (not in this repo),
+`session/fp5-qtee-session`, and `logs/`. The watcher looks for the
+session binary there first.
+
+`app/fp5-qtee-unlock.service` is a user unit. It starts after
+`graphical-session.target` and runs `%h/.local/bin/fp5-qtee-unlock`.
+Enable it for the seat user.
+
+`scripts/fp5-qtee-load.service` is a system unit. This repo does not
+install it. Copy it to `/etc/systemd/system/` and enable it only after
+`/home/user/fp5-qtee-keep/load-qcomtee.sh` is this tree's script. It
+runs that script as root. The script refuses `qsee_fingerpr` and does
+nothing when qcomtee is already loaded or built in.
+
+The watcher and the Finger app call `sudo -n`. The seat user needs a
+sudoers rule with `NOPASSWD` for
+`/home/user/fp5-qtee-keep/load-qcomtee.sh`, for `timeout` in front of
+the session binary (`unlock`, and the Finger app's `enroll` and
+`match`), and for `<session> serve /lib/firmware/qsee`. The boot unit
+is root and does not use sudo.
+
+## SERVE
+
+`fp5-qtee-session serve` stays loaded and waits on stdin. There is no
+poll and no sensor command while it waits.
+
+```
+in:  auth | cancel | quit    (EOF is quit)
+out: SERVE ready             once
+     SERVE idle              before each wait
+     SERVE result <n>        after each auth
+```
+
+`n` is the `auth_once` return code:
+
+| code | meaning |
+| --- | --- |
+| 0 | hit |
+| 2 | miss |
+| 3 | cancelled, even if the finger was down or had matched |
+| 4 | armed, no finger-down in this window |
+| 5 | all-zero miss; re-arm in this process |
+
+A cancelled auth also prints `AUTH <n> cancelled`. `auth` while one
+attempt is running prints `SERVE reject auth busy`. Any other line
+prints `SERVE reject unknown`. `cancel` while idle does nothing.
+
+The warm loop sends one `auth` at a time. It unlocks only when
+`AUTH HIT` prints the same attempt number it just sent.
+
+## Threat model
+
+The trustlet decides the match. The template objects stay in its
+storage. This watcher does not enroll and does not read those objects.
+
+What it does trust is smaller than that. After a hit it runs
+`loginctl unlock-session` as the seat user. The session binary itself
+runs as root through `sudo -n`. The sudoers rule is who may talk to
+the trustlet. A process that can run those commands can unlock the seat.
+
+The PIN rule, the strike count, and the 2 second hold are enforced in
+this user process, using files on the user tmpfs. They stop a forgotten
+strike count and a one-sample flicker. They are not a policy inside
+the trustlet. A missing or unreadable state file fails closed. A person
+who can already replace this process can also skip the check.
+
+A hit does not write the backlight or the panel power files, and it
+does not wake a suspended CPU. The power key does. A miss never
+unlocks.
 
 ## License
 

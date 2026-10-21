@@ -25,15 +25,32 @@ class BootUnitTest(unittest.TestCase):
         self.assertNotIn("INSMOD_OK", proc.stdout + proc.stderr)
         self.assertNotIn("insmod", proc.stdout + proc.stderr)
 
+    def test_plan(self) -> None:
+        def plan(*args: str) -> str:
+            proc = subprocess.run(
+                ["sh", str(SCRIPT), "--plan", *args],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            return proc.stdout.strip()
+
+        # rel fingerpr module tee0 driver class
+        self.assertEqual(plan("7.2.0-nfc-test+", "0", "0", "0", "0", "1"), "insmod")
+        self.assertEqual(plan("7.2.9", "0", "0", "1", "1", "1"), "builtin")
+        self.assertEqual(plan("7.2.9", "1", "0", "1", "1", "1"), "refuse-fingerpr")
+        self.assertEqual(plan("7.2.9", "0", "1", "1", "1", "1"), "already")
+        self.assertEqual(plan("7.2.10", "0", "0", "0", "0", "0"), "refuse-kernel")
+
     def test_script_still_refuses_the_old_driver(self) -> None:
         text = SCRIPT.read_text(encoding="utf-8")
         self.assertIn("7.2.0-nfc-test+", text)
         self.assertIn("qsee_fingerpr is loaded", text)
         self.assertIn("qcomtee already loaded", text)
+        self.assertIn("qcomtee built-in", text)
         self.assertIn("sudo -n", text)
-        self.assertIn('id -u', text)
-        # The kernel check stays ahead of any insmod.
-        self.assertLess(text.index("exit 1"), text.index("insmod"))
+        self.assertIn("id -u", text)
 
     def test_unit_is_a_system_oneshot_and_not_a_user_unit(self) -> None:
         text = UNIT.read_text(encoding="utf-8")

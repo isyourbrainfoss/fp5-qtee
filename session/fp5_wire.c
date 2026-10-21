@@ -39,6 +39,8 @@ uint32_t fp5_op_auth(void) { return 0x2008; }
 
 uint32_t fp5_op_init(void) { return 0x1004; }
 uint32_t fp5_op_init_spi(void) { return 0x1006; }
+uint32_t fp5_op_free_spi(void) { return 0x1007; }
+uint32_t fp5_op_cancel(void) { return 0x2004; }
 uint32_t fp5_op_init_dev(void) { return 0x100b; }
 uint32_t fp5_op_sync(void) { return 0x100d; }
 uint32_t fp5_op_probe(void) { return 0x100a; }
@@ -181,6 +183,18 @@ int fp5_real_down(uint32_t itype, int esd)
 	return itype == 0x2u && !esd;
 }
 
+int fp5_down_at_arm(int saw_itype, uint32_t itype, int esd)
+{
+	if (!saw_itype)
+		return 0;
+	return fp5_real_down(itype, esd);
+}
+
+int fp5_query_on_panel_rise(int was_on, int now_on)
+{
+	return now_on && !was_on;
+}
+
 int fp5_score_sample(uint32_t avgv)
 {
 	return avgv > 0 && avgv < 600;
@@ -268,6 +282,19 @@ int fp5_finger_held(unsigned base, unsigned now, int saw_itype,
 	return fp5_real_down(itype, esd);
 }
 
+int fp5_held_for_retry(int already, unsigned base, unsigned now,
+		       int saw_itype, uint32_t itype, int esd)
+{
+	if (fp5_finger_held(base, now, saw_itype, itype, esd))
+		return 1;
+	/* Already-down consumed the 0x2. The capture report then raises
+	 * irq and the next query is idle 0x0. That is not a lift (0x4).
+	 */
+	if (!already || !saw_itype || esd)
+		return 0;
+	return itype == 0;
+}
+
 int fp5_retry_more(int bursts_done, int held)
 {
 	if (!held)
@@ -277,9 +304,36 @@ int fp5_retry_more(int bursts_done, int held)
 	return 1;
 }
 
+uint32_t fp5_burst_level(const uint32_t *avgv, int n)
+{
+	uint32_t best = 0;
+	int i, lim;
+
+	if (!avgv || n <= 0)
+		return 0;
+	lim = n > 3 ? 3 : n;
+	for (i = 0; i < lim; i++) {
+		if (fp5_score_sample(avgv[i]) && avgv[i] > best)
+			best = avgv[i];
+	}
+	return best;
+}
+
+int fp5_burst_falling(uint32_t first, uint32_t now)
+{
+	if (first == 0 || now == 0 || now >= first)
+		return 0;
+	return first - now >= FP5_FALL_AVGV;
+}
+
 int fp5_press_strikes(int scored_misses)
 {
 	return scored_misses > 0 ? 1 : 0;
+}
+
+int fp5_miss_stays(int scored, int nonzero)
+{
+	return scored > 0 && !nonzero;
 }
 
 /* Parsers stop at end so a token at the end of the buffer is not over-read. */
@@ -460,11 +514,71 @@ int fp5_log_is_score(const char *line)
 	       strstr(line, "score") != NULL;
 }
 
+int fp5_log_score(const char *line, int *score)
+{
+	const char *p;
+	int sign = 1, v = 0, any = 0;
+
+	if (!score || !fp5_log_is_score(line))
+		return 0;
+	p = strstr(line, "score");
+	if (!p)
+		return 0;
+	p = strchr(p, '=');
+	if (!p)
+		return 0;
+	for (p++; *p == ' '; p++)
+		;
+	if (*p == '-') {
+		sign = -1;
+		p++;
+	}
+	while (*p >= '0' && *p <= '9') {
+		any = 1;
+		v = v * 10 + (*p - '0');
+		p++;
+	}
+	if (!any)
+		return 0;
+	*score = sign * v;
+	return 1;
+}
+
+int fp5_log_nonzero_score(const uint8_t *buf, size_t n)
+{
+	size_t i = 0;
+
+	if (!buf)
+		return 0;
+	while (i < n) {
+		size_t a, run;
+		char line[180];
+		int score;
+
+		while (i < n && (buf[i] < 32 || buf[i] >= 127))
+			i++;
+		a = i;
+		while (i < n && buf[i] >= 32 && buf[i] < 127)
+			i++;
+		run = i - a;
+		if (run < 12)
+			continue;
+		if (run > sizeof(line) - 1)
+			run = sizeof(line) - 1;
+		memcpy(line, buf + a, run);
+		line[run] = 0;
+		if (fp5_log_score(line, &score) && score != 0)
+			return 1;
+	}
+	return 0;
+}
+
 int fp5_log_keep(const char *line)
 {
 	static const char *want[] = {
 		"enroll", "Null", "error", "image", "remain", "statistic",
 		"synced", "empty", "pointer", "core:", "trustlet", "authenticat",
+		"template", "loaded", "slot", "new fid", "removing", "fid_list",
 	};
 	int hex = 0, k, i;
 
@@ -491,6 +605,54 @@ int fp5_log_keep(const char *line)
 			return 1;
 	}
 	return 0;
+}
+
+int fp5_gallery_loaded(const uint8_t *buf, size_t n, int *count)
+{
+	const char *base, *end, *p;
+	int found = 0, val = 0;
+
+	if (!buf || !count)
+		return 0;
+	base = (const char *)buf;
+	end = base + n;
+	for (p = base; p < end; p++) {
+		const char *q;
+		int v;
+
+		if ((size_t)(end - p) < 18 || p[0] != 't')
+			continue;
+		if (memcmp(p, "there is ", 9) == 0)
+			q = p + 9;
+		else if ((size_t)(end - p) >= 19 && memcmp(p, "there are ", 10) == 0)
+			q = p + 10;
+		else
+			continue;
+		if (q >= end || *q < '0' || *q > '9')
+			continue;
+		v = 0;
+		while (q < end && *q >= '0' && *q <= '9') {
+			v = v * 10 + (*q - '0');
+			q++;
+			if (v > 20)
+				break;
+		}
+		if (v > 20 || (size_t)(end - q) < 16)
+			continue;
+		if (memcmp(q, " template", 9) != 0)
+			continue;
+		q += 9;
+		if (q < end && *q == 's')
+			q++;
+		if ((size_t)(end - q) < 7 || memcmp(q, " loaded", 7) != 0)
+			continue;
+		val = v;
+		found = 1;
+	}
+	if (!found)
+		return 0;
+	*count = val;
+	return 1;
 }
 
 static const char *const gp_roots[] = {
