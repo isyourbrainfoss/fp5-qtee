@@ -1,0 +1,149 @@
+--- focaltech_fp_life.c.orig	2026-10-21 22:53:19.678446800 +0200
++++ focaltech_fp_life.c	2026-10-21 22:53:47.902217680 +0200
+@@ -35,6 +35,8 @@
+ #include <linux/pinctrl/machine.h>
+ #include <linux/io.h>
+ #include <linux/interconnect.h>
++#include <linux/pm.h>
++#include <linux/pm_wakeup.h>
+ 
+ #define DRV_NAME		"focaltech_fp"
+ #define DEV_NAME		"focaltech_fp"
+@@ -52,6 +54,22 @@
+ #define FF_IOC_GET_IRQ_COUNT	_IOR(FF_IOC_MAGIC, 0x10, unsigned int)
+ 
+ /* Module params for non-DT / software bind */
++/*
++ * Wake from suspend on a finger. GPIO 34 has PDC pin 77 on sc7280
++ * (sc7280_pdc_map), so it can resume deep suspend once enable_irq_wake()
++ * is set. The device is wakeup-capable; power/wakeup in sysfs turns it on
++ * or off ("enabled" at probe when wake_default=1). Suspend arms the IRQ
++ * as a wake source only while it is enabled (listen=1). Each edge reports
++ * a wakeup event that holds the system awake wake_hold_ms, so the unlock
++ * session can read the finger before the next suspend.
++ */
++static bool wake_default = true;
++module_param(wake_default, bool, 0444);
++MODULE_PARM_DESC(wake_default, "power/wakeup enabled at probe (default true)");
++static unsigned int wake_hold_ms = 3000;
++module_param(wake_hold_ms, uint, 0644);
++MODULE_PARM_DESC(wake_hold_ms, "ms a finger edge keeps the system awake (default 3000)");
++
+ static int irq_gpio = 34;
+ module_param(irq_gpio, int, 0644);
+ MODULE_PARM_DESC(irq_gpio, "TLMM GPIO for FP IRQ (default 34)");
+@@ -124,6 +142,9 @@
+ 	bool driver_inited;
+ 	bool spiclk_en;
+ 	atomic_t irq_count;
++	atomic_t wake_count;
++	bool wake_armed;
++	bool suspended;
+ 	struct mutex lock;
+ 	wait_queue_head_t wq;
+ 
+@@ -615,6 +636,12 @@
+ 	static unsigned long last_log_jiffies;
+ 
+ 	n = (unsigned int)atomic_inc_return(&ff->irq_count);
++	if (device_may_wakeup(ff->dev)) {
++		/* hard while suspending: aborts a suspend on its way in */
++		pm_wakeup_dev_event(ff->dev, wake_hold_ms, READ_ONCE(ff->suspended));
++		if (READ_ONCE(ff->suspended))
++			atomic_inc(&ff->wake_count);
++	}
+ 	/* Rate-limit logs — dual-edge storm flooded dmesg (M4c8) */
+ 	if (time_after(jiffies, last_log_jiffies + HZ)) {
+ 		last_log_jiffies = jiffies;
+@@ -739,6 +766,15 @@
+ }
+ static DEVICE_ATTR_RO(irq_count);
+ 
++/* Edges that came in while the system was suspending or suspended. */
++static ssize_t wake_count_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct ff_life *ff = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%u\n", (unsigned int)atomic_read(&ff->wake_count));
++}
++static DEVICE_ATTR_RO(wake_count);
++
+ static ssize_t listen_store(struct device *dev, struct device_attribute *attr,
+ 			    const char *buf, size_t count)
+ {
+@@ -833,6 +869,7 @@
+ 
+ static struct attribute *ff_attrs[] = {
+ 	&dev_attr_irq_count.attr,
++	&dev_attr_wake_count.attr,
+ 	&dev_attr_listen.attr,
+ 	&dev_attr_vdd.attr,
+ 	&dev_attr_spiclk.attr,
+@@ -1106,6 +1143,9 @@
+ 		return ret;
+ 	}
+ 	ff->irq_enabled = false;
++	device_init_wakeup(dev, wake_default);
++	if (!wake_default)
++		device_set_wakeup_capable(dev, true);
+ 
+ 	ret = ff_setup_chardev(ff);
+ 	if (ret) {
+@@ -1131,10 +1171,43 @@
+ 	ff_power(ff, false);
+ 	mutex_unlock(&ff->lock);
+ 	ff_teardown_chardev(ff);
++	device_init_wakeup(&pdev->dev, false);
+ 	g_ff = NULL;
+ 	dev_info(&pdev->dev, "removed\n");
+ }
+ 
++static int ff_suspend(struct device *dev)
++{
++	struct ff_life *ff = dev_get_drvdata(dev);
++
++	WRITE_ONCE(ff->suspended, true);
++	ff->wake_armed = false;
++	if (ff->irq >= 0 && ff->irq_enabled && device_may_wakeup(dev)) {
++		if (!enable_irq_wake(ff->irq))
++			ff->wake_armed = true;
++	}
++	dev_info(dev, "suspend: irq_en=%d wake=%d armed=%d irq_count=%u\n",
++		 ff->irq_enabled, device_may_wakeup(dev), ff->wake_armed,
++		 (unsigned int)atomic_read(&ff->irq_count));
++	return 0;
++}
++
++static int ff_resume(struct device *dev)
++{
++	struct ff_life *ff = dev_get_drvdata(dev);
++
++	if (ff->wake_armed)
++		disable_irq_wake(ff->irq);
++	ff->wake_armed = false;
++	WRITE_ONCE(ff->suspended, false);
++	dev_info(dev, "resume: irq_count=%u wake_count=%u\n",
++		 (unsigned int)atomic_read(&ff->irq_count),
++		 (unsigned int)atomic_read(&ff->wake_count));
++	return 0;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(ff_pm_ops, ff_suspend, ff_resume);
++
+ static const struct of_device_id ff_of_match[] = {
+ 	{ .compatible = "focaltech,fp" },
+ 	{ /* sentinel */ }
+@@ -1147,6 +1220,7 @@
+ 	.driver = {
+ 		.name = DRV_NAME,
+ 		.of_match_table = ff_of_match,
++		.pm = pm_sleep_ptr(&ff_pm_ops),
+ 	},
+ };
+ 
+@@ -1204,4 +1278,4 @@
+ MODULE_LICENSE("GPL");
+ MODULE_AUTHOR("FP5 lab");
+ MODULE_DESCRIPTION("FocalTech FT9362 lab foothold (power/reset/IRQ/SPI-clk/chardev)");
+-MODULE_VERSION("0.7");
++MODULE_VERSION("0.8-wake");

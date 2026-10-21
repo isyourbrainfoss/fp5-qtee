@@ -1760,5 +1760,161 @@ class WarmSessionPipeTest(unittest.TestCase):
         proc.stdout.close()
 
 
+
+class FakeInhibitor:
+    def __init__(self) -> None:
+        self.taken = 0
+        self.released = 0
+
+    def take(self) -> bool:
+        self.taken += 1
+        return True
+
+    def release(self) -> None:
+        self.released += 1
+
+
+class FakeSleepSignals(FakeSignals):
+    def __init__(self) -> None:
+        super().__init__()
+        self.events: list[bool] = []
+
+    def take_sleep_events(self) -> list[bool]:
+        out, self.events = self.events, []
+        return out
+
+
+class TouchWakeTest(WarmLoopTest.__base__):  # type: ignore[misc]
+    HIT = WarmLoopTest.HIT
+    step = WarmLoopTest.step
+    unlocks = WarmLoopTest.unlocks
+
+    def setUp(self) -> None:
+        WarmLoopTest.setUp(self)  # type: ignore[arg-type]
+        self.screen: list[str] = []
+        self.w.screen_on = lambda: self.screen.append("on")  # type: ignore[method-assign]
+        self.sig = FakeSleepSignals()
+
+        def is_locked(sid: str) -> bool | None:
+            return self.lock[0]
+
+        self.loop = WarmLoop(self.w, panel=lambda: self.panel[0],
+                             is_locked=is_locked, clock=lambda: self.now[0],
+                             signals=self.sig,  # type: ignore[arg-type]
+                             dark_arm=True, touch_wake=True)
+        self.loop.nap = lambda s: None
+        self.delay = FakeInhibitor()
+        self.resume = FakeInhibitor()
+        self.loop.delay_lock = self.delay  # type: ignore[assignment]
+        self.loop.resume_lock = self.resume  # type: ignore[assignment]
+
+    def test_dark_hit_unlocks_then_turns_screen_on(self) -> None:
+        self.panel[0] = False
+        self.step()
+        warm = self.started[0]
+        warm.say("SERVE idle")
+        self.step()
+        self.assertEqual(warm.sent, ["auth"])
+        warm.say("AUTH 1 arm mode=1 irq=4", "AUTH 1 REAL DOWN itype=0x2", self.HIT)
+        self.step()
+        self.assertEqual(self.unlocks(), [("unlock", "c4", 1403494260)])
+        self.assertEqual(self.screen, ["on"])
+        self.assertEqual(self.resume.released, 1)
+
+    def test_lit_hit_does_not_call_screen_on(self) -> None:
+        self.step()
+        warm = self.started[0]
+        warm.say("SERVE idle")
+        self.step()
+        warm.say(self.HIT)
+        self.step()
+        self.assertEqual(len(self.unlocks()), 1)
+        self.assertEqual(self.screen, [])
+
+    def test_sleep_arms_idle_session_then_releases_delay_lock(self) -> None:
+        self.panel[0] = False
+        self.step()
+        warm = self.started[0]
+        warm.say("SERVE idle", "SERVE result 3")
+        # A result came in: the session is idle, nothing armed yet.
+        self.loop.drain(False)
+        self.loop.armed = False
+        warm.idle = True
+        warm.say("AUTH 2 arm mode=1 irq=5")
+        self.sig.events = [True]
+        self.step()
+        self.assertIn("auth", warm.sent)
+        self.assertEqual(self.delay.released, 1)
+        self.sig.events = [False]
+        self.step()
+        self.assertEqual(self.delay.taken, 1)
+        self.assertEqual(self.resume.taken, 1)
+
+    def test_sleep_with_no_session_still_releases(self) -> None:
+        self.lock[0] = False
+        self.sig.events = [True]
+        self.step()
+        self.assertEqual(self.delay.released, 1)
+        self.sig.events = [False]
+        self.step()
+        self.assertEqual(self.resume.taken, 0)   # unlocked: no hold
+
+
+class TouchWakeHelpersTest(unittest.TestCase):
+    def test_sleep_signal(self) -> None:
+        f = fp5_qtee_unlock.sleep_signal
+        self.assertTrue(f("/org/freedesktop/login1: org.freedesktop.login1.Manager.PrepareForSleep (true,)"))
+        self.assertFalse(f("/org/freedesktop/login1: org.freedesktop.login1.Manager.PrepareForSleep (false,)"))
+        self.assertIsNone(f("org.freedesktop.login1.Session.Lock ()"))
+
+    def test_inhibit_and_screen_args(self) -> None:
+        a = fp5_qtee_unlock.inhibit_args("delay", None)
+        self.assertEqual(a[:3], ["systemd-inhibit", "--what=sleep", "--mode=delay"])
+        self.assertEqual(a[-2:], ["sleep", "infinity"])
+        self.assertEqual(fp5_qtee_unlock.inhibit_args("block", 6)[-2:], ["sleep", "6"])
+        s = fp5_qtee_unlock.screen_on_args()
+        self.assertIn("org.gnome.ScreenSaver.SetActive", s)
+        self.assertEqual(s[-1], "false")
+
+    def test_inhibitor_take_release(self) -> None:
+        spawned: list[list[str]] = []
+
+        class P:
+            def __init__(self) -> None:
+                self.rc: int | None = None
+
+            def poll(self) -> int | None:
+                return self.rc
+
+            def terminate(self) -> None:
+                self.rc = -15
+
+            def wait(self, timeout: float = 0) -> int:
+                return self.rc or 0
+
+        def spawn(argv: list[str]) -> P:
+            spawned.append(argv)
+            return P()
+
+        inh = fp5_qtee_unlock.Inhibitor("delay", spawn=spawn)  # type: ignore[arg-type]
+        self.assertTrue(inh.take())
+        self.assertTrue(inh.take())
+        self.assertEqual(len(spawned), 1)
+        self.assertTrue(inh.held())
+        inh.release()
+        self.assertFalse(inh.held())
+        inh.take()
+        self.assertEqual(len(spawned), 2)
+
+    def test_lock_signals_collects_sleep_events(self) -> None:
+        sig = fp5_qtee_unlock.LockSignals(["sh", "-c", "echo 'x PrepareForSleep (true,)'; echo 'x PrepareForSleep (false,)'"])
+        for _ in range(50):
+            sig.poll()
+            if len(sig.sleep_events) >= 2:
+                break
+            time.sleep(0.02)
+        self.assertEqual(sig.take_sleep_events(), [True, False])
+        sig.close()
+
 if __name__ == "__main__":
     unittest.main()

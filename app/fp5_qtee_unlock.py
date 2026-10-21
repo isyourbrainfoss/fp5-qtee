@@ -113,6 +113,23 @@ WARM = os.environ.get("FP5_QTEE_WARM", "0") == "1"
 # not patch the kernel. A hit never writes the backlight or DSI power
 # files. The power key turns the panel on. A miss never unlocks.
 DARK_ARM = os.environ.get("FP5_QTEE_DARK_ARM", "0") == "1"
+# Touch-to-wake (fp-wake): needs focaltech_fp_life 0.8-wake, which makes
+# the IRQ a wakeup source (enable_irq_wake on gpio34, PDC pin 77). Implies
+# warm mode and dark arming. A delay inhibitor makes sure the sensor is
+# armed (finger-detect mode) before the system sleeps. FP5_QTEE_WAKE_HOLD_S
+# (default 0, off) adds a short block inhibitor after each locked resume;
+# off because gsd-power does not retry a refused suspend. A hit in the
+# dark unlocks and then asks Phosh to turn the screen on
+# (org.gnome.ScreenSaver.SetActive false).
+WAKE = os.environ.get("FP5_QTEE_WAKE", "0") == "1"
+if WAKE:
+    WARM = True
+SLEEP_ARM_WAIT_S = 1.5
+try:
+    RESUME_HOLD_S = max(0, int(os.environ.get("FP5_QTEE_WAKE_HOLD_S", "0")))
+except ValueError:
+    RESUME_HOLD_S = 0
+_SLEEP_SIGNAL = re.compile(r"PrepareForSleep \((true|false),\)")
 # After the panel goes off, ask LockedHint once a second this many times,
 # so the session can load while the screen is dark. Then stay quiet.
 OFF_LOCK_CHECKS = 10
@@ -165,6 +182,67 @@ def request_panel_on(backlight: Path = BACKLIGHT, drm: Path = DSI_DPMS) -> None:
             path.write_text("on\n")
         except OSError:
             pass
+
+
+def sleep_signal(line: str) -> bool | None:
+    """True for PrepareForSleep(true), False for (false), else None."""
+    match = _SLEEP_SIGNAL.search(line)
+    if match is None:
+        return None
+    return match.group(1) == "true"
+
+
+def screen_on_args() -> list[str]:
+    """Phosh: SetActive(false) turns power save off. Lock state is kept."""
+    return ["gdbus", "call", "--session", "--dest", "org.gnome.ScreenSaver",
+            "--object-path", "/org/gnome/ScreenSaver",
+            "--method", "org.gnome.ScreenSaver.SetActive", "false"]
+
+
+def inhibit_args(mode: str, seconds: int | None) -> list[str]:
+    """systemd-inhibit holding a sleep lock until killed (or seconds)."""
+    hold = ["sleep", "infinity"] if seconds is None else ["sleep", str(seconds)]
+    return ["systemd-inhibit", "--what=sleep", f"--mode={mode}",
+            "--who=fp5-qtee-unlock", "--why=fingerprint touch-to-wake",
+            *hold]
+
+
+class Inhibitor:
+    """One systemd-inhibit child. take() is idempotent; release() kills it."""
+
+    def __init__(self, mode: str, seconds: int | None = None,
+                 spawn: Callable[[list[str]], "subprocess.Popen[bytes]"] | None = None) -> None:
+        self.mode = mode
+        self.seconds = seconds
+        self.proc: subprocess.Popen[bytes] | None = None
+        self._spawn = spawn or (lambda argv: subprocess.Popen(
+            argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL))
+
+    def held(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def take(self) -> bool:
+        if self.held():
+            return True
+        try:
+            self.proc = self._spawn(inhibit_args(self.mode, self.seconds))
+        except OSError:
+            self.proc = None
+            return False
+        return True
+
+    def release(self) -> None:
+        if self.proc is None:
+            return
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(timeout=2)
+        self.proc = None
 
 
 def hit_fid(line: str) -> int | None:
@@ -298,6 +376,7 @@ class LockSignals:
     def __init__(self, argv: list[str] | None = None) -> None:
         self.lines: queue.Queue[str | None] = queue.Queue()
         self.alive = False
+        self.sleep_events: list[bool] = []
         self.proc: subprocess.Popen[str] | None = None
         try:
             self.proc = subprocess.Popen(
@@ -330,7 +409,15 @@ class LockSignals:
                 break
             if lock_signal(line):
                 seen = True
+            ev = sleep_signal(line)
+            if ev is not None:
+                self.sleep_events.append(ev)
         return seen
+
+    def take_sleep_events(self) -> list[bool]:
+        """PrepareForSleep values seen by poll() since the last call."""
+        out, self.sleep_events = self.sleep_events, []
+        return out
 
     def close(self) -> None:
         if self.proc is not None and self.proc.poll() is None:
@@ -929,6 +1016,16 @@ class UnlockWatcher:
             noted = True
         return False, bad_since, noted
 
+    def screen_on(self) -> None:
+        """Ask Phosh to leave power save (screen on). Best effort."""
+        try:
+            proc = subprocess.run(screen_on_args(), check=False, timeout=3,
+                                  stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL)
+            self.note(f"screen on (phosh) exit {proc.returncode}")
+        except (subprocess.TimeoutExpired, OSError):
+            self.note("screen on (phosh) failed")
+
     def wake_panel(self) -> None:
         """Ask the panel to come on. Never called for a miss."""
         request_panel_on()
@@ -1207,7 +1304,14 @@ class UnlockWatcher:
         signals = LockSignals()
         if not signals.alive:
             self.note("no logind signals; polling LockedHint")
-        loop = WarmLoop(self, signals=signals, dark_arm=self.dark_arm)
+        loop = WarmLoop(self, signals=signals, dark_arm=self.dark_arm,
+                        touch_wake=WAKE)
+        if WAKE:
+            loop.delay_lock = Inhibitor("delay")
+            if RESUME_HOLD_S:
+                loop.resume_lock = Inhibitor("block", RESUME_HOLD_S)
+            held = loop.delay_lock.take()
+            self.note(f"touch-to-wake on: delay inhibitor={held} {fp_wake_counts()}")
         try:
             while True:
                 loop.step()
@@ -1215,6 +1319,9 @@ class UnlockWatcher:
         finally:
             loop.stop()
             signals.close()
+            for lock in (loop.delay_lock, loop.resume_lock):
+                if lock is not None:
+                    lock.release()
 
     def run(self) -> None:
         """Listen while the seat is locked, including while the panel is off.
@@ -1389,8 +1496,14 @@ class WarmLoop:
                  clock: Callable[[], float] = time.monotonic,
                  signals: "LockSignals | None" = None,
                  dark_arm: bool = False,
-                 wake: Callable[[], None] | None = None) -> None:
+                 wake: Callable[[], None] | None = None,
+                 touch_wake: bool = False) -> None:
         self.w = watcher
+        self.touch_wake = touch_wake
+        self.nap: Callable[[float], None] = time.sleep
+        self.delay_lock: Inhibitor | None = None
+        self.resume_lock: Inhibitor | None = None
+        self.sleeping = False
         self.signals = signals
         self.panel = panel
         self.is_locked = is_locked
@@ -1564,8 +1677,13 @@ class WarmLoop:
             return
         if should_wake_panel(True, panel, self.dark_arm):
             self.wake()
+        dark = not self.panel()
         if not self.w.unlock(sid, fid):
             return
+        if self.touch_wake and dark:
+            self.w.screen_on()
+        if self.resume_lock is not None:
+            self.resume_lock.release()
         self.w.policy.on_hit()
         self.w.tell_hit()
         self.believed_locked = False
@@ -1587,11 +1705,65 @@ class WarmLoop:
         self.stop()
         self.w._told_reason = None
 
+    def _sleep_events(self) -> None:
+        """PrepareForSleep from logind, only in touch-wake mode."""
+        if not self.touch_wake or self.signals is None:
+            return
+        take = getattr(self.signals, "take_sleep_events", None)
+        if take is None:
+            return
+        for going in take():
+            if going:
+                self.before_sleep()
+            else:
+                self.after_sleep()
+
+    def before_sleep(self) -> None:
+        """Arm the sensor (finger-detect) if locked, then let sleep go on."""
+        self.sleeping = True
+        armed_now = False
+        if self.warm is not None and self.believed_locked:
+            if self.warm.idle and not self.armed:
+                self.arm_now()
+            # Bounded by steps, not self.clock: logind waits at most
+            # InhibitDelayMaxSec (5 s) for the delay lock.
+            for _ in range(int(SLEEP_ARM_WAIT_S / 0.05)):
+                self.drain(False)
+                if self.armed and self.saw_arm:
+                    armed_now = True
+                    break
+                self.nap(0.05)
+            armed_now = armed_now or (self.armed and self.saw_arm)
+        self.w.note(f"sleep: locked={self.believed_locked} "
+                    f"session={self.warm is not None} armed={armed_now}")
+        if self.delay_lock is not None:
+            self.delay_lock.release()
+
+    def after_sleep(self) -> None:
+        self.sleeping = False
+        self.w.note(f"resume: armed={self.armed} {fp_wake_counts()}")
+        if self.resume_lock is not None and self.believed_locked:
+            self.resume_lock.take()
+        if self.delay_lock is not None:
+            self.delay_lock.take()
+
+    def arm_now(self) -> None:
+        warm = self.warm
+        if warm is None:
+            return
+        self.attempt_n += 1
+        self.live_attempt = self.attempt_n
+        warm.send("auth")
+        warm.idle = False
+        self.armed = True
+        self.down_at = None
+
     def step(self) -> None:
         self._step_no += 1
         now = self.clock()
         panel = self.panel()
         signalled = self._signalled()
+        self._sleep_events()
         if panel and self.prev_panel is False:
             self.wake_open = True
             self.arm_at = None
@@ -1674,17 +1846,27 @@ class WarmLoop:
                 return
         if self.w.policy.why_not() is not None:
             return
-        self.attempt_n += 1
-        self.live_attempt = self.attempt_n
-        warm.send("auth")
-        warm.idle = False
-        self.armed = True
-        self.down_at = None
+        self.arm_now()
+
+
+def fp_wake_counts(base: Path = Path("/sys/class/focaltech_fp/focaltech_fp")) -> str:
+    """irq_count/wake_count of the focaltech driver, for the watcher log."""
+    out = []
+    for name in ("irq_count", "wake_count"):
+        try:
+            out.append(f"{name}={(base / name).read_text().strip()}")
+        except OSError:
+            out.append(f"{name}=?")
+    try:
+        out.append("pm_wakeup_irq=" + Path("/sys/power/pm_wakeup_irq").read_text().strip())
+    except OSError:
+        pass
+    return " ".join(out)
 
 
 def main() -> None:
     watcher = UnlockWatcher()
-    watcher.dark_arm = DARK_ARM
+    watcher.dark_arm = DARK_ARM or WAKE
     if WARM:
         watcher.run_warm()
     else:
