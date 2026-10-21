@@ -112,6 +112,45 @@ int fp5_held_for_retry(int already, unsigned base, unsigned now,
 		       int saw_itype, uint32_t itype, int esd);
 /* 1 to capture another burst. Stops at 3, and when the finger has lifted. */
 int fp5_retry_more(int bursts_done, int held);
+/*
+ * Rescan policy of the Android HAL on this phone. Its focaltech config
+ * has common.max_authentication_rescan_times (5 on the July 2026 build;
+ * the C.108 build logs "rescan and try again (n/2)", so 1 + 2 scans) and
+ * common.max_authentication_rescan_timing = 1000 ms. A rescan happens
+ * only while the finger is still down. The HAL has no "falling" rule: on
+ * 2026-10-09 it scored rescans whose avgv fell 221 -> 181 -> 170.
+ * Build-time defaults; a root run may override them with
+ * FP5_QTEE_AUTH_SCANS, FP5_QTEE_RESCAN_MS and FP5_QTEE_SKIP_FALLING
+ * (sudo drops the environment, so the watcher always gets the defaults).
+ */
+#ifndef FP5_AUTH_MAX_SCANS
+#define FP5_AUTH_MAX_SCANS 3
+#endif
+#ifndef FP5_AUTH_RESCAN_MS
+#define FP5_AUTH_RESCAN_MS 1000
+#endif
+#ifndef FP5_SKIP_FALLING
+#define FP5_SKIP_FALLING 0
+#endif
+#define FP5_AUTH_SCANS_MAX 8
+/* Clamp a scan count to 1..FP5_AUTH_SCANS_MAX. */
+int fp5_auth_scans_clamp(long scans);
+/*
+ * 1 to capture another burst: the finger is still down, fewer than
+ * max_scans bursts were captured, and less than budget_ms have passed
+ * since the finger-down. budget_ms <= 0 means no time limit. The first
+ * burst is never a rescan (scans_done 0 returns 0).
+ */
+int fp5_rescan_more(int scans_done, int held, long elapsed_ms,
+		    int max_scans, long budget_ms);
+/*
+ * One timing line: "TIME <which> <event> <ms>[ <extra>]". ms is
+ * monotonic since the session started. The line never starts with
+ * "AUTH", so the watcher's patterns do not see it. Returns the length,
+ * or -1 when it does not fit or event is empty.
+ */
+int fp5_time_line(char *dst, size_t cap, int which, const char *event,
+		  long ms, const char *extra);
 /* Brightest in-range frame of the first 3. 0 when none is in (0, 600). */
 uint32_t fp5_burst_level(const uint32_t *avgv, int n);
 /* A later burst this far below the first burst's level is a lifting

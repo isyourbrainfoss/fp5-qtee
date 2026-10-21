@@ -93,6 +93,71 @@ static void logf(const char *fmt, ...)
 	logl(line);
 }
 
+/*
+ * Monotonic ms since the session started, for TIME lines. The start line
+ * also prints the wall clock, so a TIME line can be put next to the
+ * watcher's unlock-watcher.log stamps.
+ */
+static struct timespec t_start;
+
+static long now_ms(void)
+{
+	struct timespec t;
+
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (long)(t.tv_sec - t_start.tv_sec) * 1000L +
+	       (long)((t.tv_nsec - t_start.tv_nsec) / 1000000L);
+}
+
+static void tlog(int which, const char *event, const char *extra)
+{
+	char line[160];
+
+	if (fp5_time_line(line, sizeof(line), which, event, now_ms(),
+			  extra) > 0)
+		logl(line);
+}
+
+/* Rescan policy. See fp5_wire.h. A root run may override it. */
+static int auth_scans = FP5_AUTH_MAX_SCANS;
+static long auth_rescan_ms = FP5_AUTH_RESCAN_MS;
+static int auth_skip_falling = FP5_SKIP_FALLING;
+
+static long env_long(const char *name, long def, long lo, long hi)
+{
+	const char *v = getenv(name);
+	char *end = NULL;
+	long x;
+
+	if (!v || !*v)
+		return def;
+	x = strtol(v, &end, 10);
+	if (!end || *end || x < lo || x > hi)
+		return def;
+	return x;
+}
+
+static void tune_init(void)
+{
+	char wall[64];
+	struct timespec w;
+
+	clock_gettime(CLOCK_MONOTONIC, &t_start);
+	clock_gettime(CLOCK_REALTIME, &w);
+	auth_scans = fp5_auth_scans_clamp(env_long("FP5_QTEE_AUTH_SCANS",
+						   FP5_AUTH_MAX_SCANS, 1,
+						   FP5_AUTH_SCANS_MAX));
+	auth_rescan_ms = env_long("FP5_QTEE_RESCAN_MS", FP5_AUTH_RESCAN_MS,
+				  0, 10000);
+	auth_skip_falling = (int)env_long("FP5_QTEE_SKIP_FALLING",
+					  FP5_SKIP_FALLING, 0, 1);
+	snprintf(wall, sizeof(wall), "wall=%lld.%03ld",
+		 (long long)w.tv_sec, (long)(w.tv_nsec / 1000000L));
+	tlog(0, "start", wall);
+	logf("TUNE scans=%d rescan_ms=%ld skip_falling=%d", auth_scans,
+	     auth_rescan_ms, auth_skip_falling);
+}
+
 static int read_whole(const char *path, uint8_t **out, size_t *len)
 {
 	FILE *f;
@@ -2075,8 +2140,11 @@ static int auth_press(struct svc *s, int which, unsigned *irq,
 	uint32_t empty_av[3] = { 0, 0, 0 };
 	uint32_t miss_avgv = 0, miss_fid = 0, first_level = 0;
 	int miss_rc = 0;
+	long t_down = now_ms();
+	char ex[48];
 
-	for (burst = 0; burst < 3 && !cut; burst++) {
+	tlog(which, "down", already ? "already=1" : NULL);
+	for (burst = 0; burst < auth_scans && !cut; burst++) {
 		uint32_t av[3] = { 0, 0, 0 };
 		uint32_t fid = 0, level;
 		int fi, matched, verdict, held;
@@ -2092,8 +2160,13 @@ static int auth_press(struct svc *s, int which, unsigned *irq,
 			held = finger_held(s, irq, already);
 			if (held < 0)
 				return -1;
-			if (!fp5_retry_more(burst, held))
+			if (!fp5_rescan_more(burst, held, now_ms() - t_down,
+					     auth_scans, auth_rescan_ms)) {
+				snprintf(ex, sizeof(ex), "scan=%d held=%d",
+					 burst, held);
+				tlog(which, "rescan-stop", ex);
 				break;
+			}
 		}
 		for (fi = 0; fi < 3; fi++) {
 			fp5_capture_fill(s->req + FP5_PAY_OFF, 3, (uint32_t)fi,
@@ -2112,6 +2185,8 @@ static int auth_press(struct svc *s, int which, unsigned *irq,
 		}
 		if (cut)
 			break;
+		snprintf(ex, sizeof(ex), "scan=%d", burst + 1);
+		tlog(which, "caps", ex);
 		if (!fp5_burst_ok(av, 3)) {
 			saw_empty = 1;
 			empty_av[0] = av[0];
@@ -2120,7 +2195,7 @@ static int auth_press(struct svc *s, int which, unsigned *irq,
 			continue;
 		}
 		level = fp5_burst_level(av, 3);
-		if (fp5_burst_falling(first_level, level)) {
+		if (auth_skip_falling && fp5_burst_falling(first_level, level)) {
 			logf("AUTH %d skip falling avgv=%u,%u,%u first=%u",
 			     which, av[0], av[1], av[2], first_level);
 			break;
@@ -2140,6 +2215,7 @@ static int auth_press(struct svc *s, int which, unsigned *irq,
 		    fp5_log_nonzero_score(qsee_delta, qsee_delta_len))
 			nonzero = 1;
 		memcpy(&fid, s->req + FP5_PAY_OFF + 0x10, 4);
+		tlog(which, "report", ex);
 		logf("AUTH %d report rc=%d fid=%u", which, (int)s->last_rc, fid);
 		if (serve_on)
 			serve_poll_cmds();
@@ -2148,6 +2224,7 @@ static int auth_press(struct svc *s, int which, unsigned *irq,
 		if (serve_on)
 			verdict = fp5_att_finish(&serve_att, matched);
 		if (verdict == FP5_ATT_HIT) {
+			tlog(which, "hit", ex);
 			logf("AUTH HIT %d itype=0x%x avgv=%u fid=%u rc=%d", which,
 			     itype, fp5_burst_pick(av, 3), fid, (int)s->last_rc);
 			return 0;
@@ -2163,6 +2240,8 @@ static int auth_press(struct svc *s, int which, unsigned *irq,
 		miss_rc = (int)s->last_rc;
 	}
 	if (fp5_press_strikes(scored)) {
+		snprintf(ex, sizeof(ex), "scans=%d", scored);
+		tlog(which, "fail", ex);
 		logf("AUTH FAIL %d itype=0x%x esd=%d avgv=%u fid=%u rc=%d",
 		     which, itype, esd, miss_avgv, miss_fid, miss_rc);
 		if (fp5_miss_stays(scored, nonzero))
@@ -2170,6 +2249,7 @@ static int auth_press(struct svc *s, int which, unsigned *irq,
 		return FP5_ATT_MISS;
 	}
 	if (saw_empty) {
+		tlog(which, "empty", NULL);
 		logf("AUTH %d empty avgv=%u,%u,%u", which, empty_av[0],
 		     empty_av[1], empty_av[2]);
 		return 2;
@@ -2273,6 +2353,7 @@ static int auth_once(struct svc *s, int which)
 			return FP5_ATT_CANCELLED;
 		}
 	}
+	tlog(which, "arm", NULL);
 	logf("AUTH %d arm mode=%u irq=%u", which, mode, irq);
 	if (send_cmd(s, fp5_op_wmode(), 4, &mode, "WMODE_TOUCH"))
 		return -1;
@@ -2478,6 +2559,7 @@ int main(int argc, char **argv)
 	int rc, i;
 
 	setvbuf(stdout, NULL, _IOLBF, 0);
+	tune_init();
 	{
 		struct sigaction sa;
 

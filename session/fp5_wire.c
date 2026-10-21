@@ -2,6 +2,7 @@
 
 #include <fcntl.h>
 #include <string.h>
+#include <stdio.h>
 
 static uint32_t rd32(const uint8_t *p)
 {
@@ -302,6 +303,44 @@ int fp5_retry_more(int bursts_done, int held)
 	if (bursts_done < 1 || bursts_done >= 3)
 		return 0;
 	return 1;
+}
+
+int fp5_auth_scans_clamp(long scans)
+{
+	if (scans < 1)
+		return 1;
+	if (scans > FP5_AUTH_SCANS_MAX)
+		return FP5_AUTH_SCANS_MAX;
+	return (int)scans;
+}
+
+int fp5_rescan_more(int scans_done, int held, long elapsed_ms,
+		    int max_scans, long budget_ms)
+{
+	if (!held || scans_done < 1)
+		return 0;
+	if (scans_done >= fp5_auth_scans_clamp(max_scans))
+		return 0;
+	if (budget_ms > 0 && elapsed_ms >= budget_ms)
+		return 0;
+	return 1;
+}
+
+int fp5_time_line(char *dst, size_t cap, int which, const char *event,
+		  long ms, const char *extra)
+{
+	int n;
+
+	if (!dst || !cap || !event || !*event)
+		return -1;
+	if (extra && *extra)
+		n = snprintf(dst, cap, "TIME %d %s %ld %s", which, event, ms,
+			     extra);
+	else
+		n = snprintf(dst, cap, "TIME %d %s %ld", which, event, ms);
+	if (n < 0 || (size_t)n >= cap)
+		return -1;
+	return n;
 }
 
 uint32_t fp5_burst_level(const uint32_t *avgv, int n)

@@ -562,6 +562,44 @@ static void test_group(void)
 	expect(fp5_build_group(g, 4, "") == -1, "tiny cap refused");
 }
 
+/* Android HAL rescan policy: scans while held, within the time budget. */
+static void test_rescan_policy(void)
+{
+	char line[64];
+
+	expect(FP5_AUTH_MAX_SCANS == 3, "default is 1 + 2 scans like C.108");
+	expect(FP5_AUTH_RESCAN_MS == 1000, "default budget is the HAL's 1000 ms");
+	expect(FP5_SKIP_FALLING == 0, "the HAL has no falling skip");
+	expect(fp5_auth_scans_clamp(0) == 1, "scans clamp up to 1");
+	expect(fp5_auth_scans_clamp(-4) == 1, "negative scans clamp to 1");
+	expect(fp5_auth_scans_clamp(6) == 6, "6 scans (1 + 5 rescans) kept");
+	expect(fp5_auth_scans_clamp(99) == FP5_AUTH_SCANS_MAX,
+	       "scans clamp down to the max");
+	expect(!fp5_rescan_more(0, 1, 0, 3, 1000), "first burst is not a rescan");
+	expect(fp5_rescan_more(1, 1, 190, 3, 1000), "rescan after one burst");
+	expect(fp5_rescan_more(2, 1, 390, 3, 1000), "rescan after two bursts");
+	expect(!fp5_rescan_more(3, 1, 590, 3, 1000), "three scans is the limit");
+	expect(!fp5_rescan_more(1, 0, 190, 3, 1000), "a lift stops the rescan");
+	expect(!fp5_rescan_more(2, 1, 1000, 6, 1000), "budget spent stops");
+	expect(fp5_rescan_more(5, 1, 999, 6, 1000), "6 scans inside 1000 ms");
+	expect(!fp5_rescan_more(6, 1, 999, 6, 1000), "6 scans is the limit");
+	expect(fp5_rescan_more(2, 1, 5000, 3, 0), "budget 0 has no time limit");
+	expect(fp5_rescan_more(1, 1, 0, 3, 1000) == fp5_retry_more(1, 1),
+	       "defaults keep the old count");
+	expect(fp5_rescan_more(3, 1, 0, 3, 1000) == fp5_retry_more(3, 1),
+	       "defaults keep the old limit");
+
+	expect(fp5_time_line(line, sizeof(line), 2, "down", 1234, NULL) > 0 &&
+	       !strcmp(line, "TIME 2 down 1234"), "time line");
+	expect(fp5_time_line(line, sizeof(line), 2, "report", 1400, "scan=1") > 0 &&
+	       !strcmp(line, "TIME 2 report 1400 scan=1"), "time line extra");
+	expect(strncmp(line, "AUTH", 4) != 0, "time line is not an AUTH line");
+	expect(fp5_time_line(line, 8, 2, "down", 1234, NULL) == -1,
+	       "short buffer refused");
+	expect(fp5_time_line(line, sizeof(line), 2, "", 1, NULL) == -1,
+	       "empty event refused");
+}
+
 int main(void)
 {
 	test_opcodes();
@@ -572,6 +610,7 @@ int main(void)
 	test_time_short_buffer();
 	test_scan_log_tail();
 	test_group();
+	test_rescan_policy();
 	if (fails) {
 		fprintf(stderr, "%d failed\n", fails);
 		return 1;
