@@ -21,6 +21,26 @@ sudo fp5-qtee-session remove /lib/firmware/qsee <fid> --yes-really [--allow-last
 no other session process is left, runs the session (120 s timeout), and
 starts the service again.
 
+## On the phone (2026-10-21, 19:55 UTC)
+
+```
+$ fp5-qtee list
+2 enrolled finger(s) (gallery load logged 2)
+  #0  finger id 1558157930  (group 0, slot 0)
+  #1  finger id 1979259351  (group 0, slot 1)
+```
+
+Raw answer: `status=2 pay 00000002 00000000 5cdf9a6a 00000000 75f919d7 ...`
+(count, then `{gid 0, fid}` twice). `ro_refused=0`: the load asked for
+no write. The sha256 of every file under `/mnt/persist/misc` was the
+same before and after. The unlock service was active again and its next
+session armed (`AUTH 1 arm`).
+
+Stopping `fp5-qtee-unlock.service` does not end the session it started:
+the session runs under `sudo` in its own logind scope. The wrapper
+waits 5 s, then sends that session the SIGTERM its `timeout 1800` would
+send, and waits for it to exit before it opens the trustlet.
+
 ## Opcodes
 
 | Op | id | plen | Source |

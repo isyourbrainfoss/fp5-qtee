@@ -65,10 +65,19 @@ run_session() {
 		trap restart_unit EXIT INT TERM
 		systemctl --user stop "$UNIT"
 	fi
+	# The watcher's session runs under sudo in its own logind scope, so
+	# stopping the unit does not end it. Give it 5 s, then send it the
+	# SIGTERM its own `timeout 1800` would send, and wait for it to go.
+	# pidof matches the program name, not a shell that mentions it.
 	i=0
-	while pgrep -f 'fp5-qtee-session (unlock|serve|enroll|auth)' >/dev/null 2>&1; do
+	while pids=$(pidof fp5-qtee-session 2>/dev/null); do
 		i=$((i + 1))
-		[ "$i" -le 20 ] || die "a session is still running; not opening the trustlet"
+		if [ "$i" = 10 ]; then
+			echo "fp5-qtee: ending the unlock session ($pids)" >&2
+			# shellcheck disable=SC2086
+			sudo -n kill -TERM $pids 2>/dev/null || true
+		fi
+		[ "$i" -le 60 ] || die "a session is still running after 30 s; not opening the trustlet"
 		sleep 0.5
 	done
 	rc=0
