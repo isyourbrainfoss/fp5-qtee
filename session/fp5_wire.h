@@ -268,4 +268,31 @@ void fp5_hat_auth(uint8_t *hat);
 /* PRE_ENROLL challenge at hat+1, token version 0, authenticator type at +0x1c. */
 void fp5_hat_enroll(uint8_t *hat, uint64_t challenge);
 
+/*
+ * Template learning, as the Android HAL does it after every
+ * authentication result (device_event_thread in fingerprint.default.so,
+ * from 0x527b4). The HAL table entry is {0x1015, 0x2e0}
+ * (ff_trustlet_update_template). The payload is zero except:
+ *   +0x2c8, +0x2d0  copied from the report event context (after the TA
+ *                   answered the last 0x1017 report)
+ *   +0x2d8          0x80000 (8 bytes 00 00 08 00 00 00 00 00 at 0x97998)
+ * The TA answers byte +0x2a4 != 0 when the template changed. The HAL then
+ * queues a save with mask 0x60000000 (lazy timer, 5000 ms) that ends in
+ * ff_trustlet_save_data: 0x1014, length 4, payload = mask. 0x1015 alone
+ * changes only the RAM copy.
+ * A report answer with bit 0x40000 at +0x2d8 (byte 0x2d9 bit 2) and rc
+ * 0 or -11 queues a save with mask 0x80000000 (0x51b98).
+ */
+#ifndef FP5_LEARN
+#define FP5_LEARN 1
+#endif
+#define FP5_TPL_PLEN 0x2e0u
+#define FP5_LEARN_SAVE_MASK 0x60000000u
+#define FP5_REPORT_SAVE_MASK 0x80000000u
+uint32_t fp5_op_update_template(void); /* 0x1015 */
+void fp5_tpl_update_fill(uint8_t *pay, uint32_t w2c8, uint32_t w2d0);
+int fp5_tpl_update_changed(const uint8_t *pay);
+uint32_t fp5_tpl_update_stats(const uint8_t *pay);
+int fp5_report_wants_save(const uint8_t *pay, int32_t rc);
+
 #endif

@@ -23,6 +23,7 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/epoll.h>
 
 /*
  * QTEE sendRequest returned MAXDATA (-95) for both 0x78000 and 8K/16K.
@@ -310,57 +311,149 @@ static int serve_poll_cmds(void)
 }
 
 /*
- * One 20 ms step of a finger wait in serve mode. Returns 1 when the
- * wait should end because of a command. If the driver calls
- * sysfs_notify on irq_count, POLLPRI ends the step early. If it does
- * not, the step simply times out, as usleep did.
+ * Finger waits block on the driver's interrupt. /dev/focaltech_fp wakes
+ * its wait queue on every edge, but its poll is level (ready whenever
+ * irq_count > 0), so it is registered edge-triggered with epoll: each
+ * epoll_wait returns once per new wake. irq_count is still what decides;
+ * the wake only ends the sleep early. In serve mode stdin is in the same
+ * epoll set, so a command also ends it. Without the device, or after
+ * FP5_IRQ_SPURIOUS wakes in a row that changed nothing, the wait falls
+ * back to FP5_IRQ_POLL_MS polling of irq_count (20 ms before).
  */
-static int serve_wait_step(int ms)
-{
-	struct pollfd p[2];
-	int np = 1;
+#ifndef FP5_IRQ_POLL_MS
+#define FP5_IRQ_POLL_MS 5
+#endif
+#ifndef FP5_IRQ_SPURIOUS
+#define FP5_IRQ_SPURIOUS 64
+#endif
+#define FP5_IRQ_DEV "/dev/focaltech_fp"
+static int irq_ep = -1;
+static int irq_dev = -1;
+static int irq_ep_stdin;
+static int irq_spurious;
 
-	p[0].fd = 0;
-	p[0].events = POLLIN;
-	p[0].revents = 0;
-	if (irq_fd >= 0) {
-		p[1].fd = irq_fd;
-		p[1].events = POLLPRI | POLLERR;
-		p[1].revents = 0;
-		np = 2;
+static void irq_ep_close(const char *why)
+{
+	if (irq_ep >= 0)
+		close(irq_ep);
+	if (irq_dev >= 0)
+		close(irq_dev);
+	irq_ep = irq_dev = -1;
+	irq_ep_stdin = 0;
+	if (why)
+		logf("IRQWAIT poll %dms (%s)", FP5_IRQ_POLL_MS, why);
+}
+
+static void irq_ep_open(void)
+{
+	struct epoll_event ev, out[4];
+
+	if (irq_ep >= 0)
+		return;
+	irq_dev = open(FP5_IRQ_DEV, O_RDONLY | O_CLOEXEC);
+	if (irq_dev < 0) {
+		logf("IRQWAIT poll %dms (open %s: %s)", FP5_IRQ_POLL_MS,
+		     FP5_IRQ_DEV, strerror(errno));
+		return;
 	}
-	if (poll(p, (nfds_t)np, ms) > 0 && (p[0].revents & (POLLIN | POLLHUP)))
-		return serve_poll_cmds();
-	return serve_att.cancelled;
+	irq_ep = epoll_create1(EPOLL_CLOEXEC);
+	if (irq_ep < 0) {
+		irq_ep_close("epoll_create1");
+		return;
+	}
+	memset(&ev, 0, sizeof(ev));
+	ev.events = EPOLLIN | EPOLLET;
+	ev.data.fd = irq_dev;
+	if (epoll_ctl(irq_ep, EPOLL_CTL_ADD, irq_dev, &ev)) {
+		irq_ep_close("epoll_ctl");
+		return;
+	}
+	/* The add reports a count > 0 once. Take it now. */
+	while (epoll_wait(irq_ep, out, 4, 0) > 0)
+		;
+	irq_spurious = 0;
+	logl("IRQWAIT epoll " FP5_IRQ_DEV);
+}
+
+static void irq_ep_watch_stdin(void)
+{
+	struct epoll_event ev;
+
+	if (irq_ep < 0 || irq_ep_stdin)
+		return;
+	memset(&ev, 0, sizeof(ev));
+	ev.events = EPOLLIN;
+	ev.data.fd = 0;
+	if (epoll_ctl(irq_ep, EPOLL_CTL_ADD, 0, &ev) == 0)
+		irq_ep_stdin = 1;
+	else
+		irq_ep_close("stdin not pollable");
+}
+
+/* Sleep at most ms. 2 when stdin has input (serve), 1 on a device wake, 0 else. */
+static int irq_sleep(int ms)
+{
+	if (irq_ep >= 0) {
+		struct epoll_event out[4];
+		int n, i, r = 0;
+
+		n = epoll_wait(irq_ep, out, 4, ms);
+		for (i = 0; i < n; i++) {
+			if (out[i].data.fd == 0)
+				r = 2;
+			else if (r == 0)
+				r = 1;
+		}
+		return r;
+	}
+	if (serve_on) {
+		struct pollfd p = { .fd = 0, .events = POLLIN };
+
+		if (ms > FP5_IRQ_POLL_MS)
+			ms = FP5_IRQ_POLL_MS;
+		if (poll(&p, 1, ms) > 0 && (p.revents & (POLLIN | POLLHUP)))
+			return 2;
+		return 0;
+	}
+	if (ms > FP5_IRQ_POLL_MS)
+		ms = FP5_IRQ_POLL_MS;
+	usleep((useconds_t)ms * 1000);
+	return 0;
+}
+
+static int irq_changed(unsigned *prev, unsigned now)
+{
+	if (serve_on)
+		return fp5_att_irq(&serve_att, now);
+	return now != *prev;
 }
 
 static int wait_irq(unsigned *prev, int ms)
 {
 	while (ms > 0) {
 		unsigned now;
+		long t0;
+		int r;
 
-		if (serve_on) {
-			/* stdin first: a cancel that is already here wins over
-			 * an irq change that is also already here. */
-			if (serve_poll_cmds())
-				return 0;
-			now = read_irq();
-			if (fp5_att_irq(&serve_att, now)) {
-				*prev = now;
-				return 1;
-			}
-			if (serve_wait_step(20))
-				return 0;
-			ms -= 20;
-			continue;
-		}
+		/* stdin first: a cancel that is already here wins over
+		 * an irq change that is also already here. */
+		if (serve_on && serve_poll_cmds())
+			return 0;
 		now = read_irq();
-		if (now != *prev) {
+		if (irq_changed(prev, now)) {
 			*prev = now;
+			irq_spurious = 0;
 			return 1;
 		}
-		usleep(20 * 1000);
-		ms -= 20;
+		t0 = now_ms();
+		r = irq_sleep(ms);
+		if (r == 2 && serve_poll_cmds())
+			return 0;
+		if (r == 1 && read_irq() == now &&
+		    ++irq_spurious >= FP5_IRQ_SPURIOUS)
+			irq_ep_close("spurious wakes");
+		t0 = now_ms() - t0;
+		ms -= t0 < 1 ? 1 : (int)t0;
 	}
 	return 0;
 }
@@ -457,6 +550,10 @@ static int sensor_on(void)
 			pid_t pid = fork();
 
 			if (pid == 0) {
+				sigset_t none;
+
+				sigemptyset(&none);
+				sigprocmask(SIG_SETMASK, &none, NULL);
 				execl("/sbin/insmod", "insmod", ko, "auto_spiclk=1",
 				      (char *)NULL);
 				execl("/usr/sbin/insmod", "insmod", ko, "auto_spiclk=1",
@@ -1069,9 +1166,34 @@ static void dump_runs(const char *tag, const uint8_t *buf, size_t n)
 static void qsee_log_apply(const char *tag, struct fp5_log *dst);
 static void qsee_dump_delta(const char *tag);
 
+/* Microseconds spent inside the TEE invoke and in all of send_cmd. */
+static long long cmd_tee_us, cmd_all_us;
+
+static long long mono_us(void)
+{
+	struct timespec t;
+
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (long long)t.tv_sec * 1000000LL + t.tv_nsec / 1000;
+}
+
+static int send_cmd_inner(struct svc *s, uint32_t cmd, uint32_t plen,
+			  const void *pay, const char *tag);
+
 static int send_cmd(struct svc *s, uint32_t cmd, uint32_t plen, const void *pay,
 		    const char *tag)
 {
+	long long t0 = mono_us();
+	int rc = send_cmd_inner(s, cmd, plen, pay, tag);
+
+	cmd_all_us += mono_us() - t0;
+	return rc;
+}
+
+static int send_cmd_inner(struct svc *s, uint32_t cmd, uint32_t plen,
+			  const void *pay, const char *tag)
+{
+	long long t_inv;
 	struct tee_param_view p[10];
 	struct fp5_shm capmem;
 	uint32_t qret = 0, is64 = 0, i, cap_off = FP5_PAY_OFF;
@@ -1136,7 +1258,9 @@ static int send_cmd(struct svc *s, uint32_t cmd, uint32_t plen, const void *pay,
 			logf("%s embed off=0x%x", tag, cap_off);
 		}
 	}
+	t_inv = mono_us();
 	rc = fp5_tee_invoke(&s->tee, s->app, 0, p, 10, &qret);
+	cmd_tee_us += mono_us() - t_inv;
 	if (rc || qret) {
 		logf("%s invoke rc=%d qret=0x%x errno=%d", tag, rc, qret, errno);
 		if (have_cap)
@@ -1190,6 +1314,14 @@ static int send_cmd(struct svc *s, uint32_t cmd, uint32_t plen, const void *pay,
  * satisfy this one.
  */
 #define QSEE_LOG_CAP (128u * 1024u)
+/* 1: scan the whole ring on every command (full_avg/full_ity). */
+#ifndef FP5_QSEE_FULL
+#define FP5_QSEE_FULL 0
+#endif
+/* 1: run the 30 ms /tmp/fp5-qtee/watch.txt reader in unlock mode too. */
+#ifndef FP5_QSEE_WATCH
+#define FP5_QSEE_WATCH 0
+#endif
 #define QSEE_LOG_HDR 8u
 
 static uint8_t *qsee_buf;
@@ -1425,7 +1557,10 @@ static void qsee_log_apply(const char *tag, struct fp5_log *dst)
 		return;
 	memcpy(&wrap, qsee_buf, 4);
 	memcpy(&off, qsee_buf + 4, 4);
-	fp5_scan_log(qsee_buf, (size_t)n, &full);
+	/* The whole 128 KiB ring only feeds the log line. Commands need
+	   the delta. */
+	if (FP5_QSEE_FULL || !qsee_armed)
+		fp5_scan_log(qsee_buf, (size_t)n, &full);
 	prev_w = qsee_wrap;
 	prev_o = qsee_off;
 	if (!qsee_armed) {
@@ -2311,6 +2446,169 @@ static int finger_held(struct svc *s, unsigned *irq, int already)
 }
 
 /*
+ * Android's post-auth learning (see fp5_wire.h). One 0x1015 per press
+ * result, hit or scored miss; the TA decides whether the template
+ * changed. A change, or a report that asked for one, is saved at once
+ * with 0x1014 and the HAL's mask. Android waits 5 s first and the watcher
+ * quits a warm session within about a second of an unlock, so the save
+ * runs here, after AUTH HIT is already on stdout.
+ */
+static uint32_t learn_pending;
+
+/*
+ * The watcher SIGTERMs a cold unlock process as soon as the seat
+ * unlocks, which is while the learn save may be writing. A TERM that
+ * comes in during learn_after waits for it to finish, then ends the
+ * process the default way.
+ */
+static volatile sig_atomic_t learn_busy, term_pending;
+static sigset_t term_set;
+
+static void term_now(int sig)
+{
+	signal(sig, SIG_DFL);
+	pthread_sigmask(SIG_UNBLOCK, &term_set, NULL);
+	raise(sig);
+}
+
+/*
+ * TERM, HUP and INT are blocked in every thread (main blocks them before
+ * any thread starts) and taken here with sigwait, so no TEE ioctl ever
+ * sees EINTR. Outside learn_after they end the process as before.
+ */
+static void *term_main(void *arg)
+{
+	(void)arg;
+	for (;;) {
+		int sig = 0;
+
+		if (sigwait(&term_set, &sig))
+			continue;
+		if (learn_busy) {
+			term_pending = sig;
+			continue;
+		}
+		term_now(sig);
+	}
+	return NULL;
+}
+
+static void term_setup(void)
+{
+	pthread_t t;
+
+	sigemptyset(&term_set);
+	sigaddset(&term_set, SIGTERM);
+	sigaddset(&term_set, SIGHUP);
+	sigaddset(&term_set, SIGINT);
+	if (pthread_sigmask(SIG_BLOCK, &term_set, NULL))
+		return;
+	if (pthread_create(&t, NULL, term_main, NULL)) {
+		pthread_sigmask(SIG_UNBLOCK, &term_set, NULL);
+		return;
+	}
+	pthread_detach(t);
+}
+
+static void learn_hold(void)
+{
+	learn_busy = 1;
+}
+
+static void learn_release(void)
+{
+	learn_busy = 0;
+	if (term_pending) {
+		logf("LEARN done; taking deferred signal %d", (int)term_pending);
+		term_now(term_pending);
+	}
+}
+
+static int learn_save(struct svc *s, int which, uint32_t mask)
+{
+	struct timespec a, b;
+	long ms;
+	uint32_t cmd;
+	uint16_t result;
+	int valid, tmpl, pers;
+
+	memset(s->req + FP5_PAY_OFF, 0, 0x230);
+	memcpy(s->req + FP5_PAY_OFF, &mask, 4);
+	pthread_mutex_lock(&s->mu);
+	s->last_rpmb_cmd = 0;
+	s->last_rpmb_valid = 0;
+	s->template_write = 0;
+	s->persist_write = 0;
+	pthread_mutex_unlock(&s->mu);
+	clock_gettime(CLOCK_MONOTONIC, &a);
+	if (send_cmd(s, fp5_op_save(), 4, NULL, "LEARN_SAVE"))
+		return -1;
+	clock_gettime(CLOCK_MONOTONIC, &b);
+	ms = (b.tv_sec - a.tv_sec) * 1000 + (b.tv_nsec - a.tv_nsec) / 1000000;
+	pthread_mutex_lock(&s->mu);
+	cmd = s->last_rpmb_cmd;
+	result = s->last_rpmb_result;
+	valid = s->last_rpmb_valid;
+	tmpl = s->template_write;
+	pers = s->persist_write;
+	pthread_mutex_unlock(&s->mu);
+	logf("LEARN %d save mask=0x%x rc=%d ms=%ld rpmb_cmd=0x%x rpmb_result=0x%x valid=%d template=%d persist=%d name=%s",
+	     which, mask, (int)s->last_rc, ms, cmd, result, valid, tmpl, pers,
+	     s->template_name);
+	return 0;
+}
+
+static int learn_after_inner(struct svc *s, int which, int hit,
+			     uint32_t w2c8, uint32_t w2d0);
+
+static int learn_after(struct svc *s, int which, int hit, uint32_t w2c8,
+		       uint32_t w2d0)
+{
+	int rc;
+
+	if (!FP5_LEARN)
+		return 0;
+	learn_hold();
+	rc = learn_after_inner(s, which, hit, w2c8, w2d0);
+	learn_release();
+	return rc;
+}
+
+static int learn_after_inner(struct svc *s, int which, int hit,
+			     uint32_t w2c8, uint32_t w2d0)
+{
+	uint8_t *pay = s->req + FP5_PAY_OFF;
+	int changed = 0;
+	uint32_t stats = 0, mask;
+	char ex[48];
+
+	if (!FP5_LEARN)
+		return 0;
+	fp5_tpl_update_fill(pay, w2c8, w2d0);
+	if (send_cmd(s, fp5_op_update_template(), FP5_TPL_PLEN, NULL,
+		     "TPL_UPDATE"))
+		return -1;
+	if (s->last_rc == 0) {
+		changed = fp5_tpl_update_changed(pay);
+		stats = fp5_tpl_update_stats(pay);
+	}
+	logf("LEARN %d update hit=%d rc=%d changed=%d stats=%u in=%u,%u",
+	     which, hit, (int)s->last_rc, changed, stats, w2c8, w2d0);
+	if (changed)
+		learn_pending |= FP5_LEARN_SAVE_MASK;
+	mask = learn_pending;
+	learn_pending = 0;
+	snprintf(ex, sizeof(ex), "changed=%d mask=0x%x", changed, mask);
+	tlog(which, "learn", ex);
+	if (!mask)
+		return 0;
+	if (learn_save(s, which, mask))
+		return -1;
+	tlog(which, "learn-saved", NULL);
+	return 0;
+}
+
+/*
  * Up to three 3-frame bursts while the finger stays down. The first hit
  * returns at once. Scored misses share one AUTH FAIL, so the watcher adds
  * one strike. Bursts with no in-range frame are not reported; if every
@@ -2324,11 +2622,13 @@ static int auth_press(struct svc *s, int which, unsigned *irq,
 	uint32_t empty_av[3] = { 0, 0, 0 };
 	uint32_t miss_avgv = 0, miss_fid = 0, first_level = 0;
 	int miss_rc = 0;
+	uint32_t rep_2c8 = 3, rep_2d0 = 0;
 	long t_down = now_ms();
-	char ex[48];
+	char ex[80];
 
 	tlog(which, "down", already ? "already=1" : NULL);
 	for (burst = 0; burst < auth_scans && !cut; burst++) {
+		long long tee0 = cmd_tee_us, all0 = cmd_all_us;
 		uint32_t av[3] = { 0, 0, 0 };
 		uint32_t fid = 0, level;
 		int fi, matched, verdict, held;
@@ -2369,8 +2669,10 @@ static int auth_press(struct svc *s, int which, unsigned *irq,
 		}
 		if (cut)
 			break;
-		snprintf(ex, sizeof(ex), "scan=%d", burst + 1);
+		snprintf(ex, sizeof(ex), "scan=%d tee=%lld cmd=%lld", burst + 1,
+			 (cmd_tee_us - tee0) / 1000, (cmd_all_us - all0) / 1000);
 		tlog(which, "caps", ex);
+		snprintf(ex, sizeof(ex), "scan=%d", burst + 1);
 		if (!fp5_burst_ok(av, 3)) {
 			saw_empty = 1;
 			empty_av[0] = av[0];
@@ -2399,6 +2701,14 @@ static int auth_press(struct svc *s, int which, unsigned *irq,
 		    fp5_log_nonzero_score(qsee_delta, qsee_delta_len))
 			nonzero = 1;
 		memcpy(&fid, s->req + FP5_PAY_OFF + 0x10, 4);
+		memcpy(&rep_2c8, s->req + FP5_PAY_OFF + 0x2c8, 4);
+		memcpy(&rep_2d0, s->req + FP5_PAY_OFF + 0x2d0, 4);
+		if (FP5_LEARN && fp5_report_wants_save(s->req + FP5_PAY_OFF,
+						       s->last_rc)) {
+			learn_pending |= FP5_REPORT_SAVE_MASK;
+			logf("AUTH %d report asks save 0x%x", which,
+			     FP5_REPORT_SAVE_MASK);
+		}
 		tlog(which, "report", ex);
 		logf("AUTH %d report rc=%d fid=%u", which, (int)s->last_rc, fid);
 		if (serve_on)
@@ -2411,6 +2721,8 @@ static int auth_press(struct svc *s, int which, unsigned *irq,
 			tlog(which, "hit", ex);
 			logf("AUTH HIT %d itype=0x%x avgv=%u fid=%u rc=%d", which,
 			     itype, fp5_burst_pick(av, 3), fid, (int)s->last_rc);
+			if (learn_after(s, which, 1, rep_2c8, rep_2d0))
+				return -1;
 			return 0;
 		}
 		if (verdict == FP5_ATT_CANCELLED) {
@@ -2428,6 +2740,8 @@ static int auth_press(struct svc *s, int which, unsigned *irq,
 		tlog(which, "fail", ex);
 		logf("AUTH FAIL %d itype=0x%x esd=%d avgv=%u fid=%u rc=%d",
 		     which, itype, esd, miss_avgv, miss_fid, miss_rc);
+		if (learn_after(s, which, 0, rep_2c8, rep_2d0))
+			return -1;
 		if (fp5_miss_stays(scored, nonzero))
 			return FP5_ATT_AGAIN;
 		return FP5_ATT_MISS;
@@ -2676,6 +2990,8 @@ static int serve_loop(struct svc *s)
 
 	irq_fd = open(IRQ_COUNT, O_RDONLY | O_CLOEXEC);
 	serve_on = 1;
+	irq_ep_open();
+	irq_ep_watch_stdin();
 	if (set_group(s, group_path())) {
 		rc = 1;
 		goto out;
@@ -2752,6 +3068,8 @@ int main(int argc, char **argv)
 		memset(&sa, 0, sizeof(sa));
 		sa.sa_handler = sigusr1_nop;
 		sigaction(SIGUSR1, &sa, NULL);
+		if (FP5_LEARN)
+			term_setup();
 	}
 	if (!strcmp(mode, "list")) {
 		persist_ro = 1;
@@ -2792,7 +3110,7 @@ int main(int argc, char **argv)
 	}
 	/* The watch thread reads /dev/qsee_log every 30 ms for a debug
 	 * file. A serve session can idle for hours, so it goes without. */
-	if (strcmp(mode, "serve"))
+	if (FP5_QSEE_WATCH && strcmp(mode, "serve"))
 		watch_on = pthread_create(&watch_thr, NULL, qsee_watch_main, NULL) == 0;
 	while (!s.ready)
 		usleep(1000);
@@ -2937,6 +3255,7 @@ int main(int argc, char **argv)
 		 */
 		int a = FP5_ATT_NONE, n = 0;
 
+		irq_ep_open();
 		if (set_group(&s, group_path())) {
 			rc = 1;
 			goto done;

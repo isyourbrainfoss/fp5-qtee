@@ -34,6 +34,7 @@ uint32_t fp5_op_pre_enroll(void) { return 0x2000; }
 uint32_t fp5_op_enroll(void) { return 0x2001; }
 uint32_t fp5_op_save(void) { return 0x1014; }
 uint32_t fp5_save_flag(void) { return 0x40000000u; }
+uint32_t fp5_op_update_template(void) { return 0x1015; }
 uint32_t fp5_wmode_detect(void) { return 9; }
 uint32_t fp5_wmode_touch(void) { return 1; }
 uint32_t fp5_op_auth(void) { return 0x2008; }
@@ -531,7 +532,14 @@ int fp5_sync_config(char *dst, size_t cap, int native_log)
 		     "\"enrolling_overlap_intervals\":\"0x54A0\","
 		     "\"enable_duplicated_finger_checking\":true,"
 		     "\"min_identify_quality_threshold\":40,"
-		     "\"min_identify_coverage_threshold\":70},"
+		     "\"min_identify_coverage_threshold\":70,"
+		     /* Android's learning settings (HAL config dump). */
+		     "\"enable_template_learning\":%s,"
+		     "\"template_update_threshold\":50,"
+		     "\"max_sub_template_num\":48,"
+		     "\"enable_post_calib_learning\":%s,"
+		     "\"enable_prep_calib_learning\":false,"
+		     "\"calib_update_threshold\":50},"
 		     "\"diagnosis\":{\"framework_log_level\":1,"
 		     "\"firmware_log_level\":3,"
 		     "\"algorithm_log_level\":2,"
@@ -539,6 +547,8 @@ int fp5_sync_config(char *dst, size_t cap, int native_log)
 		     "\"enable_logcat_trustlet\":true,"
 		     "\"enable_trustlet_native_log\":%s,"
 		     "\"enable_logcat_spi_data\":false}}",
+		     FP5_LEARN ? "true" : "false",
+		     FP5_LEARN ? "true" : "false",
 		     native_log ? "true" : "false");
 	if (n < 0 || (size_t)n >= cap)
 		return -1;
@@ -1034,4 +1044,31 @@ void fp5_hat_enroll(uint8_t *hat, uint64_t challenge)
 	memcpy(hat + 1, &challenge, 8);
 	hat[0x1c] = 2;
 	hat[0x49] = 1;
+}
+
+void fp5_tpl_update_fill(uint8_t *pay, uint32_t w2c8, uint32_t w2d0)
+{
+	memset(pay, 0, FP5_TPL_PLEN);
+	wr32(pay + 0x2c8, w2c8);
+	wr32(pay + 0x2d0, w2d0);
+	wr32(pay + 0x2d8, 0x80000u);
+	wr32(pay + 0x2dc, 0);
+	pay[0x2a4] = 0;
+}
+
+int fp5_tpl_update_changed(const uint8_t *pay)
+{
+	return pay[0x2a4] != 0;
+}
+
+uint32_t fp5_tpl_update_stats(const uint8_t *pay)
+{
+	return rd32(pay + 0x2a8);
+}
+
+int fp5_report_wants_save(const uint8_t *pay, int32_t rc)
+{
+	if (rc != 0 && rc != -11)
+		return 0;
+	return (pay[0x2d9] & 0x4) != 0;
 }

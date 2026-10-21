@@ -600,6 +600,51 @@ static void test_rescan_policy(void)
 	       "empty event refused");
 }
 
+static void test_template_learning(void)
+{
+	uint8_t pay[FP5_TPL_PLEN];
+	char cfg[2048];
+
+	expect(fp5_op_update_template() == 0x1015, "update opcode 0x1015");
+	memset(pay, 0xa5, sizeof(pay));
+	fp5_tpl_update_fill(pay, 3, 7);
+	expect(*(uint32_t *)(pay + 0x2c8) == 3, "update +0x2c8 from report");
+	expect(*(uint32_t *)(pay + 0x2d0) == 7, "update +0x2d0 from report");
+	expect(*(uint32_t *)(pay + 0x2d8) == 0x80000, "update +0x2d8 0x80000");
+	expect(*(uint32_t *)(pay + 0x2dc) == 0, "update +0x2dc 0");
+	expect(*(uint32_t *)(pay + 0) == 0 && *(uint32_t *)(pay + 4) == 0,
+	       "update head zero");
+	expect(pay[0x2a4] == 0 && !fp5_tpl_update_changed(pay), "no change yet");
+	{
+		uint8_t req[FP5_PAY_OFF + FP5_TPL_PLEN];
+
+		fp5_req_set(req, fp5_op_update_template(), FP5_TPL_PLEN);
+		fp5_req_pay(req, pay, FP5_TPL_PLEN);
+		expect(!fp5_save_ors_bit30_on_1015(req), "update is not a save");
+	}
+	pay[0x2a4] = 1;
+	expect(fp5_tpl_update_changed(pay), "TA says changed");
+	expect(FP5_LEARN_SAVE_MASK == 0x60000000u, "Android learn mask");
+	expect((FP5_LEARN_SAVE_MASK & fp5_save_flag()) == fp5_save_flag(),
+	       "learn mask holds the enroll template bit");
+	memset(pay, 0, sizeof(pay));
+	expect(!fp5_report_wants_save(pay, 0), "report: no bit, no save");
+	pay[0x2d9] = 0x4;
+	expect(fp5_report_wants_save(pay, 0), "report bit 0x40000 rc 0");
+	expect(fp5_report_wants_save(pay, -11), "report bit 0x40000 rc -11");
+	expect(!fp5_report_wants_save(pay, -5), "report other rc");
+	expect(fp5_sync_config(cfg, sizeof(cfg), 0) > 0, "config");
+	expect(strstr(cfg, "\"max_sub_template_num\":48") != NULL, "48 subtemplates");
+	expect(strstr(cfg, "\"template_update_threshold\":50") != NULL, "tpl threshold");
+	expect(strstr(cfg, "\"calib_update_threshold\":50") != NULL, "calib threshold");
+	expect(strstr(cfg, "\"enable_prep_calib_learning\":false") != NULL, "prep calib off");
+#if FP5_LEARN
+	expect(strstr(cfg, "\"enable_template_learning\":true") != NULL, "learning on");
+	expect(strstr(cfg, "\"enable_post_calib_learning\":true") != NULL, "post calib on");
+#endif
+	expect(strstr(cfg, "70,\"enable_template_learning") != NULL, "inside algorithm");
+}
+
 int main(void)
 {
 	test_opcodes();
@@ -611,6 +656,7 @@ int main(void)
 	test_scan_log_tail();
 	test_group();
 	test_rescan_policy();
+	test_template_learning();
 	if (fails) {
 		fprintf(stderr, "%d failed\n", fails);
 		return 1;

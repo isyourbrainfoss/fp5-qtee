@@ -128,7 +128,7 @@ cmd_backup() {
 	sudo -n cp -a "$STORE" "$dst/misc"
 	sudo -n chown -R "$(id -u):$(id -g)" "$dst/misc"
 	store_manifest >"$dst/MANIFEST.sha256"
-	(cd "$dst/misc" && sha256sum -c --quiet "../MANIFEST.sha256") ||
+	(cd "$dst/misc" && sha256sum -c -s "../MANIFEST.sha256") ||
 		die "backup in $dst does not match $STORE"
 	flock -u 9
 	echo "$dst"
