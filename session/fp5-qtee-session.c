@@ -505,8 +505,8 @@ static void gp_note_read(const char *full, ssize_t n)
 
 	for (i = 0; i < gp_nseen; i++) {
 		if (!strcmp(gp_seen[i], full)) {
-			if (n > 0)
-				gp_seen_size[i] += (unsigned)n;
+			if (n > 0 && (unsigned)n > gp_seen_size[i])
+				gp_seen_size[i] = (unsigned)n;
 			return;
 		}
 	}
@@ -2034,7 +2034,7 @@ static int list_mode(struct svc *s)
 		return 2;
 	print_fingers(f, n, loaded);
 	for (i = 0; i < gp_nseen; i++)
-		logf("OBJECT read='%s' bytes=%u", gp_seen[i], gp_seen_size[i]);
+		logf("OBJECT read='%s' max_read=%u", gp_seen[i], gp_seen_size[i]);
 	logf("LIST ro_refused=%u", __atomic_load_n(&ro_refused, __ATOMIC_SEQ_CST));
 	if (loaded >= 0 && loaded != n)
 		logf("LIST warning: SET_GROUP logged %d loaded, ENUMERATE %d",

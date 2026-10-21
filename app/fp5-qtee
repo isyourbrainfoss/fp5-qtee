@@ -103,7 +103,9 @@ cmd_list() {
 
 cmd_files() {
 	echo "$STORE (secure-file-system objects; names are the TEE's, not per finger):"
-	sudo -n find "$STORE" -type f -printf '  %TY-%Tm-%Td %TH:%TM UTC  %8s  %P\n' | sort -k4
+	# BusyBox find has no -printf; stat prints mtime, size, path.
+	sudo -n find "$STORE" -type f -exec stat -c '  %y  %8s  %n' {} + |
+		sed "s|  $STORE/|  |" | sort -k4
 	echo "sha256:"
 	store_manifest | sed 's/^/  /'
 }
