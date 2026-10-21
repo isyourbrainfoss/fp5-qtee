@@ -95,3 +95,43 @@ watcher clock, 3852 s of ticks = 3853 s wall):
 
 See `scripts/match-tuning/` (staged on the phone in
 `~/fp5-qtee-keep/match-tuning-20261021/`).
+
+## Template learning (deployed 2026-10-21, binary 7d0d322c)
+
+From `fingerprint.default.so` (sha a1a4dd99…), `device_event_thread`:
+
+- After every authentication result (after `reportEvent`, hit or miss)
+  the HAL fills its 0x2e0 user buffer with zeros, copies `+0x2c8` and
+  `+0x2d0` from the report event context, sets `+0x2d8` to 0x80000
+  (constant at 0x97998) and `+0x2a4` to 0, and calls
+  `ff_trustlet_update_template`: command table entry 0x979b8 =
+  `{0x1015, 0x2e0}`.
+- rc 0 and byte `+0x2a4` != 0: `0x52aac(0x60000000)` ORs the mask into
+  the pending mask and (re)starts the 5000 ms "lazy data updater". Its
+  callback calls `ff_trustlet_save_data(mask)` = `0x1014`, length 4,
+  payload = mask, then clears the mask. On a failed auth the HAL first
+  cancels a running lazy timer.
+- After a report (rc 0 or -11), bit 0x40000 at `+0x2d8` of the answer
+  queues mask 0x80000000 the same way.
+- Config (TA reads these keys; the HAL dump shows them):
+  `enable_template_learning` on, `template_update_threshold` 50,
+  `max_sub_template_num` 48, `enable_post_calib_learning` on,
+  `enable_prep_calib_learning` off, `calib_update_threshold` 50.
+
+The session does the same, but saves right away instead of after 5 s,
+because the watcher quits a warm session soon after an unlock (and
+SIGTERMs a cold one at once). TERM/HUP/INT wait for a running
+update/save. Log lines: `LEARN <n> update hit= rc= changed= stats=`,
+`LEARN <n> save mask= rc= ms= rpmb_cmd= template= persist=`,
+`TIME <n> learn`/`learn-saved`.
+
+Finger waits now block on `/dev/focaltech_fp` (edge-triggered epoll on
+the driver's wait queue; irq_count sysfs has no `sysfs_notify`, so
+POLLPRI never fired). Fallback is 5 ms polling. The 128 KiB qsee ring
+is still read per command (avgv comes from it), but the whole-ring
+scan and the unlock-mode watch thread are off (`FP5_QSEE_FULL`,
+`FP5_QSEE_WATCH`). `TIME caps` lines now show `tee=` (ms inside the
+TEE invoke) and `cmd=` (ms in send_cmd) per burst, so the host share
+of a burst can be read off directly.
+
+Kit: `scripts/learn/` (deploy.sh, restore.sh, common.sh, README.md).
