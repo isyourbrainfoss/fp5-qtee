@@ -72,10 +72,14 @@ Test without touching sudo (screen unlocked, in a terminal on the phone):
     fp5-pam-test                 # "Place your finger..." touch -> rc=0
     fp5-pam-test fp5-fprint-test # same; a miss falls back to the password
 
-Only after that works, sudo/polkit can get one line at the top of
-`/etc/pam.d/sudo` / `polkit-1` (keep the password lines):
-
-    auth sufficient pam_fprintd.so max-tries=3 timeout=20
+Note (found 2026-10-22): `/etc/pam.d/sudo`, `polkit-1` and `phosh` on
+the phone already carry `auth sufficient pam_fprintd.so max-tries=1
+timeout=8` from the September install (fp5-fingerprint repo), with the
+password lines after it. With the old stub those always failed at once;
+with this daemon sudo/polkit really ask for a finger while unlocked (8 s,
+then the password). `sudo -n` (NOPASSWD) is not affected. Phosh's stack
+runs only on PIN submit while locked, where the daemon refuses at once,
+so the PIN is not delayed. Those files were not changed by this kit.
 
 Tests: `python3 -m unittest fprintd/test_fp5_fprintd.py` and
 `dbus-run-session -- python3 -m unittest fprintd/test_fp5_fprintd_dbus.py`

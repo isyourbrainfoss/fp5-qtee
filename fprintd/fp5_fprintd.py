@@ -300,7 +300,9 @@ class SensorLock:
         self.fd: int | None = None
 
     def take(self) -> None:
-        if seat_locked():
+        # Unknown lock state counts as locked: never take the sensor from
+        # the watcher on a guess.
+        if seat_locked() is not False:
             raise Busy("the screen is locked; the unlock watcher owns the sensor")
         if other_session_pids():
             raise Busy("another fp5-qtee-session is running")
@@ -454,7 +456,7 @@ def main() -> int:  # pragma: no cover - needs a system bus
                                      "org.freedesktop.DBus", "GetConnectionUnixUser",
                                      "s", [sender]))
 
-    def polkit_ok(sender: str, action: str) -> bool:
+    def polkit_ok(sender: str, action: str, interactive: bool = False) -> bool:
         if caller_uid(sender) == 0 or test:
             return True
         try:
@@ -463,7 +465,7 @@ def main() -> int:  # pragma: no cover - needs a system bus
             subject = ("system-bus-name", {"name": dbus.String(sender, variant_level=1)})
             res = auth.CheckAuthorization(
                 subject, action, dbus.Dictionary({}, signature="ss"),
-                dbus.UInt32(1), "",
+                dbus.UInt32(1 if interactive else 0), "",
                 dbus_interface="org.freedesktop.PolicyKit1.Authority", timeout=120)
             return bool(res[0])
         except dbus.exceptions.DBusException as e:
@@ -499,7 +501,7 @@ def main() -> int:  # pragma: no cover - needs a system bus
             if not username:
                 return pwd.getpwuid(uid).pw_name
             if uid != 0 and pwd.getpwuid(uid).pw_name != username:
-                if not polkit_ok(sender, "net.reactivated.fprint.device.setusername"):
+                if not polkit_ok(sender, "net.reactivated.fprint.device.setusername", True):
                     raise dbus_err("PermissionDenied", "Not allowed to act for another user")
             return username
 
@@ -577,7 +579,7 @@ def main() -> int:  # pragma: no cover - needs a system bus
             return True
 
         def _lock_check(self) -> bool:
-            if self.sess is not None and seat_locked():
+            if self.sess is not None and seat_locked() is not False:
                 log("seat locked; handing the sensor back to the watcher")
                 if self.op == "verify":
                     self.VerifyStatus("verify-disconnected", True)
@@ -718,7 +720,7 @@ def main() -> int:  # pragma: no cover - needs a system bus
                              sender_keyword="sender")
         def EnrollStart(self, finger_name, sender=None):
             self._need_claim(sender)
-            if not polkit_ok(sender, "net.reactivated.fprint.device.enroll"):
+            if not polkit_ok(sender, "net.reactivated.fprint.device.enroll", True):
                 raise dbus_err("PermissionDenied", "Not authorized: net.reactivated.fprint.device.enroll")
             finger = str(finger_name)
             if finger not in FINGERS:
@@ -758,7 +760,7 @@ def main() -> int:  # pragma: no cover - needs a system bus
                 self._close_sess()
 
         def _delete(self, sender, fids, done_ok, done_err, allow_last=False):
-            if not polkit_ok(sender, "net.reactivated.fprint.device.enroll"):
+            if not polkit_ok(sender, "net.reactivated.fprint.device.enroll", True):
                 done_err(dbus_err("PermissionDenied", "Not authorized: net.reactivated.fprint.device.enroll"))
                 return
             if self.op is not None:

@@ -37,7 +37,8 @@ if [ ! -d "$ORIG" ]; then
 	S chown -R "$(id -u):$(id -g)" "$ORIG"
 fi
 
-# 3. Install.
+# 3. Install. The distro fprintd must not run (it would own the name).
+if systemctl is-active --quiet fprintd.service; then echo "stock fprintd.service is active; refusing"; exit 1; fi
 S install -d -m 755 $LIB
 S install -m 755 "$K/fp5_fprintd.py" $LIB/fp5_fprintd.py
 S install -m 755 "$K/fp5-pam-test.py" /usr/local/bin/fp5-pam-test
