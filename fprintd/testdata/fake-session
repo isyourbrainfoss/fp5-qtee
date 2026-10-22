@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+"""Stand-in for fp5-qtee-session in the D-Bus test. FAKE_SEQ picks the
+outcome of each auth: hit, miss, empty, none (comma separated)."""
+import os, sys, time
+mode = sys.argv[1]
+sf = os.environ.get("FAKE_SEQ_FILE")
+seq = (open(sf).read().strip() if sf and os.path.exists(sf) else "hit").split(",")
+fids = [1558157930, 1979259351]
+def out(s):
+    print(s, flush=True)
+if mode == "list":
+    for i, f in enumerate(fids):
+        out(f"FINGER index={i} gid=0 fid={f} slot={i}")
+    sys.exit(0)
+if mode == "remove":
+    fid = int(sys.argv[3])
+    out("LIST_BEFORE"); out("REMOVE gid=0 fid=%d" % fid); out("LIST_AFTER")
+    for i, f in enumerate([x for x in fids if x != fid]):
+        out(f"FINGER index={i} gid=0 fid={f} slot={i}")
+    sys.exit(0)
+if mode == "enroll":
+    out("ENROLL fid=777 rc=0 text rsp=0 req=0")
+    for r in (3, 2, 2, 1, 0):
+        time.sleep(0.1)
+        if r == 2:
+            out("PRESS REJECT avgv=1,2,3"); continue
+        out(f"rem={r} sample=0")
+    out("enroll done rem=0 wrote=1 save_ms=90")
+    sys.exit(0)
+out("SERVE ready")
+n = 0
+while True:
+    out("SERVE idle")
+    line = sys.stdin.readline()
+    if not line or line.strip() == "quit":
+        sys.exit(0)
+    if line.strip() != "auth":
+        continue
+    n += 1
+    out(f"AUTH {n} arm mode=1 irq=0")
+    what = seq[min(n - 1, len(seq) - 1)]
+    time.sleep(0.3)
+    if what == "hit":
+        out(f"AUTH HIT {n} itype=0x2 avgv=900 fid=1979259351 rc=0")
+    elif what == "miss":
+        out(f"AUTH FAIL {n} itype=0x2 esd=0 avgv=800 fid=0 rc=-2")
+    elif what == "empty":
+        out(f"AUTH {n} empty avgv=1,2,3")
+    else:
+        out(f"AUTH {n} no finger")
+    out(f"SERVE result 0")

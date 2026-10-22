@@ -1,0 +1,6 @@
+#%PAM-1.0
+# Test stack for fp5-fprintd. Fingerprint first (pam_fprintd -> fp5-fprintd),
+# then the normal password, so a miss never locks anyone out.
+auth     sufficient pam_fprintd.so max-tries=3 timeout=20
+auth     include    base-auth
+account  include    base-account
