@@ -1,0 +1,26 @@
+--- a/plugins/power/gsd-power-manager.c	2026-10-23 08:39:21.565401161 +0200
++++ b/plugins/power/gsd-power-manager.c	2026-10-23 08:39:21.581596714 +0200
+@@ -2953,6 +2953,23 @@
+         /* ensure we turn the panel back on after resume */
+         enable_monitors (manager);
+ 
++        /* A resume is not necessarily caused by the user. If it was caused
++         * by an RTC alarm, the modem, a charger event, ... there is no input
++         * event, so idle_became_active_cb() never runs and current_idle_mode
++         * stays at SLEEP (or BLANK/DIM) from before the suspend. Because
++         * idle_set_mode() ignores "less idle" transitions, every later idle
++         * watch (dim/blank/sleep) would then be dropped and the device would
++         * stay awake forever. The shell re-arms its idle watches on resume,
++         * so start the idle state machine from NORMAL again. If the user
++         * did cause the resume, the user-active watch just sets NORMAL
++         * again, which is a no-op. */
++        if (manager->current_idle_mode != GSD_POWER_IDLE_MODE_NORMAL) {
++                g_debug ("Resumed from suspend: resetting idle mode %s -> normal",
++                         idle_mode_to_string (manager->current_idle_mode));
++                set_temporary_unidle_on_ac (manager, FALSE);
++                idle_set_mode (manager, GSD_POWER_IDLE_MODE_NORMAL);
++        }
++
+         /* set up the delay again */
+         inhibit_suspend (manager);
+ }
