@@ -70,6 +70,28 @@ class MapTest(unittest.TestCase):
         self.assertEqual(len(m.rows), 2)
         json.loads(self.path.read_text())
 
+    def test_relabel(self):
+        m = f.FingerMap(self.path)
+        self.assertEqual(m.relabel("user", "right-thumb", "left-thumb"), "renamed")
+        self.assertEqual(m.fid("user", "left-thumb"), 1979259351)
+        self.assertIsNone(m.fid("user", "right-thumb"))
+        self.assertEqual(m.relabel("user", "left-thumb", "right-index-finger"), "swapped")
+        self.assertEqual(m.fid("user", "right-index-finger"), 1979259351)
+        self.assertEqual(m.fid("user", "left-thumb"), 1558157930)
+        self.assertEqual(m.relabel("user", "left-thumb", "left-thumb"), "same")
+        self.assertEqual(f.FingerMap(self.path).fid("user", "left-thumb"), 1558157930)  # persisted
+        with self.assertRaises(KeyError):
+            m.relabel("user", "right-thumb", "left-thumb")
+        with self.assertRaises(ValueError):
+            m.relabel("user", "left-thumb", "pinky")
+        with self.assertRaises(KeyError):
+            m.relabel("other", "left-thumb", "right-thumb")
+
+    def test_details(self):
+        m = f.FingerMap(self.path)
+        self.assertEqual({d[0] for d in m.details("user")}, {"right-index-finger", "right-thumb"})
+        self.assertEqual(m.details("other"), [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -43,6 +43,7 @@ MGR_PATH = "/net/reactivated/Fprint/Manager"
 DEV_PATH = "/net/reactivated/Fprint/Device/0"
 IFACE_MGR = "net.reactivated.Fprint.Manager"
 IFACE_DEV = "net.reactivated.Fprint.Device"
+IFACE_MANAGE = "org.fp5.Fprint.Manage"  # our extension: details + relabel
 ERR = "net.reactivated.Fprint.Error."
 
 SESSION_CANDIDATES = (
@@ -210,6 +211,33 @@ class FingerMap:
     def drop(self, fid: int) -> None:
         self.rows = [r for r in self.rows if int(r["fid"]) != fid]
         self.save()
+
+    def details(self, user: str) -> list[tuple[str, int, str]]:
+        """(finger name, fid, source) for a user, in map order."""
+        return [(r["finger"], int(r["fid"]), str(r.get("source", "")))
+                for r in self.rows if r.get("user") == user]
+
+    def relabel(self, user: str, old: str, new: str) -> str:
+        """Give the template named `old` the name `new`. Names only; the
+        trustlet is not touched. If `new` is already taken by another of the
+        user's templates the two names are swapped. Returns "renamed",
+        "swapped" or "same". Raises KeyError (no such finger) or ValueError
+        (not a standard finger name)."""
+        if new not in FINGERS or old not in FINGERS:
+            raise ValueError(new if new not in FINGERS else old)
+        mine = {r["finger"]: r for r in self.rows if r.get("user") == user}
+        if old not in mine:
+            raise KeyError(old)
+        if old == new:
+            return "same"
+        other = mine.get(new)
+        mine[old]["finger"] = new
+        mine[old]["source"] = "relabel"
+        if other is not None:
+            other["finger"] = old
+            other["source"] = "relabel"
+        self.save()
+        return "swapped" if other is not None else "renamed"
 
     def sync(self, fids: list[int], user: str = DEFAULT_USER) -> bool:
         """Make the map match the trustlet list. True if it changed."""
@@ -412,6 +440,16 @@ def run_once(mode_args: list[str], tag: str, timeout: float = 120) -> str:
         out.append(line)
     s.close(grace=5)
     return "".join(out)
+
+
+def backup_map(path: Path = MAP_PATH) -> Path | None:
+    """Copy fingers.json to BACKUP_DIR before a rename. None if absent."""
+    if not path.is_file():
+        return None
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    dst = BACKUP_DIR / f"fingers-{_dt.datetime.now(_dt.timezone.utc):%Y%m%dT%H%M%S%fZ}.json"
+    shutil.copy2(path, dst)
+    return dst
 
 
 def backup_store() -> Path:
@@ -849,6 +887,33 @@ def main() -> int:  # pragma: no cover - needs a system bus
                 err(dbus_err("PrintsNotDeleted", "refusing to delete every finger on this phone"))
                 return
             self._delete(sender, fids, ok, err, allow_last=ALLOW_LAST)
+
+        # --------------------------------------- org.fp5.Fprint.Manage
+        # Not part of fprintd. Used by the Fingerprints app only; stock
+        # clients (GNOME Settings, pam_fprintd) never call it.
+        @dbus.service.method(IFACE_MANAGE, in_signature="s", out_signature="a(sxs)",
+                             sender_keyword="sender")
+        def ListDetailed(self, username, sender=None):
+            user = self._user_for(str(username), sender)
+            return dbus.Array([(n, dbus.Int64(fid), src) for n, fid, src in fmap.details(user)],
+                              signature="(sxs)")
+
+        @dbus.service.method(IFACE_MANAGE, in_signature="ss", out_signature="s",
+                             sender_keyword="sender")
+        def RelabelFinger(self, old_name, new_name, sender=None):
+            """Rename which finger a stored template is called (names only)."""
+            user = self._user_for("", sender)
+            if not polkit_ok(sender, "net.reactivated.fprint.device.enroll", True):
+                raise dbus_err("PermissionDenied", "Not authorized: net.reactivated.fprint.device.enroll")
+            try:
+                backup_map(fmap.path)
+                res = fmap.relabel(user, str(old_name), str(new_name))
+            except ValueError as e:
+                raise dbus_err("InvalidFingername", f"Invalid finger name: {e}")
+            except KeyError:
+                raise dbus_err("NoEnrolledPrints", "No such enrolled finger")
+            log(f"relabel {old_name} -> {new_name}: {res}")
+            return res
 
         # ---------------------------------------------------- signals
         @dbus.service.signal(IFACE_DEV, signature="sb")

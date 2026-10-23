@@ -123,6 +123,25 @@ class Flow(unittest.TestCase):
         self.assertIn(("enroll-retry-scan", False), got)
         self.assertEqual(sorted(self.dev.ListEnrolledFingers("")), ["left-index-finger", "right-thumb"])
 
+    def test_6_relabel_and_details(self):
+        man = dbus.Interface(self.dev, "org.fp5.Fprint.Manage")
+        before = {str(n): int(fid) for n, fid, _ in man.ListDetailed("")}
+        self.assertIn("left-index-finger", before)
+        fid = before["left-index-finger"]
+        self.assertEqual(str(man.RelabelFinger("left-index-finger", "left-thumb")), "renamed")
+        self.assertEqual(sorted(self.dev.ListEnrolledFingers("")), ["left-thumb", "right-thumb"])
+        after = {str(n): int(x) for n, x, _ in man.ListDetailed("")}
+        self.assertEqual(after["left-thumb"], fid)   # same template, new name
+        with self.assertRaises(dbus.exceptions.DBusException) as e:
+            man.RelabelFinger("left-thumb", "pinky")
+        self.assertEqual("net.reactivated.Fprint.Error.InvalidFingername", e.exception.get_dbus_name())
+        with self.assertRaises(dbus.exceptions.DBusException) as e:
+            man.RelabelFinger("right-index-finger", "left-index-finger")
+        self.assertEqual("net.reactivated.Fprint.Error.NoEnrolledPrints", e.exception.get_dbus_name())
+        backups = list((Path(self.tmp.name) / "state" / "backup").glob("fingers-*.json"))
+        self.assertTrue(backups)               # fingers.json copied before the rename
+        self.assertEqual(str(man.RelabelFinger("left-thumb", "left-index-finger")), "renamed")
+
 
 if __name__ == "__main__":
     unittest.main()

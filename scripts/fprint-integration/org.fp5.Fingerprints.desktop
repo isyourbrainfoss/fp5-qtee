@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Fingerprints
+Comment=Add, test, rename and delete the fingers that unlock this phone
+Exec=@HOME@/.local/bin/fp5-fingerprints
+Icon=auth-fingerprint-symbolic
+Terminal=false
+Categories=GNOME;GTK;Settings;Security;
+Keywords=fingerprint;finger;unlock;biometric;
+StartupNotify=true
+X-Purism-FormFactor=Workstation;Mobile;

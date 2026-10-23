@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Minimal stand-in for gdm's org.gnome.login-screen schema.
+     GNOME Settings (Users) hides its "Fingerprint Login" row when the
+     schema is missing or the key is false. gdm is not installed on this
+     phone. Installed under /usr/local/share so a later gdm package (which
+     owns /usr/share/glib-2.0/schemas/org.gnome.login-screen.gschema.xml)
+     never conflicts; GLib reads /usr/local/share first. -->
+<schemalist>
+  <schema id="org.gnome.login-screen" path="/org/gnome/login-screen/">
+    <key name="enable-fingerprint-authentication" type="b">
+      <default>true</default>
+      <summary>Enable fingerprint authentication</summary>
+      <description>Show the fingerprint login option in Settings.</description>
+    </key>
+  </schema>
+</schemalist>
