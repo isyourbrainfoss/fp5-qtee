@@ -19,6 +19,15 @@ One owner of the sensor at a time:
 Finger names: the trustlet knows only numeric fids. fingers.json maps
 fid -> {user, finger}. Fids the trustlet lists that the map lacks get the
 next free name from DEFAULT_ORDER and are written back.
+
+Lockout (read-only): the unlock watcher keeps its Android-style strike
+count in $XDG_RUNTIME_DIR/fp5-qtee-lockout ("<failed> <until>", until in
+CLOCK_BOOTTIME). We read that file and publish it on org.fp5.Fprint.Manage
+as properties (locked-out, lockout-permanent, lockout-remaining,
+failed-attempts, lockout-reason) plus a LockoutChanged signal. With
+FP5_FPRINTD_HONOR_LOCKOUT=1 a VerifyStart during a lockout answers
+VerifyStatus("verify-disconnected", true) at once, so pam_fprintd falls
+back to the password the way it does for an unplugged reader.
 """
 from __future__ import annotations
 
@@ -26,6 +35,7 @@ import datetime as _dt
 import fcntl
 import hashlib
 import json
+import math
 import os
 import pwd
 import queue
@@ -79,6 +89,12 @@ ENROLL_STAGES = int(os.environ.get("FP5_FPRINTD_ENROLL_STAGES", "16"))
 IDLE_RELEASE_S = 60.0
 READY_TIMEOUT_S = 20.0
 ALLOW_LAST = os.environ.get("FP5_FPRINTD_ALLOW_LAST", "0") == "1"
+# Mirror of the watcher's lockout rules (app/fp5_qtee_unlock.py,
+# UnlockPolicy): 5 rejected fingers -> 30 s, 20 -> until the PIN.
+LOCKOUT_S = 30.0
+LOCKOUT_PERMANENT = 20
+HONOR_LOCKOUT = os.environ.get("FP5_FPRINTD_HONOR_LOCKOUT", "0") == "1"
+LOCKOUT_POLL_S = 2
 
 _HIT = re.compile(r"^AUTH HIT (\d+) .* fid=(\d+) ")
 _NOMATCH = re.compile(r"^AUTH FAIL \d+ itype=0x2 ")
@@ -317,6 +333,92 @@ def seat_locked() -> bool | None:
     return False
 
 
+# ------------------------------------------------------------- lockout
+
+def boottime() -> float:
+    """Seconds since boot, counting suspend (the watcher's clock)."""
+    return time.clock_gettime(time.CLOCK_BOOTTIME)
+
+
+def lockout_paths(user: str = DEFAULT_USER) -> tuple[Path | None, Path | None]:
+    """(lockout state file, PIN marker) the watcher of `user` writes."""
+    forced = os.environ.get("FP5_FPRINTD_LOCKOUT_FILE")
+    if forced:
+        marker = os.environ.get("FP5_FPRINTD_PIN_MARKER")
+        return Path(forced), (Path(marker) if marker else Path(forced).with_name("fp5-qtee-pin-ok"))
+    try:
+        uid = pwd.getpwnam(user).pw_uid
+    except KeyError:
+        return None, None
+    run = Path(f"/run/user/{uid}")
+    return run / "fp5-qtee-lockout", run / "fp5-qtee-pin-ok"
+
+
+NO_LOCKOUT = {"locked-out": False, "lockout-permanent": False,
+              "lockout-remaining": 0, "failed-attempts": 0, "lockout-reason": ""}
+
+
+def lockout_state(text: str | None, now: float, marker_exists: bool,
+                  unreadable: bool = False) -> dict:
+    """What the watcher would decide from its state file, as properties.
+
+    text: file contents, or None when the file does not exist.
+    Same fail-closed rules as UnlockPolicy._load_state/why_not: a file
+    that cannot be read or parsed, a negative count, or a missing file
+    while the PIN marker exists all mean "until the PIN".
+    """
+    def permanent(failed: int, why: str) -> dict:
+        return {"locked-out": True, "lockout-permanent": True, "lockout-remaining": 0,
+                "failed-attempts": failed, "lockout-reason": why}
+    if unreadable:
+        return permanent(LOCKOUT_PERMANENT, "lockout-permanent")
+    if text is None:
+        if marker_exists:
+            return permanent(LOCKOUT_PERMANENT, "lockout-permanent")
+        return dict(NO_LOCKOUT)
+    parts = text.split()
+    try:
+        failed = int(parts[0])
+        until = float(parts[1])
+    except (IndexError, ValueError):
+        return permanent(LOCKOUT_PERMANENT, "lockout-permanent")
+    if failed < 0:
+        return permanent(LOCKOUT_PERMANENT, "lockout-permanent")
+    if failed >= LOCKOUT_PERMANENT:
+        return permanent(failed, "lockout-permanent")
+    # The watcher never waits longer than one timed lockout from its load.
+    until = min(until, now + LOCKOUT_S)
+    if now < until:
+        return {"locked-out": True, "lockout-permanent": False,
+                "lockout-remaining": int(math.ceil(until - now)),
+                "failed-attempts": failed, "lockout-reason": "lockout"}
+    st = dict(NO_LOCKOUT)
+    st["failed-attempts"] = failed
+    return st
+
+
+def read_lockout(user: str = DEFAULT_USER, now: float | None = None) -> dict:
+    """Read the watcher's files for `user`. No files at all: no lockout."""
+    state, marker = lockout_paths(user)
+    if state is None:
+        return dict(NO_LOCKOUT)
+    if now is None:
+        now = boottime()
+    try:
+        text: str | None = state.read_text(encoding="utf-8")
+        bad = False
+    except FileNotFoundError:
+        text, bad = None, False
+    except OSError:
+        text, bad = None, True
+    return lockout_state(text, now, bool(marker and marker.exists()), bad)
+
+
+def lockout_key(st: dict) -> tuple:
+    """The part of the state whose change is worth a signal."""
+    return (st["locked-out"], st["lockout-permanent"], st["failed-attempts"], st["lockout-reason"])
+
+
 class Busy(Exception):
     pass
 
@@ -524,8 +626,10 @@ def main() -> int:  # pragma: no cover - needs a system bus
             self.enroll_rem: int | None = None
             self.enroll_fid: int | None = None
             self.watch = None
+            self.lockout = read_lockout()
             GLib.timeout_add(100, self._tick)
             GLib.timeout_add_seconds(2, self._lock_check)
+            GLib.timeout_add_seconds(LOCKOUT_POLL_S, self._lockout_poll)
 
         # ---------------------------------------------------------- helpers
         def _need_claim(self, sender: str) -> None:
@@ -624,6 +728,34 @@ def main() -> int:  # pragma: no cover - needs a system bus
                 elif self.op == "enroll":
                     self.EnrollStatus("enroll-disconnected", True)
                 self._close_sess()
+            return True
+
+        def _lockout_props(self, st: dict) -> "dbus.Dictionary":
+            return dbus.Dictionary({
+                "locked-out": dbus.Boolean(st["locked-out"]),
+                "lockout-permanent": dbus.Boolean(st["lockout-permanent"]),
+                "lockout-remaining": dbus.UInt32(st["lockout-remaining"]),
+                "failed-attempts": dbus.UInt32(max(0, st["failed-attempts"])),
+                "lockout-reason": dbus.String(st["lockout-reason"]),
+            }, signature="sv")
+
+        def _lockout_poll(self) -> bool:
+            try:
+                st = read_lockout(self.user or DEFAULT_USER)
+            except Exception as e:  # never let the poll timer die
+                log(f"lockout read: {e}")
+                return True
+            if lockout_key(st) != lockout_key(self.lockout):
+                log(f"lockout {self.lockout['lockout-reason'] or 'none'} -> "
+                    f"{st['lockout-reason'] or 'none'} (failed={st['failed-attempts']}, "
+                    f"remaining={st['lockout-remaining']} s)")
+                self.lockout = st
+                self.PropertiesChanged(IFACE_MANAGE, self._lockout_props(st),
+                                       dbus.Array([], signature="s"))
+                self.LockoutChanged(st["locked-out"], dbus.UInt32(st["lockout-remaining"]),
+                                    st["lockout-reason"])
+            else:
+                self.lockout = st
             return True
 
         def _verify_line(self, line: str) -> None:
@@ -733,6 +865,16 @@ def main() -> int:  # pragma: no cover - needs a system bus
             finger = str(finger_name) or "any"
             if finger != "any" and finger not in names:
                 raise dbus_err("NoEnrolledPrints", f"{finger} not enrolled")
+            if HONOR_LOCKOUT:
+                st = read_lockout(self.user or DEFAULT_USER)
+                if st["locked-out"]:
+                    # fprintd has no lockout status. verify-disconnected is
+                    # what pam_fprintd and GNOME treat as "reader not
+                    # available now": they stop and fall back to the password.
+                    log(f"verify refused: {st['lockout-reason']} ({st['lockout-remaining']} s)")
+                    self.VerifyFingerSelected(finger)
+                    GLib.idle_add(lambda: self.VerifyStatus("verify-disconnected", True) and False)
+                    return
             self._open_serve()
             self.op = "verify"
             self.op_finger = finger
@@ -928,6 +1070,10 @@ def main() -> int:  # pragma: no cover - needs a system bus
         def EnrollStatus(self, result, done):
             log(f"EnrollStatus {result} {done}")
 
+        @dbus.service.signal(IFACE_MANAGE, signature="bus")
+        def LockoutChanged(self, locked_out, remaining, reason):
+            """Not fprintd: emitted when the watcher's lockout changes."""
+
         @dbus.service.signal(dbus.PROPERTIES_IFACE, signature="sa{sv}as")
         def PropertiesChanged(self, interface, changed, invalidated):
             pass
@@ -942,6 +1088,10 @@ def main() -> int:  # pragma: no cover - needs a system bus
 
         @dbus.service.method(dbus.PROPERTIES_IFACE, in_signature="s", out_signature="a{sv}")
         def GetAll(self, interface):
+            if interface == IFACE_MANAGE:
+                # remaining is computed now, not at the last poll
+                self.lockout = read_lockout(self.user or DEFAULT_USER)
+                return self._lockout_props(self.lockout)
             if interface not in (IFACE_DEV, ""):
                 return dbus.Dictionary({}, signature="sv")
             return dbus.Dictionary({
@@ -1003,6 +1153,9 @@ def main() -> int:  # pragma: no cover - needs a system bus
         return False
 
     GLib.idle_add(initial_sync)
+    lk, _mk = lockout_paths()
+    log(f"lockout file {lk} (dir visible: {bool(lk and lk.parent.is_dir())}, "
+        f"honor={HONOR_LOCKOUT}); now {dev.lockout['lockout-reason'] or 'none'}")
     log(f"fp5-fprintd (qtee) on {bus.get_unique_name()} as {name.get_name()}; map {fmap.rows}")
     loop = GLib.MainLoop()
 

@@ -67,7 +67,7 @@ A Phosh-native lock screen would need: (a) a Phosh change (Phosh has `PhoshLocks
 `phosh_lockscreen_set_unlock_status` and an extra-page extension point, but nothing calls fprintd) and (b) our daemon to
 become the owner of the sensor while locked too (warm session, touch-to-wake wakeup, lockout policy move from the
 watcher into the daemon). That is a big change with a risk of breaking unlock; recommendation: keep the watcher as the
-lock-screen owner. Cheap improvement if wanted: put the lockout state on D-Bus so a small Phosh plugin could show it.
+lock-screen owner. The lockout state is now on D-Bus (branch `fprint-lockout`, `docs/fprint-lockout.md`), so a small Phosh plugin could show it.
 
 ## Deploy / restore (no reboot, no fingerprint storage touched)
     sh ~/fp5-qtee-keep/fprint-integration-20261023/deploy.sh    # schema shim, app, daemon with RelabelFinger

@@ -10,6 +10,9 @@ fingerprint storage itself.
   * Test:   Claim, VerifyStart("any"), VerifyStatus, VerifyStop, Release.
   * Delete: DeleteEnrolledFinger(name)  (fp5-fprintd backs up storage first).
   * Rename: RelabelFinger(old, new)     (names only; swaps if the new name is used).
+  * Lockout: org.fp5.Fprint.Manage properties locked-out / lockout-remaining /
+    lockout-permanent + LockoutChanged; shown as a banner with a countdown.
+    A stock fprintd has none of these and the banner just stays hidden.
 
 While the phone is locked the unlock watcher owns the sensor, so enroll,
 test and delete answer "AlreadyInUse"; the app says so. Opening the app
@@ -80,6 +83,17 @@ ERROR_TEXT = {
 }
 
 
+def lockout_text(locked: bool, permanent: bool, remaining: int) -> str:
+    """Banner text for the watcher's lockout, or "" when there is none."""
+    if not locked:
+        return ""
+    if permanent:
+        return "Too many attempts. Unlock with your PIN once to use your finger again."
+    if remaining > 0:
+        return f"Too many attempts. Fingerprint unlock is paused for {remaining} s."
+    return "Too many attempts. Fingerprint unlock is paused."
+
+
 def pretty(name: str) -> str:
     return PRETTY.get(name, name)
 
@@ -100,6 +114,8 @@ class Client(GObject.Object):
     __gsignals__ = {
         "enroll-status": (GObject.SignalFlags.RUN_FIRST, None, (str, bool)),
         "verify-status": (GObject.SignalFlags.RUN_FIRST, None, (str, bool)),
+        # locked-out, lockout-permanent, lockout-remaining (s), lockout-reason
+        "lockout": (GObject.SignalFlags.RUN_FIRST, None, (bool, bool, int, str)),
     }
 
     def __init__(self) -> None:
@@ -135,13 +151,31 @@ class Client(GObject.Object):
                     BUS, IFACE_DEV, sig, self.path, None, Gio.DBusSignalFlags.NONE,
                     lambda c, s, p, i, sg, params, n=name: self.emit(n, *params.unpack())))
 
+            # Lockout (fp5-fprintd extension; absent on a stock fprintd).
+            self._subs.append(self.conn.signal_subscribe(
+                BUS, IFACE_MANAGE, "LockoutChanged", self.path, None, Gio.DBusSignalFlags.NONE,
+                lambda *_a: self.fetch_lockout()))
+            self._subs.append(self.conn.signal_subscribe(
+                BUS, "org.freedesktop.DBus.Properties", "PropertiesChanged", self.path,
+                IFACE_MANAGE, Gio.DBusSignalFlags.NONE, lambda *_a: self.fetch_lockout()))
+
             def got_props(o, e):
                 if not e:
                     self.stages = int(o.unpack()[0].get("num-enroll-stages", self.stages))
                 cb(None)
+                self.fetch_lockout()
             self.call("org.freedesktop.DBus.Properties", "GetAll",
                       GLib.Variant("(s)", (IFACE_DEV,)), got_props, sig="(a{sv})")
         self.call(IFACE_MGR, "GetDefaultDevice", None, got_dev, path=MGR_PATH, sig="(o)")
+
+    def fetch_lockout(self) -> None:
+        def got(out, err):
+            p = {} if err else out.unpack()[0]
+            self.emit("lockout", bool(p.get("locked-out", False)),
+                      bool(p.get("lockout-permanent", False)),
+                      int(p.get("lockout-remaining", 0)), str(p.get("lockout-reason", "")))
+        self.call("org.freedesktop.DBus.Properties", "GetAll",
+                  GLib.Variant("(s)", (IFACE_MANAGE,)), got, sig="(a{sv})", timeout=10_000)
 
     # -- fprintd calls; cb(result, error)
     def list_fingers(self, cb) -> None:
@@ -191,6 +225,10 @@ class Window(Adw.ApplicationWindow):
         self.op_bar: Gtk.ProgressBar | None = None
         self.enroll_finger = ""
         self.enroll_passed = 0
+        self.locked_out = False
+        self.lock_permanent = False
+        self.lock_remaining = 0
+        self._lock_timer = 0
         self.overlay = Adw.ToastOverlay()
         self.nav = Adw.NavigationView()
         self.overlay.set_child(self.nav)
@@ -198,12 +236,15 @@ class Window(Adw.ApplicationWindow):
         self.nav.add(self._main_page())
         client.connect("enroll-status", self._on_enroll_status)
         client.connect("verify-status", self._on_verify_status)
+        client.connect("lockout", self._on_lockout)
         client.connect_device(self._on_connected)
 
     # ------------------------------------------------------------ main page
     def _main_page(self) -> Adw.NavigationPage:
         view = Adw.ToolbarView()
         view.add_top_bar(Adw.HeaderBar())
+        self.lock_banner = Adw.Banner(revealed=False)
+        view.add_top_bar(self.lock_banner)
         page = Adw.PreferencesPage()
         self.status = Adw.StatusPage(icon_name="auth-fingerprint-symbolic", title="Fingerprints",
                                      description="Connecting\u2026")
@@ -239,6 +280,31 @@ class Window(Adw.ApplicationWindow):
 
     def refresh(self) -> None:
         self.client.list_fingers(self._on_list)
+
+    # -------------------------------------------------------------- lockout
+    def _on_lockout(self, _c, locked: bool, permanent: bool, remaining: int, _reason: str) -> None:
+        self.locked_out, self.lock_permanent, self.lock_remaining = locked, permanent, remaining
+        self._show_lockout()
+        if self._lock_timer:
+            GLib.source_remove(self._lock_timer)
+            self._lock_timer = 0
+        if locked and not permanent and remaining > 0:
+            self._lock_timer = GLib.timeout_add_seconds(1, self._lock_tick)
+
+    def _lock_tick(self) -> bool:
+        self.lock_remaining = max(0, self.lock_remaining - 1)
+        if self.lock_remaining == 0:
+            self._lock_timer = 0
+            self.client.fetch_lockout()   # the daemon has the truth
+            return False
+        self._show_lockout()
+        return True
+
+    def _show_lockout(self) -> None:
+        text = lockout_text(self.locked_out, self.lock_permanent, self.lock_remaining)
+        if text:
+            self.lock_banner.set_title(text)
+        self.lock_banner.set_revealed(bool(text))
 
     def _on_list(self, fingers, err) -> None:
         for r in self._rows:
@@ -414,7 +480,11 @@ class Window(Adw.ApplicationWindow):
     def _on_verify_status(self, _c, result: str, done: bool) -> None:
         if getattr(self, "op", None) != "verify" or self.op_label is None:
             return
-        self.op_label.set_label(VERIFY_TEXT.get(result, result))
+        text = VERIFY_TEXT.get(result, result)
+        if result == "verify-disconnected" and self.locked_out:
+            # fp5-fprintd with FP5_FPRINTD_HONOR_LOCKOUT=1 ends a verify like this
+            text = lockout_text(True, self.lock_permanent, self.lock_remaining)
+        self.op_label.set_label(text)
         if done:
             self._finish_op(ok=result == "verify-match")
 

@@ -198,6 +198,13 @@ class MissTest(unittest.TestCase):
             self.assertEqual(args[-1], text)
             self.assertNotIn("-b", args)
         self.assertIn("30 seconds", fp5_qtee_unlock.POLICY_TEXT["lockout"])
+
+    def test_lockout_notice_is_transient(self) -> None:
+        # Not kept in the notification list after it is shown.
+        for key in ("lockout", "lockout-permanent"):
+            self.assertTrue(fp5_qtee_unlock.notice_is_transient(fp5_qtee_unlock.POLICY_TEXT[key]))
+        for key in ("pin-after-boot", "pin-72h", "no-state"):
+            self.assertFalse(fp5_qtee_unlock.notice_is_transient(fp5_qtee_unlock.POLICY_TEXT[key]))
         self.assertIn("PIN", fp5_qtee_unlock.POLICY_TEXT["lockout-permanent"])
 
     def test_tell_uses_the_android_waveform(self) -> None:

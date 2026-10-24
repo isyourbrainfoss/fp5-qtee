@@ -675,6 +675,18 @@ class UnlockPolicy:
         return None
 
 
+# Lockout notices go out transient: they show on the lock screen for their
+# 6 s but are not kept in the notification list, where a "Too many
+# attempts" from an hour ago looked like a current lockout. The current
+# state is on D-Bus (fp5-fprintd, org.fp5.Fprint.Manage) and in the
+# Fingerprints app.
+TRANSIENT_NOTICES = frozenset((POLICY_TEXT["lockout"], POLICY_TEXT["lockout-permanent"]))
+
+
+def notice_is_transient(text: str) -> bool:
+    return text in TRANSIENT_NOTICES
+
+
 def notify_args(text: str, timeout_ms: int, transient: bool = False) -> list[str]:
     """notify-send command that puts the message in the summary.
 
@@ -909,7 +921,7 @@ class UnlockWatcher:
     def notify(self, text: str) -> None:
         try:
             subprocess.run(
-                notify_args(text, 6000),
+                notify_args(text, 6000, transient=notice_is_transient(text)),
                 check=False,
                 timeout=3,
             )

@@ -29,7 +29,10 @@ class Flow(unittest.TestCase):
                    FP5_FPRINTD_SESSION=str(HERE / "testdata" / "fake-session"),
                    FP5_FPRINTD_STATE=str(t / "state"), FP5_FPRINTD_LOCK=str(t / "lock"),
                    FP5_FPRINTD_FAKE_LOCKED=str(cls.lockflag), FP5_FPRINTD_LOAD="/nonexistent",
-                   FP5_FPRINTD_STORE=str(t / "store"), FAKE_SEQ_FILE=str(t / "seq"), FP5_FPRINTD_USER=os.environ.get("USER", "kb"))
+                   FP5_FPRINTD_STORE=str(t / "store"), FAKE_SEQ_FILE=str(t / "seq"), FP5_FPRINTD_USER=os.environ.get("USER", "kb"),
+                   FP5_FPRINTD_LOCKOUT_FILE=str(t / "fp5-qtee-lockout"),
+                   FP5_FPRINTD_HONOR_LOCKOUT="1")
+        cls.lockout = t / "fp5-qtee-lockout"
         cls.env = env
         cls.daemon = subprocess.Popen([sys.executable, str(HERE / "fp5_fprintd.py")], env=env,
                                       stderr=open(t / "daemon.log", "w"))
@@ -141,6 +144,51 @@ class Flow(unittest.TestCase):
         backups = list((Path(self.tmp.name) / "state" / "backup").glob("fingers-*.json"))
         self.assertTrue(backups)               # fingers.json copied before the rename
         self.assertEqual(str(man.RelabelFinger("left-thumb", "left-index-finger")), "renamed")
+
+
+    def test_7_lockout(self):
+        man = "org.fp5.Fprint.Manage"
+        props = dbus.Interface(self.dev, "org.freedesktop.DBus.Properties")
+        self.assertFalse(props.Get(man, "locked-out"))
+        self.assertEqual(props.Get(man, "lockout-reason"), "")
+        got = []
+        loop = GLib.MainLoop()
+        def cb(locked, remaining, reason):
+            got.append((bool(locked), int(remaining), str(reason)))
+            loop.quit()
+        m = self.dev.connect_to_signal("LockoutChanged", cb, dbus_interface=man)
+        changed = []
+        pm = props.connect_to_signal("PropertiesChanged",
+                                     lambda i, c, inv: changed.append((str(i), dict(c))))
+        until = time.clock_gettime(time.CLOCK_BOOTTIME) + 25
+        self.lockout.write_text(f"5 {until:.3f}\n")
+        GLib.timeout_add_seconds(8, loop.quit)
+        loop.run()
+        self.assertTrue(got and got[-1][0] and got[-1][2] == "lockout", got)
+        self.assertTrue(0 < got[-1][1] <= 26)
+        self.assertTrue(any(i == man and c.get("locked-out") for i, c in changed), changed)
+        self.assertTrue(props.Get(man, "locked-out"))
+        self.assertEqual(int(props.Get(man, "failed-attempts")), 5)
+        # stock interface unchanged
+        self.assertNotIn("locked-out", props.GetAll("net.reactivated.Fprint.Device"))
+        # honor mode: verify ends at once with verify-disconnected
+        got_v = self.verify("hit")
+        self.assertEqual(got_v[-1], ("verify-disconnected", True))
+        # PIN used: the watcher rewrites the file with 0 strikes
+        loop2 = GLib.MainLoop()
+        got.clear()
+        def cb2(locked, remaining, reason):
+            got.append((bool(locked), int(remaining), str(reason)))
+            loop2.quit()
+        m.remove()
+        m = self.dev.connect_to_signal("LockoutChanged", cb2, dbus_interface=man)
+        self.lockout.write_text("0 0.000\n")
+        GLib.timeout_add_seconds(8, loop2.quit)
+        loop2.run()
+        m.remove()
+        pm.remove()
+        self.assertEqual(got[-1], (False, 0, ""))
+        self.assertEqual(self.verify("hit")[-1], ("verify-match", True))
 
 
 if __name__ == "__main__":

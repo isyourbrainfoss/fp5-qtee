@@ -50,8 +50,10 @@ class UiFlow(unittest.TestCase):
                    FP5_FPRINTD_STATE=str(t / "state"), FP5_FPRINTD_LOCK=str(t / "lock"),
                    FP5_FPRINTD_FAKE_LOCKED=str(t / "locked"), FP5_FPRINTD_LOAD="/nonexistent",
                    FP5_FPRINTD_STORE=str(t / "store"), FAKE_SEQ_FILE=str(t / "seq"),
-                   FP5_FPRINTD_USER=os.environ.get("USER", "kb"))
+                   FP5_FPRINTD_USER=os.environ.get("USER", "kb"),
+                   FP5_FPRINTD_LOCKOUT_FILE=str(t / "fp5-qtee-lockout"))
         cls.lockflag = t / "locked"
+        cls.lockout = t / "fp5-qtee-lockout"
         cls.seq = t / "seq"
         cls.daemon = subprocess.Popen([sys.executable, str(HERE.parent / "fp5_fprintd.py")], env=env,
                                       stderr=open(t / "daemon.log", "w"))
@@ -122,6 +124,20 @@ class UiFlow(unittest.TestCase):
         self.assertGreater(self.win.op_bar.get_fraction(), 0)
         self.win._op_button()
         self.assertTrue(pump(lambda: sorted(rows(self.win)) == ["Left index finger", "Right thumb"]))
+
+
+    def test_5_lockout_banner(self):
+        self.assertFalse(self.win.lock_banner.get_revealed())
+        until = time.clock_gettime(time.CLOCK_BOOTTIME) + 20
+        self.lockout.write_text(f"5 {until:.3f}\n")
+        self.assertTrue(pump(lambda: self.win.lock_banner.get_revealed(), 8))
+        self.assertIn("paused for", self.win.lock_banner.get_title())
+        first = self.win.lock_remaining
+        self.assertTrue(pump(lambda: self.win.lock_remaining < first, 3))   # counts down
+        self.lockout.write_text("20 0\n")
+        self.assertTrue(pump(lambda: "PIN" in self.win.lock_banner.get_title(), 8))
+        self.lockout.write_text("0 0.000\n")
+        self.assertTrue(pump(lambda: not self.win.lock_banner.get_revealed(), 8))
 
 
 if __name__ == "__main__":

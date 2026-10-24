@@ -1,4 +1,6 @@
 import json
+import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -91,6 +93,75 @@ class MapTest(unittest.TestCase):
         m = f.FingerMap(self.path)
         self.assertEqual({d[0] for d in m.details("user")}, {"right-index-finger", "right-thumb"})
         self.assertEqual(m.details("other"), [])
+
+
+class LockoutTest(unittest.TestCase):
+    """lockout_state mirrors the watcher's UnlockPolicy (app/)."""
+
+    def test_states(self):
+        now = 1000.0
+        st = f.lockout_state(None, now, False)
+        self.assertFalse(st["locked-out"])
+        self.assertEqual(st["lockout-reason"], "")
+        st = f.lockout_state("3 0.000\n", now, True)
+        self.assertEqual((st["locked-out"], st["failed-attempts"]), (False, 3))
+        st = f.lockout_state("5 1012.200\n", now, True)
+        self.assertEqual((st["locked-out"], st["lockout-permanent"], st["lockout-remaining"],
+                          st["lockout-reason"]), (True, False, 13, "lockout"))
+        # never more than one timed lockout ahead
+        self.assertEqual(f.lockout_state("5 99999\n", now, True)["lockout-remaining"], 30)
+        st = f.lockout_state("20 0\n", now, True)
+        self.assertEqual((st["locked-out"], st["lockout-permanent"], st["lockout-reason"]),
+                         (True, True, "lockout-permanent"))
+        # fail closed like the watcher
+        for text, marker, bad in (("garbage", False, False), ("-1 0", False, False),
+                                  (None, True, False), (None, False, True)):
+            st = f.lockout_state(text, now, marker, bad)
+            self.assertTrue(st["lockout-permanent"], (text, marker, bad))
+
+    def test_read_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            state = Path(d) / "fp5-qtee-lockout"
+            os.environ["FP5_FPRINTD_LOCKOUT_FILE"] = str(state)
+            try:
+                self.assertFalse(f.read_lockout("x")["locked-out"])
+                state.write_text(f"10 {f.boottime() + 20:.3f}\n")
+                st = f.read_lockout("x")
+                self.assertTrue(st["locked-out"])
+                self.assertTrue(18 <= st["lockout-remaining"] <= 21)
+                state.unlink()
+                (Path(d) / "fp5-qtee-pin-ok").write_text("1\n")
+                self.assertTrue(f.read_lockout("x")["lockout-permanent"])  # marker, no state
+            finally:
+                del os.environ["FP5_FPRINTD_LOCKOUT_FILE"]
+
+    def test_matches_watcher_policy(self):
+        app = Path(__file__).resolve().parent.parent / "app"
+        if not (app / "fp5_qtee_unlock.py").is_file():
+            self.skipTest("app/ not in this tree")
+        sys.path.insert(0, str(app))
+        try:
+            import fp5_qtee_unlock as w
+        finally:
+            sys.path.remove(str(app))
+        self.assertEqual(w.LOCKOUT_S, f.LOCKOUT_S)
+        self.assertEqual(w.LOCKOUT_PERMANENT, f.LOCKOUT_PERMANENT)
+        with tempfile.TemporaryDirectory() as d:
+            state = Path(d) / "fp5-qtee-lockout"
+            marker = Path(d) / "fp5-qtee-pin-ok"
+            clock = [500.0]
+            pol = w.UnlockPolicy(require_pin=False, marker=marker, clock=lambda: clock[0], state=state)
+            for i in range(25):
+                pol.on_miss()
+                for dt in (0.0, 10.0, 29.0, 31.0):
+                    clock[0] += dt
+                    fresh = w.UnlockPolicy(require_pin=False, marker=marker,
+                                           clock=lambda: clock[0], state=state)
+                    why = fresh.why_not()
+                    st = f.lockout_state(state.read_text(), clock[0], marker.exists())
+                    self.assertEqual(why if why in ("lockout", "lockout-permanent") else "",
+                                     st["lockout-reason"], (i, dt))
+                    self.assertEqual(st["locked-out"], why is not None)
 
 
 if __name__ == "__main__":
