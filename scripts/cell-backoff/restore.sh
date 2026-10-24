@@ -4,6 +4,9 @@
 set -u
 K=$(cd "$(dirname "$0")" && pwd); O=$K/orig; S() { sudo -n "$@"; }
 S systemctl disable --now fp5-cell-backoff.timer 2>/dev/null
+# a pending suspend re-arm (transient unit from systemd-run)
+S systemctl stop fp5-cell-rearm.timer fp5-cell-rearm.service 2>/dev/null
+S systemctl reset-failed fp5-cell-rearm.service 2>/dev/null
 S rm -f /etc/systemd/system/fp5-cell-backoff.timer /etc/systemd/system/fp5-cell-backoff.service \
 	/etc/systemd/system/imsd.service.d/fp5-cell-gate.conf /usr/lib/systemd/system-sleep/fp5-cell-presleep
 S rmdir /etc/systemd/system/imsd.service.d 2>/dev/null
