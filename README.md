@@ -495,6 +495,13 @@ the session binary (`unlock`, and the Finger app's `enroll` and
 `match`), and for `<session> serve /lib/firmware/qsee`. The boot unit
 is root and does not use sudo.
 
+## Upgrades
+
+`apk upgrade` can put the stock `gsd-power` back, drop local drop-ins, or (on a
+kernel that shares the distro release) replace the modules under a custom kernel.
+`scripts/upgrade-guard/` checks for that after every apk transaction and puts back
+what is safe: see [docs/upgrade-guard.md](docs/upgrade-guard.md).
+
 ## SERVE
 
 `fp5-qtee-session serve` stays loaded and waits on stdin. There is no

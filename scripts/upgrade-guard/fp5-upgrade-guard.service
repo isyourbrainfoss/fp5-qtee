@@ -1,0 +1,13 @@
+[Unit]
+Description=FP5: check that local fixes survived the last upgrade
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/fp5-upgrade-guard check
+# exit 1 = warnings, 2 = failures; both are reported, neither is a unit failure
+SuccessExitStatus=1 2
+StandardOutput=journal
+
+[Install]
+WantedBy=multi-user.target

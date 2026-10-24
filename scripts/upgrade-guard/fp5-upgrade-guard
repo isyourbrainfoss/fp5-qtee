@@ -1,0 +1,297 @@
+#!/bin/sh
+# fp5-upgrade-guard: notice when an apk upgrade undid FP5 lab fixes, and put
+# back what can be put back safely.
+#
+#   fp5-upgrade-guard snapshot   record the current (known-good) state
+#   fp5-upgrade-guard check      report only (exit 0 ok, 1 warn, 2 fail)
+#   fp5-upgrade-guard fix        check, then re-apply what is safe
+#   fp5-upgrade-guard pin        hold gnome-settings-daemon at its version
+#   fp5-upgrade-guard unpin      drop that hold
+#
+# Run as root. FP5_ROOT prefixes every path (tests use a fake root).
+# Nothing here flashes, reboots, or touches /boot or boot_b.
+set -u
+
+R=${FP5_ROOT:-}
+STATE=${FP5_GUARD_STATE:-$R/var/lib/fp5-upgrade-guard}
+STORE=$STATE/store
+MANIFEST=$STATE/manifest
+LOG=${FP5_GUARD_LOG:-$R/var/log/fp5-upgrade-guard.log}
+APKDB=$R/lib/apk/db/installed
+WORLD=$R/etc/apk/world
+GSD_BIN=$R/usr/libexec/gsd-power
+KEEP=${FP5_KEEP:-$R/home/user/fp5-qtee-keep}
+GSD_PATCHED_DEFAULT=$KEEP/resuspend-20261023/gsd-power.patched
+KREL=${FP5_KREL:-$(uname -r)}
+
+# Files the FP5 kits install. Missing ones are skipped at snapshot time.
+# Edit /var/lib/fp5-upgrade-guard/extra-paths to add more (one path a line).
+DEFAULT_PATHS="
+/usr/libexec/gsd-power
+/usr/local/bin/fp5-cell-backoff
+/usr/local/bin/fp5-telephony-resume.sh
+/usr/lib/systemd/system-sleep/fp5-cell-presleep
+/etc/systemd/system/imsd.service.d/fp5-cell-gate.conf
+/etc/systemd/system/fp5-cell-backoff.service
+/etc/systemd/system/fp5-cell-backoff.timer
+/etc/systemd/system/q6voiced.service.d/10-fp5-hostless.conf
+/usr/share/q6voiced/q6voiced.conf
+/etc/systemd/system/fp5-mm-call-path-agent.service
+/usr/local/bin/fp5-mm-call-path-agent.sh
+/usr/local/bin/fp5-voice-path-on.sh
+/usr/local/bin/fp5-voice-hostless-on.sh
+/usr/local/lib/fp5-qtee/fp5_fprintd.py
+/usr/local/bin/fp5-fprintd
+/etc/dbus-1/system.d/fp5-fprintd.conf
+/usr/share/polkit-1/actions/net.reactivated.fprint.device.policy
+/usr/local/share/glib-2.0/schemas/org.gnome.login-screen.gschema.xml
+/etc/systemd/system/fp5-backlight-restore.service
+/etc/systemd/system/fp5-backlight-unblank.service
+/etc/systemd/system/fp5-backlight-screensaver-watch.service
+/etc/systemd/system/fp5-enable-paging-wakes.service
+/usr/local/bin/fp5-enable-paging-wakes.sh
+/etc/apk/commit_hooks.d/zz-fp5-upgrade-guard.sh
+"
+
+WARN=0
+FAIL=0
+ok()   { echo "OK    $*"; }
+warn() { echo "WARN  $*"; WARN=$((WARN + 1)); }
+fail() { echo "FAIL  $*"; FAIL=$((FAIL + 1)); }
+fixd() { echo "FIXED $*"; }
+sha()  { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
+
+# Installed version of an apk package, from the apk database (P:/V: records).
+pkgver() {
+	[ -f "$APKDB" ] || return 1
+	awk -v p="$1" '
+		/^P:/ { name = substr($0, 3) }
+		/^V:/ { if (name == p) { print substr($0, 3); exit } }
+		/^$/  { name = "" }
+	' "$APKDB"
+}
+
+# Package that owns a path (path without leading slash in the db).
+owner() {
+	[ -f "$APKDB" ] || return 1
+	rel=${1#/}
+	d=${rel%/*}
+	f=${rel##*/}
+	awk -v d="$d" -v f="$f" '
+		/^P:/ { name = substr($0, 3) }
+		/^F:/ { dir = substr($0, 3) }
+		/^R:/ { if (dir == d && substr($0, 3) == f) { print name; exit } }
+	' "$APKDB"
+}
+
+all_paths() {
+	echo "$DEFAULT_PATHS"
+	[ -f "$STATE/extra-paths" ] && cat "$STATE/extra-paths"
+	# out-of-tree modules for the running kernel
+	if [ -d "$R/lib/modules/$KREL/extra" ]; then
+		find "$R/lib/modules/$KREL/extra" -type f -name '*.ko*' 2>/dev/null |
+			sed "s|^$R||"
+	fi
+}
+
+cmd_snapshot() {
+	mkdir -p "$STORE"
+	tmp=$MANIFEST.new
+	: > "$tmp"
+	all_paths | while read -r p; do
+		[ -n "$p" ] || continue
+		[ -f "$R$p" ] || continue
+		mkdir -p "$STORE$(dirname "$p")"
+		cp -p "$R$p" "$STORE$p"
+		printf '%s %s %s\n' "$(sha "$R$p")" "$(stat -c %a "$R$p")" "$p" >> "$tmp"
+	done
+	mv "$tmp" "$MANIFEST"
+	{
+		echo "date=$(date -u +%FT%TZ)"
+		echo "krel=$KREL"
+		echo "kernel_pkg=$(pkgver linux-postmarketos-qcom-sc7280 || echo none)"
+		echo "gsd_pkg=$(pkgver gnome-settings-daemon || echo none)"
+		echo "gsd_sha=$(sha "$GSD_BIN")"
+		if [ -d "$R/lib/modules/$KREL" ]; then
+			echo "modules_dep_sha=$(sha "$R/lib/modules/$KREL/modules.dep")"
+		fi
+	} > "$STATE/baseline"
+	echo "snapshot: $(wc -l < "$MANIFEST") files in $MANIFEST"
+	cat "$STATE/baseline"
+}
+
+base() { sed -n "s/^$1=//p" "$STATE/baseline" 2>/dev/null; }
+
+check_gsd() {
+	mode=$1
+	want=$(base gsd_sha)
+	built_for=$(base gsd_pkg)
+	now_pkg=$(pkgver gnome-settings-daemon || echo none)
+	have=$(sha "$GSD_BIN")
+	if [ -z "$want" ]; then
+		warn "gsd-power: no baseline (run snapshot while the patched binary is live)"
+		return
+	fi
+	if [ "$have" = "$want" ]; then
+		ok "gsd-power is the patched binary ($now_pkg)"
+		return
+	fi
+	if [ "$now_pkg" != "$built_for" ]; then
+		fail "gsd-power is stock: gnome-settings-daemon $built_for -> $now_pkg. The saved binary was built for $built_for; rebuild it (resuspend/build-gsd-power.sh) before re-applying. Phone will not re-suspend after unattended wakes until then."
+		return
+	fi
+	src=$STORE/usr/libexec/gsd-power
+	[ -f "$src" ] || src=$GSD_PATCHED_DEFAULT
+	if [ "$(sha "$src")" != "$want" ]; then
+		fail "gsd-power is stock and no copy with sha $want is available"
+		return
+	fi
+	if [ "$mode" != fix ]; then
+		fail "gsd-power is stock (same package $now_pkg); 'fix' puts the patched one back"
+		return
+	fi
+	cp "$src" "$GSD_BIN.fp5new" && chmod 755 "$GSD_BIN.fp5new" && mv "$GSD_BIN.fp5new" "$GSD_BIN" || {
+		fail "gsd-power: copy failed"
+		return
+	}
+	fixd "gsd-power patched binary re-installed"
+	# gsd-power has RefuseManualStart/Stop; a KILL makes systemd respawn it.
+	if [ -z "$R" ] && pid=$(pgrep -x gsd-power); then
+		kill -KILL "$pid" 2>/dev/null && fixd "gsd-power restarted (pid $pid killed, systemd respawns it)"
+	fi
+}
+
+check_files() {
+	mode=$1
+	[ -f "$MANIFEST" ] || { warn "no manifest (run snapshot)"; return; }
+	while read -r want perm p; do
+		[ "$p" = /usr/libexec/gsd-power ] && continue
+		case $p in /lib/modules/*) continue ;; esac
+		have=$(sha "$R$p")
+		[ "$have" = "$want" ] && continue
+		what=changed
+		[ -f "$R$p" ] || what=missing
+		own=$(owner "$p")
+		[ -n "$own" ] && what="$what (now owned by apk package $own)"
+		if [ "$mode" = fix ] && [ -f "$STORE$p" ] && [ "$(sha "$STORE$p")" = "$want" ]; then
+			mkdir -p "$(dirname "$R$p")"
+			cp -p "$STORE$p" "$R$p.fp5new" && chmod "$perm" "$R$p.fp5new" && mv "$R$p.fp5new" "$R$p" &&
+				{ fixd "$p restored ($what)"; NEED_RELOAD=1; continue; }
+		fi
+		fail "$p $what"
+	done < "$MANIFEST"
+	if [ "${NEED_RELOAD:-0}" = 1 ] && [ -z "$R" ]; then
+		systemctl daemon-reload && fixd "systemctl daemon-reload"
+	fi
+}
+
+check_kernel() {
+	mode=$1
+	md=$R/lib/modules/$KREL
+	if [ ! -d "$md" ]; then
+		fail "no $md: the running kernel has no modules (display, Wi-Fi, modem, USB gadget all need them)"
+		return
+	fi
+	ok "modules dir $md present"
+	bpkg=$(base kernel_pkg)
+	npkg=$(pkgver linux-postmarketos-qcom-sc7280 || echo none)
+	bdep=$(base modules_dep_sha)
+	ndep=$(sha "$md/modules.dep")
+	own=$(owner "/lib/modules/$KREL/modules.order")
+	[ -z "$own" ] && own=$(owner "/usr/lib/modules/$KREL/modules.order")
+	case $KREL in
+	*-fp5*) ok "custom kernel $KREL has its own version string (a distro kernel apk cannot overwrite its modules)" ;;
+	*)
+		if [ -n "$own" ]; then
+			warn "modules for $KREL are owned by apk package $own: a kernel package upgrade replaces them under the custom kernel"
+		fi
+		;;
+	esac
+	if [ -n "$bpkg" ] && [ "$bpkg" != "$npkg" ]; then
+		case $KREL in
+		*-fp5*) ok "distro kernel package changed $bpkg -> $npkg (does not affect $KREL)" ;;
+		*) fail "distro kernel package changed $bpkg -> $npkg while running $KREL: its modules may now be the distro build. Check 'journalctl -k -b | grep BTF' and keep the revert image ready" ;;
+		esac
+	fi
+	if [ -n "$bdep" ] && [ "$bdep" != "$ndep" ]; then
+		warn "$md/modules.dep changed since snapshot"
+	fi
+	# extra/ modules from the manifest
+	if [ -f "$MANIFEST" ]; then
+		ex=$STATE/.extra.$$
+		grep " /lib/modules/$KREL/extra/" "$MANIFEST" > "$ex" || true
+		while read -r want perm p; do
+			if [ "$(sha "$R$p")" = "$want" ]; then
+				ok "out-of-tree $(basename "$p")"
+			elif [ "$mode" = fix ] && [ -f "$STORE$p" ]; then
+				mkdir -p "$(dirname "$R$p")"
+				cp -p "$STORE$p" "$R$p" && fixd "$p restored"
+			else
+				fail "out-of-tree module $p missing or changed"
+			fi
+		done < "$ex"
+		rm -f "$ex"
+	fi
+	if [ -z "$R" ] && command -v journalctl >/dev/null 2>&1; then
+		n=$(journalctl -k -b 0 --no-pager 2>/dev/null | grep -c 'failed to validate module') || true
+		[ "${n:-0}" -gt 0 ] && fail "$n modules failed BTF validation this boot (journalctl -k -b | grep 'failed to validate module')"
+	fi
+}
+
+check_misc() {
+	for f in $R/usr/share/deviceinfo/deviceinfo $R/etc/deviceinfo; do
+		[ -f "$f" ] || continue
+		v=$(sed -n 's/^deviceinfo_flash_kernel_on_update="\(.*\)"/\1/p' "$f" | tail -1)
+		if [ -n "$v" ] && [ "$v" != false ]; then
+			fail "$f: deviceinfo_flash_kernel_on_update=$v (must be false: an upgrade would flash boot)"
+		fi
+	done
+	grep -q '^deviceinfo_flash_kernel_on_update="false"' $R/etc/deviceinfo 2>/dev/null &&
+		ok "deviceinfo_flash_kernel_on_update=false" ||
+		warn "no deviceinfo_flash_kernel_on_update=\"false\" in /etc/deviceinfo"
+	if [ -n "$(pkgver gnome-settings-daemon-mobile)" ]; then
+		fail "gnome-settings-daemon-mobile is installed (postmarketos-ui-phosh forbids it)"
+	fi
+	if [ -z "$R" ] && command -v sshd >/dev/null 2>&1; then
+		sshd -t 2>/dev/null && ok "sshd -t" || fail "sshd -t fails: SSH may refuse new logins (2026-10-08 hostkey break). Reboot or 'rc' sshd before logging out"
+	fi
+}
+
+cmd_check() {
+	mode=$1
+	[ -f "$STATE/baseline" ] || warn "no baseline at $STATE/baseline (run: fp5-upgrade-guard snapshot)"
+	check_gsd "$mode"
+	check_files "$mode"
+	check_kernel "$mode"
+	check_misc
+	echo "summary: $FAIL fail, $WARN warn"
+	[ "$FAIL" -gt 0 ] && return 2
+	[ "$WARN" -gt 0 ] && return 1
+	return 0
+}
+
+cmd_pin() {
+	v=$(pkgver gnome-settings-daemon) || { echo "gnome-settings-daemon not installed"; return 1; }
+	[ -n "$v" ] || { echo "gnome-settings-daemon not installed"; return 1; }
+	grep -v '^gnome-settings-daemon\([=<>~].*\)\{0,1\}$' "$WORLD" > "$WORLD.fp5new" || true
+	echo "gnome-settings-daemon=$v" >> "$WORLD.fp5new"
+	mv "$WORLD.fp5new" "$WORLD"
+	echo "pinned gnome-settings-daemon=$v in $WORLD"
+	echo "apk upgrade now keeps it; an upgrade that needs a newer one stops with an error instead."
+}
+
+cmd_unpin() {
+	grep -v '^gnome-settings-daemon=' "$WORLD" > "$WORLD.fp5new" || true
+	grep -q '^gnome-settings-daemon$' "$WORLD.fp5new" || echo gnome-settings-daemon >> "$WORLD.fp5new"
+	mv "$WORLD.fp5new" "$WORLD"
+	echo "unpinned gnome-settings-daemon"
+}
+
+case ${1:-check} in
+snapshot) cmd_snapshot ;;
+check) cmd_check check ;;
+fix) cmd_check fix ;;
+pin) cmd_pin ;;
+unpin) cmd_unpin ;;
+*) sed -n '2,13p' "$0"; exit 64 ;;
+esac
