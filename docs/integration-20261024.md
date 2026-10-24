@@ -14,7 +14,7 @@ and restore script.
 | `fprintd` | bfa5540 (9a11ab8) | `fp5-fprintd`: Python `net.reactivated.Fprint` stand-in on top of `fp5-qtee-session`; unknown lock state counts as locked | Phone-tested (owner), kit `fprintd-20261022`. |
 | `resuspend` | a45d135 | gsd-power patch: reset idle mode on resume (phone re-suspends after an unattended wake) + build/deploy/restore | Deployed 2026-10-23, tested with RTC wakes. |
 | `fprint-integration` | 780e017 | GTK4 Fingerprints app, `org.fp5.Fprint.Manage` (`ListDetailed`, `RelabelFinger`), GNOME Settings `org.gnome.login-screen` schema shim | Deployed 2026-10-23; list + Settings "Fingerprint Login" seen. **Not user-tested: app rename / enroll / delete, and sudo via `pam_fprintd`.** |
-| `cell-backoff` | 4227de9 | Suspend-safe mobile-data retry backoff (NM/imsd/resume hook, pre-sleep cancel) | Deployed 2026-10-24, **only a ~45 min test** so far. |
+| `cell-backoff` | 5eac7d5 (4227de9) | Suspend-safe mobile-data retry backoff (NM/imsd/resume hook, pre-sleep cancel); 5eac7d5 adds the idle-suspend re-arm | 4227de9 deployed 2026-10-24, **only a ~45 min test**. **5eac7d5 (re-arm) not deployed.** |
 
 ## Order and how the branches relate
 
@@ -35,7 +35,7 @@ So the merge is:
 1. `git merge --ff-only fprint-integration` (fast-forward; brings
    match-tuning, finger-manage, fp-wake, fprintd and resuspend with it, in
    their original order and with their original commit ids).
-2. `git merge --no-ff cell-backoff` (8ebdbab).
+2. `git merge --no-ff cell-backoff` (8ebdbab), and again after the re-arm commit 5eac7d5 (no conflicts).
 
 ## Conflicts
 
@@ -68,7 +68,7 @@ Undo in reverse deploy order. Each script only reverts its own branch.
 
 | Branch | Restore |
 |---|---|
-| cell-backoff | `sh ~/fp5-qtee-keep/cell-backoff-20261024/restore.sh` |
+| cell-backoff | `sh ~/fp5-qtee-keep/cell-backoff-20261024/restore.sh` (also stops a pending `fp5-cell-rearm`); re-arm alone: `sudo touch /etc/fp5-cell-backoff.no-rearm` |
 | fprint-integration | `sh ~/fp5-qtee-keep/fprint-integration-20261023/restore.sh` (old `fp5_fprintd.py` back, shim + app removed) |
 | resuspend | `sh ~/fp5-qtee-keep/resuspend-20261023/restore.sh` (stock gsd-power back) |
 | fprintd | `sh ~/fp5-qtee-keep/fprintd-20261022/restore.sh` (old stub daemon; storage backup path printed) |
@@ -81,6 +81,7 @@ Undo in reverse deploy order. Each script only reverts its own branch.
   warnings for the local `logl`/`logf` helpers); `make -C session test` - 4/4 ok.
   `fp5-qtee-load` (no Makefile target) links with all `fp5_*.c`.
 * `python3 -m compileall app fprintd tools` - ok.
+* `scripts/cell-backoff/test_fp5_cell_backoff.py`: 21 passed (bash; also busybox ash and dash off-desk).
 * pytest: app 159 passed (boot 4, coach 13, haptic 19, unlock 123);
   fprintd 9 + D-Bus flow 7 passed; UI flow 5 passed; tools 3 passed.
 * `ruff --select E9,F`: two pre-existing nits (unused `any_known` in
@@ -97,10 +98,13 @@ Undo in reverse deploy order. Each script only reverts its own branch.
 
 ## Risk / still to test on the phone
 
-* cell-backoff for a full day (only ~45 min so far), especially with
-  resuspend: an attempt holds a block inhibitor up to 150 s; if gsd-power's
-  idle suspend falls into that window it is refused and gsd-power does not
-  retry it (see `docs/fp-wake.md`). Watch for "phone stayed awake after a
-  cell attempt".
+* cell-backoff for a full day (only ~45 min so far). The block-inhibitor /
+  gsd-power risk (an idle suspend refused during an attempt is never retried
+  by gsd-power 51) is addressed by 5eac7d5: a transient `fp5-cell-rearm`
+  timer 20 s after each attempt suspends only if gsd-power would have by
+  then (screen off, locked, idle >= gsd timeout, action suspend, no call, no
+  other sleep block inhibitor, no suspend meanwhile). See
+  `docs/cell-backoff.md`. Needs a phone test; kill switch
+  `/etc/fp5-cell-backoff.no-rearm`.
 * Fingerprints app: rename, enroll, delete (with a finger).
 * sudo / polkit via `pam_fprintd` while unlocked with the new daemon.
