@@ -10,8 +10,8 @@ and restore script.
 | Branch | Tip | What | Phone status |
 |---|---|---|---|
 | `match-tuning` | f47b369 | Android-HAL rescan + per-step timing (916e6d7), A/B kit, `finger-manage` (read-only `fp5-qtee list`, gated remove), template learning + warm mode (e154956, f47b369) | Deployed and used since 2026-10-21 (template learning, warm mode). `remove` never run on the phone. |
-| `fp-wake` | 772bb57 | Touch-to-wake: `focaltech_fp_life` 0.8-wake (FP IRQ as wakeup source), watcher arms before sleep, screen on after a dark hit | Deployed. Suspend/resume with armed sensor verified by RTC; a real touch while suspended verified by the owner. |
-| `fprintd` | bfa5540 (9a11ab8) | `fp5-fprintd`: Python `net.reactivated.Fprint` stand-in on top of `fp5-qtee-session`; unknown lock state counts as locked | Deployed 2026-10-22; `fp5-pam-test` used. |
+| `fp-wake` | 772bb57 | Touch-to-wake: `focaltech_fp_life` 0.8-wake (FP IRQ as wakeup source), watcher arms before sleep, screen on after a dark hit | Phone-tested (owner). `docs/fp-wake.md` records the armed suspend/resume via RTC; a touch while suspended is listed there as not verified by the agent. |
+| `fprintd` | bfa5540 (9a11ab8) | `fp5-fprintd`: Python `net.reactivated.Fprint` stand-in on top of `fp5-qtee-session`; unknown lock state counts as locked | Phone-tested (owner), kit `fprintd-20261022`. |
 | `resuspend` | a45d135 | gsd-power patch: reset idle mode on resume (phone re-suspends after an unattended wake) + build/deploy/restore | Deployed 2026-10-23, tested with RTC wakes. |
 | `fprint-integration` | 780e017 | GTK4 Fingerprints app, `org.fp5.Fprint.Manage` (`ListDetailed`, `RelabelFinger`), GNOME Settings `org.gnome.login-screen` schema shim | Deployed 2026-10-23; list + Settings "Fingerprint Login" seen. **Not user-tested: app rename / enroll / delete, and sudo via `pam_fprintd`.** |
 | `cell-backoff` | 4227de9 | Suspend-safe mobile-data retry backoff (NM/imsd/resume hook, pre-sleep cancel) | Deployed 2026-10-24, **only a ~45 min test** so far. |
