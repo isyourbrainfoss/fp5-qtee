@@ -1,0 +1,136 @@
+#!/bin/sh
+# fp5-cell-backoff: keep mobile-data retries from waking the phone.
+#
+# When the network refuses packet service (e.g. prepaid SIM out of balance:
+# EMM/GMM cause 7 "gprs-not-allowed", modem stuck on GSM, PS detached),
+# NetworkManager, ims-pdn-up.sh (imsd) and the resume hook used to retry
+# all the time. A retry still in flight when the phone suspends gets its
+# failure reply from the modem 1-30 s later, which wakes the phone, which then
+# stays awake for the 300 s idle timeout -> ~6 min awake per cycle.
+#
+# Policy while packet service is detached:
+#   - NetworkManager autoconnect on qrtr0 is switched off (runtime only,
+#     back to normal after reboot or `fp5-cell-backoff on`)
+#   - imsd is not started (drop-in ExecCondition) and a looping start is stopped
+#   - one recovery attempt (radio off/on clears the modem's "PS invalid" state
+#     after a cause-7 reject, then try data) at most every BACKOFF, doubling
+#     15 min -> 4 h, wall clock (time asleep counts). While the screen is on the
+#     wait is capped at 30 min so data returns soon after a top-up when used.
+#   - attempts hold a sleep block inhibitor (max ATTEMPT_MAX s) so no attempt
+#     is ever in flight across suspend; pre-sleep cancels anything pending.
+# When attached again: autoconnect back on, data brought up, imsd started,
+# backoff reset. Calls/SMS (CS) are never touched except the short radio
+# cycle inside an attempt.
+#
+# Usage: fp5-cell-backoff resume|timer|pre-sleep|status|reset|on|ps-attached
+set -u
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+CONN="${FP5_CELL_CONN:-Telenor smart}"
+DEV="${FP5_CELL_DEV:-qrtr0}"
+ST=/var/lib/fp5-cell
+MIN=900; MAX=14400; USER_CAP=1800; ATTEMPT_MAX=150
+mkdir -p "$ST" 2>/dev/null
+log() { echo "$(date -u +%FT%TZ) fp5-cell-backoff[$MODE]: $*"; logger -t fp5-cell-backoff "$*" 2>/dev/null || true; }
+kv() { mmcli -m any -K 2>/dev/null | sed -n "s/^$1 *: *//p" | head -1; }
+ps_attached() { [ "$(kv modem.3gpp.packet-service-state)" = attached ]; }
+registered() { case "$(kv modem.generic.state)" in registered|connected|connecting|disconnecting) return 0;; esac; return 1; }
+screen_on() { for _bl in /sys/class/backlight/*/bl_power; do [ "$(cat "$_bl" 2>/dev/null)" = 0 ] && return 0; done; return 1; }
+get() { cat "$ST/$1" 2>/dev/null || echo "${2:-0}"; }
+put() { echo "$2" > "$ST/$1"; }
+cell_ip() { for d in qmapmux0.0 qmapmux0.1 rmnet_ipa0; do ip -4 addr show "$d" 2>/dev/null | grep -q inet && return 0; done; return 1; }
+
+quiet_retries() {
+	# runtime-only: stops NM's endless activation loop on the modem device
+	[ "$(nmcli -g GENERAL.AUTOCONNECT device show "$DEV" 2>/dev/null)" = yes ] \
+		&& nmcli device set "$DEV" autoconnect no 2>/dev/null && log "NM autoconnect on $DEV off (data unavailable)"
+	case "$(nmcli -g GENERAL.STATE device show "$DEV" 2>/dev/null)" in
+		4[0-9]*|5[0-9]*|60*|70*|80*|90*) nmcli device disconnect "$DEV" >/dev/null 2>&1 && log "cancelled pending activation on $DEV";;
+	esac
+	if systemctl is-active -q imsd.service || [ "$(systemctl show -p ActiveState --value imsd.service)" = activating ]; then
+		systemctl stop imsd.service 2>/dev/null && log "stopped imsd bring-up loop (no packet service)"
+	fi
+}
+
+data_up() {
+	[ "$(nmcli -g GENERAL.AUTOCONNECT device show "$DEV" 2>/dev/null)" = yes ] \
+		|| { nmcli device set "$DEV" autoconnect yes 2>/dev/null; log "NM autoconnect on $DEV on"; }
+	cell_ip || timeout 45 nmcli connection up "$CONN" >/dev/null 2>&1 || true
+	systemctl is-active -q imsd.service || systemctl start --no-block imsd.service 2>/dev/null
+	put backoff 0; put next 0
+}
+
+attempt() {
+	log "recovery attempt (backoff $(get backoff)s)"
+	m=$(mmcli -L 2>/dev/null | sed -n 's|.*/Modem/\([0-9]*\).*|\1|p' | head -1)
+	[ -n "$m" ] || { log "no modem"; return 1; }
+	if mmcli -m "$m" --voice-list-calls 2>/dev/null | grep -q /Call/; then
+		log "call present - no radio cycle now"; return 1
+	fi
+	# radio off/on: after a cause-7 reject the modem treats the SIM as PS-invalid
+	# until it is power-cycled, so a top-up is otherwise never noticed
+	timeout 20 mmcli -m "$m" -d >/dev/null 2>&1
+	timeout 30 mmcli -m "$m" -e >/dev/null 2>&1
+	i=0; while [ $i -lt 20 ] && ! registered; do sleep 3; i=$((i+1)); done
+	timeout 20 mmcli -m "$m" --3gpp-register-home >/dev/null 2>&1
+	i=0; while [ $i -lt 10 ] && ! ps_attached; do sleep 3; i=$((i+1)); done
+	if ps_attached; then
+		log "packet service attached"
+		data_up; return 0
+	fi
+	log "still detached ($(kv modem.generic.access-technologies.value\\[1\\]), $(kv modem.generic.state))"
+	return 1
+}
+
+MODE="${1:-status}"
+now=$(date +%s)
+case "$MODE" in
+__attempt)
+	MODE=attempt; attempt; exit $? ;;
+ps-attached)
+	ps_attached; exit $? ;;
+status)
+	echo "packet=$(kv modem.3gpp.packet-service-state) state=$(kv modem.generic.state) tech=$(kv 'modem.generic.access-technologies.value\[1\]')"
+	echo "backoff=$(get backoff)s next_try_in=$(( $(get next) - now ))s nm_autoconnect=$(nmcli -g GENERAL.AUTOCONNECT device show "$DEV" 2>/dev/null) imsd=$(systemctl show -p ActiveState --value imsd.service)"
+	exit 0 ;;
+reset|on)
+	put backoff 0; put next 0
+	nmcli device set "$DEV" autoconnect yes 2>/dev/null
+	log "reset: autoconnect on, next resume/timer tries at once"
+	exit 0 ;;
+pre-sleep)
+	# must be quick: never wait on the modem here
+	if ! ps_attached; then
+		[ "$(nmcli -g GENERAL.AUTOCONNECT device show "$DEV" 2>/dev/null)" = yes ] && nmcli device set "$DEV" autoconnect no 2>/dev/null
+		timeout 3 mmcli -m any --simple-disconnect >/dev/null 2>&1
+		pkill -f /usr/libexec/ims-pdn-up.sh 2>/dev/null && log "pre-sleep: killed ims-pdn-up"
+	fi
+	exit 0 ;;
+resume|timer) ;;
+*) echo "usage: $0 resume|timer|pre-sleep|status|reset|on|ps-attached" >&2; exit 2 ;;
+esac
+
+exec 9>/run/fp5-cell-backoff.lock
+flock -n 9 || exit 0
+mmcli -L 2>/dev/null | grep -q Modem || { sleep 10; mmcli -L 2>/dev/null | grep -q Modem || { log "no modem yet"; exit 0; }; }
+
+if ps_attached; then
+	[ "$(get backoff)" = 0 ] || log "packet service back"
+	data_up; exit 0
+fi
+quiet_retries
+b=$(get backoff); last=$(get last)
+wait=$b; screen_on && [ "$wait" -gt "$USER_CAP" ] && wait=$USER_CAP
+if [ $((now - last)) -lt "$wait" ]; then
+	exit 0
+fi
+[ "$MODE" = timer ] && ! screen_on && [ "$b" != 0 ] && exit 0   # idle: leave it to the next resume
+put last "$now"
+if systemd-inhibit --what=sleep --mode=block --who=fp5-cell-backoff --why="mobile data retry" \
+	timeout "$ATTEMPT_MAX" "$0" __attempt; then
+	exit 0
+fi
+nb=$(( b * 2 )); [ "$nb" -lt "$MIN" ] && nb=$MIN; [ "$nb" -gt "$MAX" ] && nb=$MAX
+put backoff "$nb"; put next $((now + nb))
+quiet_retries
+log "no packet service; next attempt in $((nb/60)) min (or 30 min when the screen is on)"
+exit 0

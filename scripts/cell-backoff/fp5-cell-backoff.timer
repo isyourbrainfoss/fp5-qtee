@@ -1,0 +1,8 @@
+[Unit]
+Description=FP5 mobile data retry check (only acts while awake; backoff inside)
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=10min
+AccuracySec=1min
+[Install]
+WantedBy=timers.target
