@@ -86,8 +86,14 @@ Undo in reverse deploy order. Each script only reverts its own branch.
 * `ruff --select E9,F`: two pre-existing nits (unused `any_known` in
   `seat_locked`, unused `Gtk` import in `test_ui.py`). Left as is: the
   daemon is the deployed code.
-* shellcheck: see the commit that adds this file / the report; it is not
-  installed on the desk.
+* shellcheck 0.11 (`-S warning`, run off-desk on a `git archive` of this
+  branch) over every sh/bash script in `scripts/`, `app/`, `kernel/`: no
+  errors in real scripts. Only: SC2148/SC2034 in the sourced
+  `scripts/{learn,fp-wake}/common.sh` (no shebang, vars used by the
+  caller - expected), SC2034 unused loop var in
+  `resuspend/restart-gsd-power.sh`, SC2046 unquoted `$(date +%s)` in
+  `resuspend/wake-recorder.sh`, SC2024 in `app/fp5-qtee` (log redirect is
+  meant to be the user's file). `scripts/cell-backoff/*` is clean.
 
 ## Risk / still to test on the phone
 
