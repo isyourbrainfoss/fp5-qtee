@@ -35,7 +35,52 @@ reply from the modem later, which wakes the phone; it then stays up for the 300 
   the backoff is 0).
 Calls/SMS: CS registration is untouched except the ~20 s radio cycle inside an attempt.
 
+## Idle suspend during an attempt (re-arm, 2026-10-24, not yet on the phone)
+Risk: gsd-power 51 decides idle suspend once per idle stretch. When its sleep idle watch
+fires it calls logind `Suspend(false)` asynchronously and sets `current_idle_mode = SLEEP`
+(`idle_set_mode()`, gsd-power-manager.c). A logind refusal (our block inhibitor) is only
+logged ("Error calling suspend action"); the mode stays SLEEP, the watch does not fire again
+and "less idle" modes are ignored, so nothing suspends until the user touches the phone.
+(gsd's own "inhibited -> retry later" path only covers gnome-session inhibitors.) An
+attempt (<= 150 s) that overlaps the sleep timeout, e.g. a `timer` run with backoff 0 while
+the phone sits idle, would leave the phone awake.
+
+Options considered:
+- delay inhibitor instead of block: logind suspends after `InhibitDelayMaxSec` (5 s) anyway,
+  i.e. mid-attempt - the radio may be left off (no calls) or the attach reply wakes the phone
+  again, which is the bug this kit fixes. Rejected.
+- patch gsd-power to retry after a failed Suspend / on inhibitor release: needs a second gsd
+  patch and rebuild on the phone, and gsd-power has no hook for logind inhibitor changes
+  (`BlockInhibited` would need a new watch). Larger and only helps this one daemon. Not done.
+- **re-arm from cell-backoff (chosen)**: after every attempt (success or not) `systemd-run`
+  starts a transient timer `fp5-cell-rearm` 20 s later (outside the sleep hook, so it never
+  asks for a suspend from inside a suspend transaction). `fp5-cell-backoff rearm <n>`
+  suspends with `systemctl suspend` only if gsd-power itself would have by now:
+  - the suspend count (`/sys/power/suspend_stats/success`) is still the one from scheduling
+    (nothing slept meanwhile, including gsd itself),
+  - every panel off (`bl_power != 0`),
+  - logind `BlockInhibited` has no `sleep` (an SSH session, a call app, ... still win;
+    our own lock is already released),
+  - no voice call in ModemManager,
+  - the active wayland session is locked (`LockedHint=yes`),
+  - the session user's gsd setting `sleep-inactive-{battery|ac}-type` (by UPower
+    `OnBattery`) is `suspend` and its timeout is > 0,
+  - Mutter/Phosh idle time (`org.gnome.Mutter.IdleMonitor.GetIdletime` on the user's
+    session bus) >= that timeout.
+  Any unknown value means no suspend. It never suspends earlier than the user's own
+  setting and never while the screen is on or someone is using the phone. Delay
+  inhibitors (fp-wake's arming, NM, MM) are honoured by logind as for any suspend. After
+  that suspend the resuspend patch resets gsd's idle mode on resume as usual.
+
+Each decision is logged (`journalctl -t fp5-cell-backoff`): "no re-arm: <why>" or
+"idle past the gsd-power timeout ...: suspending".
+    sudo fp5-cell-backoff rearm-check        # dry run: what it would decide now
+    sudo touch /etc/fp5-cell-backoff.no-rearm  # kill switch (no timer, no suspend)
+Tests: `python3 -m unittest scripts/cell-backoff/test_fp5_cell_backoff.py` (fake
+mmcli/loginctl/gsettings/gdbus/busctl/systemd-run in PATH, fake /sys).
+
 ## Use
     fp5-cell-backoff status     # packet state, backoff, next try
     sudo fp5-cell-backoff reset # after a top-up: try at the next resume/timer
-    sh ~/fp5-qtee-keep/cell-backoff-20261024/restore.sh   # undo everything
+    sh ~/fp5-qtee-keep/cell-backoff-20261024/restore.sh   # undo everything (also stops a pending fp5-cell-rearm)
+    # re-arm only: sudo touch /etc/fp5-cell-backoff.no-rearm (rm it to turn back on)

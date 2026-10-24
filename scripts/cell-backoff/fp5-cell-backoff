@@ -18,26 +18,92 @@
 #     wait is capped at 30 min so data returns soon after a top-up when used.
 #   - attempts hold a sleep block inhibitor (max ATTEMPT_MAX s) so no attempt
 #     is ever in flight across suspend; pre-sleep cancels anything pending.
+#   - re-arm: gsd-power 51 does not retry an idle suspend that logind refused
+#     (its Suspend call fails, current_idle_mode is already SLEEP, the idle
+#     watch does not fire again). So after every attempt a transient timer
+#     runs `rearm` REARM_GRACE s later. It suspends only if gsd-power itself
+#     would have by now: screen off, session locked, Mutter idle time >= the
+#     gsd sleep-inactive timeout with action 'suspend', no call, no other
+#     sleep block inhibitor (ssh etc.), and no suspend happened meanwhile.
+#     Kill switch: touch /etc/fp5-cell-backoff.no-rearm
 # When attached again: autoconnect back on, data brought up, imsd started,
 # backoff reset. Calls/SMS (CS) are never touched except the short radio
 # cycle inside an attempt.
 #
-# Usage: fp5-cell-backoff resume|timer|pre-sleep|status|reset|on|ps-attached
+# Usage: fp5-cell-backoff resume|timer|pre-sleep|status|reset|on|ps-attached|rearm [n]|rearm-check
 set -u
-export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH=${FP5_CELL_TESTBIN:+$FP5_CELL_TESTBIN:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 CONN="${FP5_CELL_CONN:-Telenor smart}"
 DEV="${FP5_CELL_DEV:-qrtr0}"
-ST=/var/lib/fp5-cell
-MIN=900; MAX=14400; USER_CAP=1800; ATTEMPT_MAX=150
+ST=${FP5_CELL_ST:-/var/lib/fp5-cell}
+SYS=${FP5_CELL_SYS:-/sys}
+LOCK=${FP5_CELL_LOCK:-/run/fp5-cell-backoff.lock}
+NO_REARM=${FP5_CELL_NO_REARM:-/etc/fp5-cell-backoff.no-rearm}
+MIN=900; MAX=14400; USER_CAP=1800; ATTEMPT_MAX=150; REARM_GRACE=${FP5_CELL_REARM_GRACE:-20}
 mkdir -p "$ST" 2>/dev/null
 log() { echo "$(date -u +%FT%TZ) fp5-cell-backoff[$MODE]: $*"; logger -t fp5-cell-backoff "$*" 2>/dev/null || true; }
 kv() { mmcli -m any -K 2>/dev/null | sed -n "s/^$1 *: *//p" | head -1; }
 ps_attached() { [ "$(kv modem.3gpp.packet-service-state)" = attached ]; }
 registered() { case "$(kv modem.generic.state)" in registered|connected|connecting|disconnecting) return 0;; esac; return 1; }
-screen_on() { for _bl in /sys/class/backlight/*/bl_power; do [ "$(cat "$_bl" 2>/dev/null)" = 0 ] && return 0; done; return 1; }
+screen_on() { for _bl in "$SYS"/class/backlight/*/bl_power; do [ "$(cat "$_bl" 2>/dev/null)" = 0 ] && return 0; done; return 1; }
 get() { cat "$ST/$1" 2>/dev/null || echo "${2:-0}"; }
 put() { echo "$2" > "$ST/$1"; }
 cell_ip() { for d in qmapmux0.0 qmapmux0.1 rmnet_ipa0; do ip -4 addr show "$d" 2>/dev/null | grep -q inet && return 0; done; return 1; }
+
+# ---- re-arm idle suspend (see header) ----
+suspends() { cat "$SYS/power/suspend_stats/success" 2>/dev/null || echo 0; }
+call_present() { mmcli -m any --voice-list-calls 2>/dev/null | grep -q /Call/; }
+# Active graphical session -> "sid uid name locked" (empty if none)
+gui_session() {
+	for _sid in $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}'); do
+		_p=$(loginctl show-session "$_sid" -p Type -p Active -p LockedHint -p User -p Name 2>/dev/null)
+		echo "$_p" | grep -qx 'Type=wayland' || continue
+		echo "$_p" | grep -qx 'Active=yes' || continue
+		echo "$_sid $(echo "$_p" | sed -n 's/^User=//p') $(echo "$_p" | sed -n 's/^Name=//p') $(echo "$_p" | sed -n 's/^LockedHint=//p')"
+		return 0
+	done
+}
+as_user() { # uid name cmd...
+	_u=$1; _n=$2; shift 2
+	if command -v runuser >/dev/null 2>&1; then
+		runuser -u "$_n" -- env DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$_u/bus" "$@" 2>/dev/null
+	else
+		sudo -n -u "$_n" env DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$_u/bus" "$@" 2>/dev/null
+	fi
+}
+on_battery() { busctl get-property org.freedesktop.UPower /org/freedesktop/UPower org.freedesktop.UPower OnBattery 2>/dev/null | grep -q true; }
+# Why not to suspend now ("" = go). $1 = suspend count when scheduled.
+rearm_veto() {
+	[ -e "$NO_REARM" ] && { echo "disabled ($NO_REARM)"; return; }
+	[ "$(suspends)" = "${1:-x}" ] || { echo "suspended since (count ${1:-?} -> $(suspends))"; return; }
+	screen_on && { echo "screen on"; return; }
+	busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager \
+		BlockInhibited 2>/dev/null | grep -Eq '(^|[" :])sleep([":]|$)' && { echo "another sleep block inhibitor"; return; }
+	call_present && { echo "call present"; return; }
+	# shellcheck disable=SC2046
+	set -- $(gui_session)
+	[ $# -ge 4 ] || { echo "no active graphical session"; return; }
+	_uid=$2; _name=$3
+	[ "$4" = yes ] || { echo "session not locked"; return; }
+	if on_battery; then _k=battery; else _k=ac; fi
+	_type=$(as_user "$_uid" "$_name" gsettings get org.gnome.settings-daemon.plugins.power "sleep-inactive-$_k-type" | tr -d "'")
+	[ "$_type" = suspend ] || { echo "gsd $_k action is '${_type:-?}'"; return; }
+	_to=$(as_user "$_uid" "$_name" gsettings get org.gnome.settings-daemon.plugins.power "sleep-inactive-$_k-timeout" | sed 's/^[a-z0-9]* //')
+	case $_to in ''|*[!0-9]*) echo "gsd timeout unknown"; return;; esac
+	[ "$_to" -gt 0 ] || { echo "gsd $_k timeout 0 (never)"; return; }
+	_idle=$(as_user "$_uid" "$_name" gdbus call --session --dest org.gnome.Mutter.IdleMonitor \
+		--object-path /org/gnome/Mutter/IdleMonitor/Core --method org.gnome.Mutter.IdleMonitor.GetIdletime |
+		sed -n 's/^(uint64 \([0-9]*\),)$/\1/p')
+	[ -n "$_idle" ] || { echo "idle time unknown"; return; }
+	[ $((_idle / 1000)) -ge "$_to" ] || { echo "idle $((_idle / 1000))s < $_to s (gsd-power will suspend itself)"; return; }
+	echo ""
+}
+schedule_rearm() {
+	[ -e "$NO_REARM" ] && return 0
+	systemd-run --quiet --no-block --unit=fp5-cell-rearm --on-active="$REARM_GRACE" \
+		--timer-property=AccuracySec=1s /usr/local/bin/fp5-cell-backoff rearm "$(suspends)" >/dev/null 2>&1 \
+		|| log "re-arm timer not scheduled (one pending?)"
+}
 
 quiet_retries() {
 	# runtime-only: stops NM's endless activation loop on the modem device
@@ -88,6 +154,17 @@ __attempt)
 	MODE=attempt; attempt; exit $? ;;
 ps-attached)
 	ps_attached; exit $? ;;
+rearm-check)
+	# dry run: what `rearm` would decide right now (never suspends)
+	why=$(rearm_veto "$(suspends)")
+	echo "rearm: ${why:-would suspend now}"; exit 0 ;;
+rearm)
+	why=$(rearm_veto "${2:-}")
+	if [ -n "$why" ]; then
+		log "no re-arm: $why"; exit 0
+	fi
+	log "idle past the gsd-power timeout while our attempt blocked sleep: suspending"
+	systemctl suspend; exit $? ;;
 status)
 	echo "packet=$(kv modem.3gpp.packet-service-state) state=$(kv modem.generic.state) tech=$(kv 'modem.generic.access-technologies.value\[1\]')"
 	echo "backoff=$(get backoff)s next_try_in=$(( $(get next) - now ))s nm_autoconnect=$(nmcli -g GENERAL.AUTOCONNECT device show "$DEV" 2>/dev/null) imsd=$(systemctl show -p ActiveState --value imsd.service)"
@@ -106,10 +183,10 @@ pre-sleep)
 	fi
 	exit 0 ;;
 resume|timer) ;;
-*) echo "usage: $0 resume|timer|pre-sleep|status|reset|on|ps-attached" >&2; exit 2 ;;
+*) echo "usage: $0 resume|timer|pre-sleep|status|reset|on|ps-attached|rearm [n]|rearm-check" >&2; exit 2 ;;
 esac
 
-exec 9>/run/fp5-cell-backoff.lock
+exec 9>"$LOCK"
 flock -n 9 || exit 0
 mmcli -L 2>/dev/null | grep -q Modem || { sleep 10; mmcli -L 2>/dev/null | grep -q Modem || { log "no modem yet"; exit 0; }; }
 
@@ -127,8 +204,10 @@ fi
 put last "$now"
 if systemd-inhibit --what=sleep --mode=block --who=fp5-cell-backoff --why="mobile data retry" \
 	timeout "$ATTEMPT_MAX" "$0" __attempt; then
+	schedule_rearm
 	exit 0
 fi
+schedule_rearm
 nb=$(( b * 2 )); [ "$nb" -lt "$MIN" ] && nb=$MIN; [ "$nb" -gt "$MAX" ] && nb=$MAX
 put backoff "$nb"; put next $((now + nb))
 quiet_retries

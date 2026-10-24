@@ -23,4 +23,6 @@ S systemctl daemon-reload
 S systemctl enable --now fp5-cell-backoff.timer
 S /usr/local/bin/fp5-cell-backoff timer || true
 /usr/local/bin/fp5-cell-backoff status
+command -v runuser >/dev/null 2>&1 || echo "note: no runuser; re-arm uses sudo -n -u <session user>"
+S /usr/local/bin/fp5-cell-backoff rearm-check
 echo "deployed; restore: $K/restore.sh"
