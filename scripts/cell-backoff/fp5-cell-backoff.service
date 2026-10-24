@@ -1,0 +1,6 @@
+[Unit]
+Description=FP5 mobile data retry with backoff (suspend-safe)
+After=ModemManager.service NetworkManager.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/fp5-cell-backoff timer

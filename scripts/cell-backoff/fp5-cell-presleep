@@ -1,0 +1,6 @@
+#!/bin/sh
+# systemd-sleep hook: no mobile-data attempt may be pending across suspend.
+case "$1" in
+  pre) timeout 5 /usr/local/bin/fp5-cell-backoff pre-sleep >>/var/tmp/fp5-cell-backoff.log 2>&1 || true ;;
+esac
+exit 0
