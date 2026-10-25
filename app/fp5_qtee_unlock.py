@@ -611,6 +611,14 @@ class UnlockPolicy:
             except OSError:
                 pass
 
+    def pin_pending(self) -> bool:
+        """A PIN unlock was seen and waits for its LOCK_FLICKER_S hold.
+
+        Callers must ask LockedHint again soon (LOCK_POLL_S), or a short
+        PIN unlock (unlock, glance, lock) is never credited.
+        """
+        return self._unlock_since is not None
+
     def forget_session(self) -> None:
         """A different (or unknown) session: no transition carries over."""
         self.prev_locked = None
@@ -1341,7 +1349,9 @@ class UnlockWatcher:
                 last_lock_ask = 0.0
             now = time.monotonic()
             interval = (
-                LOCK_POLL_S if (believed_locked or on) else UNLOCKED_LOCK_POLL_S
+                LOCK_POLL_S
+                if (believed_locked or on or self.policy.pin_pending())
+                else UNLOCKED_LOCK_POLL_S
             )
             if last_lock_ask and now - last_lock_ask < interval:
                 time.sleep(PANEL_POLL_S)
@@ -1783,8 +1793,9 @@ class WarmLoop:
             if signalled:
                 # Locked (or unlocked) while dark: look now.
                 due = True
-            elif self.off_checks and now >= self.next_lock_ask:
-                self.off_checks -= 1
+            elif (self.off_checks or self.w.policy.pin_pending()) and now >= self.next_lock_ask:
+                if self.off_checks:
+                    self.off_checks -= 1
                 self.next_lock_ask = now + 1.0
                 due = True
             elif not self._have_signals() and now >= self.dark_ask_at:
@@ -1805,8 +1816,12 @@ class WarmLoop:
             self.next_lock_ask = now
         if now >= self.next_lock_ask:
             # Locked: every LOCK_POLL_S, as before. Unlocked with logind
-            # signals: a slow safety poll only.
-            slow = not self.believed_locked and self._have_signals()
+            # signals: a slow safety poll only, except while a PIN unlock
+            # waits for its hold. Without that, an unlock shorter than
+            # UNLOCKED_LOCK_POLL_S never refreshed the PIN marker, and
+            # after 72 h fingerprint unlock stayed off for good.
+            slow = (not self.believed_locked and self._have_signals()
+                    and not self.w.policy.pin_pending())
             self.next_lock_ask = now + (UNLOCKED_LOCK_POLL_S if slow else LOCK_POLL_S)
             state = self.ask_lock()
             if state is None:

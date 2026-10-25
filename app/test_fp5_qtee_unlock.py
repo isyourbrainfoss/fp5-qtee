@@ -1571,6 +1571,82 @@ class FakeSignals:
         return seen
 
 
+class _FakeSignals:
+    alive = True
+
+    def __init__(self) -> None:
+        self.pending = False
+
+    def poll(self) -> bool:
+        fired, self.pending = self.pending, False
+        return fired
+
+    def take_sleep_events(self) -> list[bool]:
+        return []
+
+    def close(self) -> None:
+        pass
+
+
+class WarmPinCreditTest(unittest.TestCase):
+    """A short PIN unlock (unlock, glance, lock) must refresh the PIN.
+
+    Regression: with logind signals the unlocked poll was 15 s, so an
+    unlock shorter than that never held for LOCK_FLICKER_S in two
+    samples, the marker went stale and after 72 h the finger stayed off.
+    """
+
+    step = WarmLoopTest.step
+
+    def setUp(self) -> None:
+        WarmLoopTest.setUp(self)  # type: ignore[arg-type]
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        marker = Path(tmp.name) / "fp5-qtee-pin-ok"
+        marker.write_text("1.0\n")
+        self.now[0] = 1.0 + 73 * 3600.0
+        self.w.policy = UnlockPolicy(
+            require_pin=True, marker=marker, clock=lambda: self.now[0],
+            state=lockout_state_for(marker),
+        )
+        self.sig = _FakeSignals()
+        self.loop.signals = self.sig  # type: ignore[assignment]
+
+    def run_for(self, seconds: float, dt: float = 0.2) -> None:
+        end = self.now[0] + seconds
+        while self.now[0] < end:
+            self.step(dt)
+
+    def check_short_unlock(self, panel_on: bool) -> None:
+        self.run_for(2.0)
+        self.assertEqual(self.w.policy.why_not(), "pin-72h")
+        self.lock[0] = False             # PIN entered
+        self.sig.pending = True
+        self.run_for(4.0)
+        self.panel[0] = panel_on
+        self.lock[0] = True              # locked again after 4 s
+        self.sig.pending = True
+        self.run_for(2.0)
+        self.assertIsNone(self.w.policy.why_not())
+
+    def test_short_pin_unlock_panel_on(self) -> None:
+        self.check_short_unlock(True)
+
+    def test_short_pin_unlock_then_dark(self) -> None:
+        self.loop.dark_arm = True
+        self.check_short_unlock(False)
+
+    def test_flicker_is_still_not_a_pin(self) -> None:
+        self.run_for(2.0)
+        self.lock[0] = False
+        self.sig.pending = True
+        self.step(0.2)
+        self.lock[0] = True
+        self.sig.pending = True
+        self.run_for(3.0)
+        self.assertEqual(self.w.policy.why_not(), "pin-72h")
+
+
 class WarmRelockTest(WarmLoopTest.__base__):  # type: ignore[misc]
     """Unlock frees the sensor; the next lock reloads before the wake."""
 
