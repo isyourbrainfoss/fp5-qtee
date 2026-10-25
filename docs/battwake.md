@@ -60,3 +60,20 @@ wake and its filter accepts (battmgr: charger changes only, wakeup off by defaul
 on wakeup events, i.e. s2idle; in deep the IPCC interrupt still resumes the SoC.
 Applied cleanly to desk tree branch `pmic-glink-sleep-rfc-20261025` (off
 `fp5-qtee-rpmb-v4-usb`) and built (O=/home/kb/src/build-pmic-glink-rfc), not flashed.
+
+## Measurements 2026-10-25 (battmgr wakeup disabled in both phases)
+`~/fp5-qtee-keep/battwake-20261025/test.log`, charge_counter (uAh):
+
+| phase | window | awake | asleep | wakes | used |
+|---|---|---|---|---|---|
+| deep | 10:01:32-10:25:44 | 241 s | 1211 s | resumed at 68->67 % (ipcc_0, glink 241) | 35.5 mAh (88 mAh/h) |
+| s2idle | 10:25:44-11:20:16 | 361 s | 2911 s | none across 67->65 %; ended by power key | 89.0 mAh (98 mAh/h) |
+
+Asleep current is higher in s2idle (about 1.3-1.6x deep, depending on the awake current
+assumed), but s2idle skips the ~2.5 wakes/h x ~6 min awake + 60 s lit screen. Per hour
+that comes out between break-even and ~25 % better for s2idle. One short sample each.
+Decision: **s2idle left OFF** (mem_sleep back to deep). Not because of power but
+because SMS/call wakes in s2idle depend on fp5_sms_wake's SMEM poll, which the
+paging-wakes notes call intermittent, while deep wakes on the modem IRQ in hardware. Turn
+it on only after an overnight s2idle test that includes a test call and SMS:
+`sudo sh scripts/battwake/install.sh --s2idle` (undo: `restore.sh`).
