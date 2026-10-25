@@ -1,0 +1,4 @@
+# fp5-battwake: battery percent notifications from qcom_battmgr are not
+# wakeup events (re-enabled at/below LOW % in /etc/fp5-battwake.conf).
+# See docs/battwake.md. Remove this file (and run restore.sh) to undo.
+ACTION=="add|change", SUBSYSTEM=="power_supply", KERNEL=="qcom-battmgr-bat", RUN+="/usr/local/sbin/fp5-battwake-apply auto"

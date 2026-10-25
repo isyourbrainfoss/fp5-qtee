@@ -1,0 +1,42 @@
+#!/bin/sh
+# fp5-battwake-apply: keep qcom_battmgr battery notifications (one per 1 %
+# from the ADSP over pmic_glink) from counting as system wakeup events.
+#
+# power_supply_changed() calls pm_stay_awake() on the power_supply device.
+# With power/wakeup=enabled on qcom-battmgr-bat (the kernel default, the
+# only battmgr supply still enabled after suspend-fix-wakes.sh) every
+# percent step is a wakeup event: it ends s2idle and aborts a suspend that
+# is in progress (gsd-power does not retry -> ~5 min awake).
+# Low battery compromise: at or below LOW % the wakeup is enabled again,
+# so the last percent steps can still wake the phone and UPower's critical
+# action can run (evaluated on every battmgr change uevent, i.e. at the
+# next wake below LOW).
+#
+# Does NOT touch: USB/ucsi/battmgr-usb (already disabled by
+# suspend-fix-wakes), IPA/modem glink/smp2p (SMS/call), focaltech_fp,
+# gpio-keys, pwrkey, RTC.
+#
+# Usage: fp5-battwake-apply [auto|disable|enable|status]
+# Config: /etc/fp5-battwake.conf  (LOW=10)
+set -u
+SYS=${FP5_BATTWAKE_SYS:-/sys}
+CONF=${FP5_BATTWAKE_CONF:-/etc/fp5-battwake.conf}
+LOW=10
+# shellcheck disable=SC1090
+[ -r "$CONF" ] && . "$CONF"
+B="$SYS/class/power_supply/qcom-battmgr-bat"
+W="$B/power/wakeup"
+[ -e "$W" ] || { echo "fp5-battwake: no $W" >&2; exit 0; }
+cur=$(cat "$W" 2>/dev/null)
+cap=$(cat "$B/capacity" 2>/dev/null || echo 100)
+case $cap in ''|*[!0-9]*) cap=100;; esac
+case "${1:-auto}" in
+	status) echo "qcom-battmgr-bat wakeup=$cur capacity=$cap% low=$LOW"; exit 0 ;;
+	disable) want=disabled ;;
+	enable) want=enabled ;;
+	auto) if [ "$cap" -le "$LOW" ]; then want=enabled; else want=disabled; fi ;;
+	*) echo "usage: $0 [auto|disable|enable|status]" >&2; exit 2 ;;
+esac
+[ "$cur" = "$want" ] && exit 0
+echo "$want" > "$W" && logger -t fp5-battwake "qcom-battmgr-bat wakeup $cur -> $want (capacity $cap%, low $LOW%)" 2>/dev/null
+exit 0
