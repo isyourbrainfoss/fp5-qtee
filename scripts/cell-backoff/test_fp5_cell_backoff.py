@@ -227,5 +227,66 @@ class Schedule(Base):
         self.assertNotIn("systemd-run", calls)
 
 
+class UserScreen(Base):
+    """The lock screen lights for ~60 s after every resume (Phosh/gsd-power),
+    so a lit panel only counts as "in use" when unlocked or lit >= 60 s."""
+
+    def setUp(self):
+        super().setUp()
+        import time
+        self.now = int(time.time())
+        st = Path(self.env["FP5_CELL_ST"])
+        st.mkdir(parents=True, exist_ok=True)
+        (st / "backoff").write_text("14400\n")
+        (st / "last").write_text(f"{self.now - 2000}\n")   # 33 min ago
+        self.st = st
+
+    def attempted(self, calls):
+        return "systemd-inhibit --what=sleep --mode=block" in calls
+
+    def test_resume_with_lit_lock_screen_keeps_long_backoff(self):
+        self.set("bl", "0")
+        r, calls = self.run_script("resume")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(self.attempted(calls), calls)
+        self.assertGreaterEqual(int((self.st / "resumed").read_text()), self.now)
+
+    def test_resume_unlocked_uses_user_cap(self):
+        self.set("bl", "0")
+        self.set("session", SESSION_LOCKED.replace("LockedHint=yes", "LockedHint=no"))
+        _r, calls = self.run_script("resume")
+        self.assertTrue(self.attempted(calls), calls)
+
+    def test_timer_lit_shortly_after_resume_is_not_use(self):
+        self.set("bl", "0")
+        (self.st / "resumed").write_text(f"{self.now - 20}\n")
+        _r, calls = self.run_script("timer")
+        self.assertFalse(self.attempted(calls), calls)
+
+    def test_timer_lit_for_a_minute_is_use(self):
+        self.set("bl", "0")
+        (self.st / "resumed").write_text(f"{self.now - 120}\n")
+        _r, calls = self.run_script("timer")
+        self.assertTrue(self.attempted(calls), calls)
+
+    def test_screen_min_tunable(self):
+        self.set("bl", "0")
+        (self.st / "resumed").write_text(f"{self.now - 120}\n")
+        self.env["FP5_CELL_SCREEN_MIN"] = "300"
+        _r, calls = self.run_script("timer")
+        self.assertFalse(self.attempted(calls), calls)
+
+    def test_panel_off_never_use(self):
+        (self.st / "resumed").write_text(f"{self.now - 3600}\n")
+        self.set("session", SESSION_LOCKED.replace("LockedHint=yes", "LockedHint=no"))
+        _r, calls = self.run_script("timer")
+        self.assertFalse(self.attempted(calls), calls)
+
+    def test_long_backoff_expired_attempts_even_when_dark(self):
+        (self.st / "last").write_text(f"{self.now - 15000}\n")
+        _r, calls = self.run_script("resume")
+        self.assertTrue(self.attempted(calls), calls)
+
+
 if __name__ == "__main__":
     unittest.main()

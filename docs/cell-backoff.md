@@ -79,6 +79,20 @@ Each decision is logged (`journalctl -t fp5-cell-backoff`): "no re-arm: <why>" o
 Tests: `python3 -m unittest scripts/cell-backoff/test_fp5_cell_backoff.py` (fake
 mmcli/loginctl/gsettings/gdbus/busctl/systemd-run in PATH, fake /sys).
 
+## "Screen on" means in use (2026-10-25)
+Problem: Phosh (`screen-saver-manager.c`, `on_logind_prepare_for_sleep`) and gsd-power
+(`handle_resume_actions` -> `enable_monitors`) turn the panel on for ~60 s after *every*
+resume, including the ADSP battery-percent wakes (one per 1 %, see `docs/battwake.md`).
+The resume hook runs at that instant, saw `bl_power=0` and used the 30-min user cap instead
+of the 4-h backoff: 16 attempts overnight, all "still detached".
+Fix: `user_screen()` = panel on AND (graphical session unlocked (`LockedHint=no`) OR the
+panel has stayed on >= `SCREEN_MIN` s (60, env `FP5_CELL_SCREEN_MIN`) since the last resume,
+recorded in `/var/lib/fp5-cell/resumed` by `fp5-cell-backoff resume`). Used for the 30-min
+cap and for the timer's "attempt only while in use" rule. `rearm` still vetoes on the raw
+panel state (never suspend under a lit screen). Tests: `UserScreen` (7 cases).
+On the phone 2026-10-25 the re-arm part is deployed but switched off with
+`/etc/fp5-cell-backoff.no-rearm` (it had not been on the phone before).
+
 ## Use
     fp5-cell-backoff status     # packet state, backoff, next try
     sudo fp5-cell-backoff reset # after a top-up: try at the next resume/timer
