@@ -48,6 +48,12 @@ uint32_t fp5_op_calib(void);
 uint32_t fp5_op_health(void);
 uint32_t fp5_op_stats(void);      /* 0x100e, plen 0x230 */
 uint32_t fp5_hal_flag_enroll(void);
+/* fp5_capture_fill with +0x10 set to count (the HAL sends 1). The bench
+ * tries count=burst to see whether one call takes the whole burst. */
+void fp5_capture_fill_n(uint8_t *pay, uint32_t burst, uint32_t count,
+			uint32_t frame, uint32_t flag);
+/* Non-overlapping occurrences of needle in b. */
+size_t fp5_count_needle(const uint8_t *b, size_t n, const char *needle);
 uint32_t fp5_wmode_up(void);
 
 void fp5_req_set(uint8_t *req, uint32_t cmd, uint32_t plen);
@@ -186,6 +192,32 @@ int fp5_build_group(uint8_t *dst, size_t cap, const char *path);
 
 /* Nested SYNC_CFG JSON. native_log is the trustlet native-log bool. */
 int fp5_sync_config(char *dst, size_t cap, int native_log);
+
+/* The diagnosis block of SYNC_CFG. Levels are clamped to 0..5. */
+struct fp5_diag {
+	int framework_log_level;
+	int firmware_log_level;
+	int algorithm_log_level;
+	int algorithm_log;
+	int logcat_trustlet;
+	int native_log;
+};
+/* The levels fp5_sync_config always sent (1, 3, 2, all logs on). */
+void fp5_diag_default(struct fp5_diag *d, int native_log);
+int fp5_sync_config_diag(char *dst, size_t cap, const struct fp5_diag *d);
+
+/* QEV event from the command rc and the logged interrupt type. */
+enum { FP5_EV_NONE = 0, FP5_EV_DOWN = 5, FP5_EV_UP = 6, FP5_EV_ESD = 11 };
+int fp5_qev_event(int32_t rc, int saw_itype, uint32_t itype, int esd);
+const char *fp5_ev_name(int ev);
+/* A query whose "interrupt type" log line was lost: take the type from
+ * rc (5 down, 6 up, 11 ESD; 592/592 agree in the Oct 20-21 logs).
+ * Returns 1 when it filled the type. A logged type is kept. */
+int fp5_qev_fill(struct fp5_log *l, int32_t rc);
+/* Finger seen down, no in-range frame, finger already lifted. */
+int fp5_too_fast(int burst_ok, int held);
+/* BOOTTIME - MONOTONIC grew by at least min_ms: a suspend happened. */
+int fp5_resumed(long long prev_gap_ms, long long now_gap_ms, long min_ms);
 
 /* 1 when the line is the subtemplate distance diary. */
 int fp5_log_is_score(const char *line);

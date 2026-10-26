@@ -24,6 +24,8 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/epoll.h>
+#include <sched.h>
+#include <sys/syscall.h>
 
 /*
  * QTEE sendRequest returned MAXDATA (-95) for both 0x78000 and 8K/16K.
@@ -206,6 +208,134 @@ static int sysfs_write(const char *path, const char *text)
 	n = write(fd, text, strlen(text));
 	close(fd);
 	return n > 0 ? 0 : -1;
+}
+
+/*
+ * Fast-tap tuning (2026-10-26). A press is IRQ -> QEV -> 3 CAP ->
+ * REPORT; nearly all of it is trustlet time on the calling CPU, so the
+ * calling thread is boosted for the press only: uclamp.min 1024 when the
+ * kernel has it (schedutil then runs that CPU at max), else SCHED_FIFO 1
+ * (schedutil also goes to max for an RT task), plus a cpu_dma_latency 0
+ * hold so the CPU stays out of deep idle between commands. The hold and
+ * the class end with the press. FP5_QTEE_BOOST=0 turns all of it off.
+ */
+static int wait_slice_ms = 100;
+static int boost_on = 1;
+static int boost_kind;	/* 0 none, 1 uclamp, 2 fifo */
+static int boost_active;
+static int dma_fd = -1;
+
+struct fp5_sched_attr {
+	uint32_t size;
+	uint32_t sched_policy;
+	uint64_t sched_flags;
+	int32_t sched_nice;
+	uint32_t sched_priority;
+	uint64_t sched_runtime;
+	uint64_t sched_deadline;
+	uint64_t sched_period;
+	uint32_t sched_util_min;
+	uint32_t sched_util_max;
+};
+
+#define FP5_SCHED_KEEP_ALL 0x18ull
+#define FP5_SCHED_UCLAMP_MIN 0x20ull
+
+static int uclamp_min(uint32_t v)
+{
+#ifdef SYS_sched_setattr
+	struct fp5_sched_attr a;
+
+	memset(&a, 0, sizeof(a));
+	a.size = sizeof(a);
+	a.sched_flags = FP5_SCHED_KEEP_ALL | FP5_SCHED_UCLAMP_MIN;
+	a.sched_util_min = v;
+	return (int)syscall(SYS_sched_setattr, 0, &a, 0);
+#else
+	(void)v;
+	errno = ENOSYS;
+	return -1;
+#endif
+}
+
+static void boost_init(void)
+{
+	boost_on = (int)env_long("FP5_QTEE_BOOST", 1, 0, 1);
+	wait_slice_ms = (int)env_long("FP5_QTEE_WAIT_SLICE_MS", 100, 20, 1000);
+	if (!boost_on) {
+		logf("BOOST off slice=%d", wait_slice_ms);
+		return;
+	}
+	if (uclamp_min(0) == 0) {
+		boost_kind = 1;
+	} else {
+		int e = errno;
+		struct sched_param sp = { .sched_priority = 0 };
+
+		/* Probe: going to OTHER is always allowed for root. */
+		boost_kind = sched_setscheduler(0, SCHED_OTHER, &sp) == 0 ? 2 : 0;
+		logf("BOOST uclamp unavailable: %s", strerror(e));
+	}
+	logf("BOOST kind=%s slice=%d",
+	     boost_kind == 1 ? "uclamp" : boost_kind == 2 ? "fifo" : "none",
+	     wait_slice_ms);
+}
+
+static void boost_press(int on)
+{
+	if (!boost_on || on == boost_active)
+		return;
+	boost_active = on;
+	if (on) {
+		int32_t zero = 0;
+
+		dma_fd = open("/dev/cpu_dma_latency", O_WRONLY | O_CLOEXEC);
+		if (dma_fd >= 0 && write(dma_fd, &zero, sizeof(zero)) != sizeof(zero)) {
+			close(dma_fd);
+			dma_fd = -1;
+		}
+	} else if (dma_fd >= 0) {
+		close(dma_fd);
+		dma_fd = -1;
+	}
+	if (boost_kind == 1) {
+		uclamp_min(on ? 1024u : 0u);
+	} else if (boost_kind == 2) {
+		struct sched_param sp = { .sched_priority = on ? 1 : 0 };
+
+		sched_setscheduler(0, on ? SCHED_FIFO : SCHED_OTHER, &sp);
+	}
+}
+
+/* BOOTTIME - MONOTONIC: grows by the time spent suspended. */
+static long long suspend_gap_ms(void)
+{
+	struct timespec b, m;
+
+	clock_gettime(CLOCK_BOOTTIME, &b);
+	clock_gettime(CLOCK_MONOTONIC, &m);
+	return ((long long)b.tv_sec - m.tv_sec) * 1000LL +
+	       ((long long)b.tv_nsec - m.tv_nsec) / 1000000LL;
+}
+
+/* FP5_QTEE_DIAG_{FW,FIRM,ALG,ALG_LOG,TRUSTLET,NATIVE} override the SYNC
+ * diagnosis block. Unset keeps the old values. avgv and the interrupt
+ * type are read from the trustlet log, so the bench checks a level
+ * still prints them before it is used. */
+static void diag_from_env(struct fp5_diag *d)
+{
+	d->framework_log_level = (int)env_long("FP5_QTEE_DIAG_FW",
+					       d->framework_log_level, 0, 5);
+	d->firmware_log_level = (int)env_long("FP5_QTEE_DIAG_FIRM",
+					      d->firmware_log_level, 0, 5);
+	d->algorithm_log_level = (int)env_long("FP5_QTEE_DIAG_ALG",
+					       d->algorithm_log_level, 0, 5);
+	d->algorithm_log = (int)env_long("FP5_QTEE_DIAG_ALG_LOG",
+					 d->algorithm_log, 0, 1);
+	d->logcat_trustlet = (int)env_long("FP5_QTEE_DIAG_TRUSTLET",
+					   d->logcat_trustlet, 0, 1);
+	d->native_log = (int)env_long("FP5_QTEE_DIAG_NATIVE", d->native_log,
+				      0, 1);
 }
 
 #define IRQ_COUNT "/sys/class/focaltech_fp/focaltech_fp/irq_count"
@@ -1298,6 +1428,9 @@ static int send_cmd_inner(struct svc *s, uint32_t cmd, uint32_t plen,
 	}
 	qsee_log_apply(tag, &s->last);
 	s->last_rc = fp5_req_rc(s->req);
+	if (cmd == fp5_op_query() && fp5_qev_fill(&s->last, s->last_rc))
+		logf("%s type from rc=%d (log line missing)", tag,
+		     (int)s->last_rc);
 	logf("%s cmd=0x%x rc=%d itype=0x%x esd=%d avgv=%u req_b=%llu rsp_b=%llu",
 	     tag, cmd, (int)s->last_rc, s->last.itype, s->last.esd, s->last.avgv,
 	     (unsigned long long)p[4].b, (unsigned long long)p[5].b);
@@ -1928,7 +2061,17 @@ static int setup_ta(struct svc *s, int native)
 		return -1;
 	if (send_cmd(s, fp5_op_set_km(), 0, NULL, "SET_KM"))
 		return -1;
-	n = fp5_sync_config(cfg, sizeof(cfg), native);
+	{
+		struct fp5_diag d;
+
+		fp5_diag_default(&d, native);
+		diag_from_env(&d);
+		logf("diag fw=%d firm=%d alg=%d alg_log=%d trustlet=%d native=%d",
+		     d.framework_log_level, d.firmware_log_level,
+		     d.algorithm_log_level, d.algorithm_log,
+		     d.logcat_trustlet, d.native_log);
+		n = fp5_sync_config_diag(cfg, sizeof(cfg), &d);
+	}
 	if (n < 0 || send_cmd(s, fp5_op_sync(), (uint32_t)n + 1, cfg, "SYNC"))
 		return -1;
 	if (send_cmd(s, fp5_op_init_spi(), 0, NULL, "INIT_SPI"))
@@ -2619,6 +2762,7 @@ static int auth_press(struct svc *s, int which, unsigned *irq,
 		      uint32_t itype, int esd, int already)
 {
 	int burst, scored = 0, saw_empty = 0, cut = 0, nonzero = 0;
+	int last_held = -1;
 	uint32_t empty_av[3] = { 0, 0, 0 };
 	uint32_t miss_avgv = 0, miss_fid = 0, first_level = 0;
 	int miss_rc = 0;
@@ -2644,6 +2788,7 @@ static int auth_press(struct svc *s, int which, unsigned *irq,
 			held = finger_held(s, irq, already);
 			if (held < 0)
 				return -1;
+			last_held = held;
 			if (!fp5_rescan_more(burst, held, now_ms() - t_down,
 					     auth_scans, auth_rescan_ms)) {
 				snprintf(ex, sizeof(ex), "scan=%d held=%d",
@@ -2653,11 +2798,17 @@ static int auth_press(struct svc *s, int which, unsigned *irq,
 			}
 		}
 		for (fi = 0; fi < 3; fi++) {
+			long long ftee = cmd_tee_us;
+
 			fp5_capture_fill(s->req + FP5_PAY_OFF, 3, (uint32_t)fi,
 					 fp5_hal_flag_enroll());
 			if (send_cmd(s, fp5_op_capture(), 0x24, NULL, "CAP"))
 				return -1;
 			av[fi] = s->last.avgv;
+			snprintf(ex, sizeof(ex), "scan=%d i=%d avgv=%u tee=%lld",
+				 burst + 1, fi, av[fi],
+				 (cmd_tee_us - ftee) / 1000);
+			tlog(which, "frame", ex);
 			if (serve_on && serve_poll_cmds()) {
 				if (!scored) {
 					logf("AUTH %d cancelled during capture", which);
@@ -2747,6 +2898,20 @@ static int auth_press(struct svc *s, int which, unsigned *irq,
 		return FP5_ATT_MISS;
 	}
 	if (saw_empty) {
+		if (last_held < 0) {
+			last_held = finger_held(s, irq, already);
+			if (last_held < 0)
+				return -1;
+		}
+		if (fp5_too_fast(0, last_held)) {
+			/* Down seen, no in-range frame, finger already gone:
+			 * Android's "leaving too fast". The watcher buzzes. */
+			snprintf(ex, sizeof(ex), "ms=%ld", now_ms() - t_down);
+			tlog(which, "toofast", ex);
+			logf("AUTH %d toofast avgv=%u,%u,%u", which, empty_av[0],
+			     empty_av[1], empty_av[2]);
+			return 2;
+		}
 		tlog(which, "empty", NULL);
 		logf("AUTH %d empty avgv=%u,%u,%u", which, empty_av[0],
 		     empty_av[1], empty_av[2]);
@@ -2872,6 +3037,7 @@ static int auth_once(struct svc *s, int which)
 		if (held) {
 			down = 1;
 			from_query = 1;
+			boost_press(1);
 			logf("AUTH %d already down itype=0x%x", which, itype);
 		} else if (s->last.saw_itype) {
 			logf("skip leftover itype=0x%x esd=%d",
@@ -2880,9 +3046,11 @@ static int auth_once(struct svc *s, int which)
 	}
 	{
 		int panel = dsi_is_on();
+		long long gap0 = suspend_gap_ms(), gap;
+		int resumed;
 
 		while (!down && left > 0) {
-			int got = wait_slice(&irq, &left, 200);
+			int got = wait_slice(&irq, &left, wait_slice_ms);
 			int now_panel;
 
 			if (serve_on && serve_att.cancelled) {
@@ -2890,14 +3058,28 @@ static int auth_once(struct svc *s, int which)
 				return FP5_ATT_CANCELLED;
 			}
 			if (got) {
+				char ex[64];
+				int ev;
+
+				snprintf(ex, sizeof(ex), "count=%u", irq);
+				tlog(which, "irq", ex);
+				boost_press(1);
 				if (send_cmd(s, fp5_op_query(), 4, z, "QEV"))
 					return -1;
 				itype = s->last.itype;
 				esd = s->last.esd;
+				ev = fp5_qev_event(s->last_rc, s->last.saw_itype,
+						   itype, esd);
+				snprintf(ex, sizeof(ex), "rc=%d itype=0x%x ev=%s",
+					 (int)s->last_rc, itype, fp5_ev_name(ev));
+				tlog(which, "qev", ex);
 				if (fp5_real_down(itype, esd)) {
 					down = 1;
 					break;
 				}
+				boost_press(0);
+				if (ev == FP5_EV_UP)
+					tlog(which, "up-early", NULL);
 				/* Keep the screen on PRESS. An AUTH-prefixed skip would say LIFT. */
 				logf("skip leftover itype=0x%x esd=%d", itype, esd);
 				continue;
@@ -2905,10 +3087,16 @@ static int auth_once(struct svc *s, int which)
 			/*
 			 * The power key turned the panel on. The GPIO edge
 			 * can be missing when the CPU was suspended. Ask
-			 * once on that rise.
+			 * once on that rise, and at once after any resume
+			 * (a touch that woke the phone with the panel off).
 			 */
 			now_panel = dsi_is_on();
-			if (fp5_query_on_panel_rise(panel, now_panel)) {
+			gap = suspend_gap_ms();
+			resumed = fp5_resumed(gap0, gap, 50);
+			gap0 = gap;
+			if (resumed)
+				tlog(which, "resume", NULL);
+			if (resumed || fp5_query_on_panel_rise(panel, now_panel)) {
 				int held = query_held(s, &itype, &esd);
 
 				if (held < 0)
@@ -2916,8 +3104,10 @@ static int auth_once(struct svc *s, int which)
 				if (held) {
 					down = 1;
 					from_query = 1;
-					logf("AUTH %d held at panel itype=0x%x",
-					     which, itype);
+					boost_press(1);
+					logf("AUTH %d held at %s itype=0x%x",
+					     which, resumed ? "resume" : "panel",
+					     itype);
 				}
 			}
 			panel = now_panel;
@@ -2937,7 +3127,12 @@ static int auth_once(struct svc *s, int which)
 		return FP5_ATT_CANCELLED;
 	}
 	logf("AUTH %d REAL DOWN itype=0x%x", which, itype);
-	return auth_press(s, which, &irq, itype, esd, from_query);
+	{
+		int r = auth_press(s, which, &irq, itype, esd, from_query);
+
+		boost_press(0);
+		return r;
+	}
 }
 
 /* After an all-zero miss, do not capture the finger that is still down.
@@ -3011,6 +3206,12 @@ static int serve_loop(struct svc *s)
 		if (cmd == FP5_CMD_QUIT)
 			break;
 		a = auth_once(s, ++n);
+		{
+			char ex[24];
+
+			snprintf(ex, sizeof(ex), "rc=%d", a);
+			tlog(n, "result", ex);
+		}
 		logf("SERVE result %d", a);
 		if (a < 0) {
 			rc = 1;
@@ -3051,6 +3252,73 @@ static int alloc_bufs(struct svc *s)
 	return 0;
 }
 
+/*
+ * bench: no finger, no enroll, no storage writes. AUTH_ARM, detect
+ * mode, then rounds of idle captures to time a CAP and see what one
+ * call does: A is the HAL's three calls (count 1, frame 0..2), B is one
+ * call with count 3. Each call logs tee ms, the qsee log bytes it wrote
+ * and how many "avgv" lines were in them. FP5_QTEE_BENCH_FLAG picks the
+ * capture flag (default factory 0xE0000240, which does not wait for a
+ * finger), FP5_QTEE_BENCH_ROUNDS the rounds.
+ */
+static int bench_cap(struct svc *s, const char *tag, uint32_t count,
+		     uint32_t frame, uint32_t flag)
+{
+	long long tee0 = cmd_tee_us, all0 = cmd_all_us;
+	size_t nav;
+	char ex[128];
+
+	fp5_capture_fill_n(s->req + FP5_PAY_OFF, 3, count, frame, flag);
+	if (send_cmd(s, fp5_op_capture(), 0x24, NULL, tag))
+		return -1;
+	nav = qsee_delta ? fp5_count_needle(qsee_delta, qsee_delta_len,
+					    "avgv") : 0;
+	snprintf(ex, sizeof(ex),
+		 "%s count=%u frame=%u rc=%d tee_us=%lld all_us=%lld qbytes=%zu avgv_lines=%zu avgv=%u",
+		 tag, count, frame, (int)s->last_rc, cmd_tee_us - tee0,
+		 cmd_all_us - all0, qsee_delta_len, nav, s->last.avgv);
+	tlog(0, "bench", ex);
+	return 0;
+}
+
+static int bench_mode(struct svc *s)
+{
+	uint8_t hat[0x4a];
+	uint32_t mode = fp5_wmode_detect();
+	uint32_t flag = (uint32_t)env_long("FP5_QTEE_BENCH_FLAG",
+					   (long)0xE0000240L, 0, 0xffffffffL);
+	int rounds = (int)env_long("FP5_QTEE_BENCH_ROUNDS", 5, 1, 50);
+	int r, fi;
+
+	fp5_hat_auth(hat);
+	if (send_cmd(s, fp5_op_auth(), fp5_auth_plen(), hat, "AUTH_ARM"))
+		return -1;
+	if (send_cmd(s, fp5_op_wmode(), 4, &mode, "WMODE_DETECT"))
+		return -1;
+	for (r = 0; r < rounds; r++) {
+		long long a0 = cmd_all_us;
+		char ex[64];
+
+		boost_press(1);
+		for (fi = 0; fi < 3; fi++)
+			if (bench_cap(s, "A", 1, (uint32_t)fi, flag))
+				return -1;
+		boost_press(0);
+		snprintf(ex, sizeof(ex), "A round=%d all_us=%lld", r,
+			 cmd_all_us - a0);
+		tlog(0, "bench-sum", ex);
+		a0 = cmd_all_us;
+		boost_press(1);
+		if (bench_cap(s, "B", 3, 0, flag))
+			return -1;
+		boost_press(0);
+		snprintf(ex, sizeof(ex), "B round=%d all_us=%lld", r,
+			 cmd_all_us - a0);
+		tlog(0, "bench-sum", ex);
+	}
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	const char *mode = argc > 1 ? argv[1] : "enroll";
@@ -3062,6 +3330,7 @@ int main(int argc, char **argv)
 
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	tune_init();
+	boost_init();
 	{
 		struct sigaction sa;
 
@@ -3149,6 +3418,8 @@ int main(int argc, char **argv)
 		rc = open_enroll(&s);
 		if (rc == 0)
 			rc = probe_capture(&s);
+	} else if (!strcmp(mode, "bench")) {
+		rc = bench_mode(&s) ? 1 : 0;
 	} else if (!strcmp(mode, "report-empty")) {
 		/* No finger. One REPORT after enroll-open. Optional plen
 		 * in argv[3] (default 0x2e0) to see which size kills the app.

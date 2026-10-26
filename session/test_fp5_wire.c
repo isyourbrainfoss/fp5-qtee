@@ -645,6 +645,81 @@ static void test_template_learning(void)
 	expect(strstr(cfg, "70,\"enable_template_learning") != NULL, "inside algorithm");
 }
 
+static void test_fasttap(void)
+{
+	struct fp5_log l;
+	struct fp5_diag d;
+	char cfg[2048], def[2048];
+	uint8_t pay[0x24];
+	uint32_t w;
+	const uint8_t txt[] = "avgv = 1 xx avgv = 2 avgvavgv";
+
+	/* rc is the event when the log line is lost (Oct 20-21 logs). */
+	expect(fp5_qev_event(5, 0, 0, 0) == FP5_EV_DOWN, "rc5 down");
+	expect(fp5_qev_event(6, 0, 0, 0) == FP5_EV_UP, "rc6 up");
+	expect(fp5_qev_event(11, 0, 0, 0) == FP5_EV_ESD, "rc11 esd");
+	expect(fp5_qev_event(0, 0, 0, 0) == FP5_EV_NONE, "rc0 none");
+	expect(fp5_qev_event(0, 1, 0x2, 0) == FP5_EV_DOWN, "logged down");
+	expect(fp5_qev_event(0, 1, 0x4, 0) == FP5_EV_UP, "logged up");
+	expect(fp5_qev_event(5, 1, 0x2, 1) == FP5_EV_ESD, "esd wins");
+	expect(fp5_qev_event(0, 1, 0x1, 0) == FP5_EV_NONE, "idle type");
+	expect(!strcmp(fp5_ev_name(FP5_EV_DOWN), "down"), "name down");
+	expect(!strcmp(fp5_ev_name(42), "none"), "name other");
+
+	memset(&l, 0, sizeof(l));
+	expect(fp5_qev_fill(&l, 5) == 1 && l.saw_itype && l.itype == 0x2,
+	       "fill down");
+	expect(fp5_real_down(l.itype, l.esd), "filled is real down");
+	memset(&l, 0, sizeof(l));
+	expect(fp5_qev_fill(&l, 6) == 1 && l.itype == 0x4, "fill up");
+	expect(!fp5_real_down(l.itype, l.esd), "up is not down");
+	memset(&l, 0, sizeof(l));
+	expect(fp5_qev_fill(&l, 11) == 1 && l.esd, "fill esd");
+	memset(&l, 0, sizeof(l));
+	expect(fp5_qev_fill(&l, 0) == 0 && !l.saw_itype, "rc0 no fill");
+	memset(&l, 0, sizeof(l));
+	l.saw_itype = 1;
+	l.itype = 0x1;
+	expect(fp5_qev_fill(&l, 5) == 0 && l.itype == 0x1, "logged kept");
+
+	expect(fp5_too_fast(0, 0), "no frame, lifted: too fast");
+	expect(!fp5_too_fast(0, 1), "no frame, held: partial");
+	expect(!fp5_too_fast(1, 0), "good frame: not too fast");
+	expect(fp5_resumed(100, 160, 50), "resume 60 ms");
+	expect(!fp5_resumed(100, 120, 50), "jitter is not resume");
+
+	/* Default diag is byte-identical to the old config. */
+	fp5_diag_default(&d, 0);
+	expect(fp5_sync_config_diag(cfg, sizeof(cfg), &d) > 0, "diag cfg");
+	expect(fp5_sync_config(def, sizeof(def), 0) > 0, "def cfg");
+	expect(!strcmp(cfg, def), "default diag same");
+	d.framework_log_level = 0;
+	d.firmware_log_level = 9;
+	d.algorithm_log_level = -3;
+	d.algorithm_log = 0;
+	d.logcat_trustlet = 0;
+	d.native_log = 1;
+	expect(fp5_sync_config_diag(cfg, sizeof(cfg), &d) > 0, "quiet cfg");
+	expect(strstr(cfg, "\"framework_log_level\":0") != NULL, "fw 0");
+	expect(strstr(cfg, "\"firmware_log_level\":5") != NULL, "clamp hi");
+	expect(strstr(cfg, "\"algorithm_log_level\":0") != NULL, "clamp lo");
+	expect(strstr(cfg, "\"enable_algorithm_log\":false") != NULL, "alg off");
+	expect(strstr(cfg, "\"enable_logcat_trustlet\":false") != NULL,
+	       "trustlet off");
+	expect(strstr(cfg, "\"enable_trustlet_native_log\":true") != NULL,
+	       "native on");
+
+	fp5_capture_fill_n(pay, 3, 3, 0, 0xE0000240u);
+	memcpy(&w, pay + 0x10, 4);
+	expect(w == 3, "count 3");
+	memcpy(&w, pay + 0x0c, 4);
+	expect(w == 3, "burst 3");
+	memcpy(&w, pay + 0x1c, 4);
+	expect(w == 0xE0000240u, "flag");
+	expect(fp5_count_needle(txt, sizeof(txt) - 1, "avgv") == 4, "needles");
+	expect(fp5_count_needle(txt, 3, "avgv") == 0, "short");
+}
+
 int main(void)
 {
 	test_opcodes();
@@ -657,6 +732,7 @@ int main(void)
 	test_group();
 	test_rescan_policy();
 	test_template_learning();
+	test_fasttap();
 	if (fails) {
 		fprintf(stderr, "%d failed\n", fails);
 		return 1;

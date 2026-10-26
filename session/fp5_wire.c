@@ -112,6 +112,28 @@ void fp5_capture_fill(uint8_t *pay, uint32_t burst, uint32_t frame, uint32_t fla
 	wr32(pay + 0x20, 0);
 }
 
+void fp5_capture_fill_n(uint8_t *pay, uint32_t burst, uint32_t count,
+			uint32_t frame, uint32_t flag)
+{
+	fp5_capture_fill(pay, burst, frame, flag);
+	wr32(pay + 0x10, count);
+}
+
+size_t fp5_count_needle(const uint8_t *b, size_t n, const char *needle)
+{
+	size_t k = strlen(needle), i, c = 0;
+
+	if (!k || n < k)
+		return 0;
+	for (i = 0; i + k <= n; i++) {
+		if (b[i] == (uint8_t)needle[0] && !memcmp(b + i, needle, k)) {
+			c++;
+			i += k - 1;
+		}
+	}
+	return c;
+}
+
 void fp5_poison_rem(uint8_t *pay)
 {
 	wr32(pay + 0x10, 0xaaaaaaaau);
@@ -499,7 +521,30 @@ int fp5_build_group(uint8_t *dst, size_t cap, const char *path)
 
 #include <stdio.h>
 
+void fp5_diag_default(struct fp5_diag *d, int native_log)
+{
+	d->framework_log_level = 1;
+	d->firmware_log_level = 3;
+	d->algorithm_log_level = 2;
+	d->algorithm_log = 1;
+	d->logcat_trustlet = 1;
+	d->native_log = native_log ? 1 : 0;
+}
+
 int fp5_sync_config(char *dst, size_t cap, int native_log)
+{
+	struct fp5_diag d;
+
+	fp5_diag_default(&d, native_log);
+	return fp5_sync_config_diag(dst, cap, &d);
+}
+
+static int clamp_level(int v)
+{
+	return v < 0 ? 0 : (v > 5 ? 5 : v);
+}
+
+int fp5_sync_config_diag(char *dst, size_t cap, const struct fp5_diag *d)
 {
 	int n;
 
@@ -540,16 +585,21 @@ int fp5_sync_config(char *dst, size_t cap, int native_log)
 		     "\"enable_post_calib_learning\":%s,"
 		     "\"enable_prep_calib_learning\":false,"
 		     "\"calib_update_threshold\":50},"
-		     "\"diagnosis\":{\"framework_log_level\":1,"
-		     "\"firmware_log_level\":3,"
-		     "\"algorithm_log_level\":2,"
-		     "\"enable_algorithm_log\":true,"
-		     "\"enable_logcat_trustlet\":true,"
+		     "\"diagnosis\":{\"framework_log_level\":%d,"
+		     "\"firmware_log_level\":%d,"
+		     "\"algorithm_log_level\":%d,"
+		     "\"enable_algorithm_log\":%s,"
+		     "\"enable_logcat_trustlet\":%s,"
 		     "\"enable_trustlet_native_log\":%s,"
 		     "\"enable_logcat_spi_data\":false}}",
 		     FP5_LEARN ? "true" : "false",
 		     FP5_LEARN ? "true" : "false",
-		     native_log ? "true" : "false");
+		     clamp_level(d->framework_log_level),
+		     clamp_level(d->firmware_log_level),
+		     clamp_level(d->algorithm_log_level),
+		     d->algorithm_log ? "true" : "false",
+		     d->logcat_trustlet ? "true" : "false",
+		     d->native_log ? "true" : "false");
 	if (n < 0 || (size_t)n >= cap)
 		return -1;
 	return n;
@@ -1071,4 +1121,71 @@ int fp5_report_wants_save(const uint8_t *pay, int32_t rc)
 	if (rc != 0 && rc != -11)
 		return 0;
 	return (pay[0x2d9] & 0x4) != 0;
+}
+
+/* QEV event. rc carries the trustlet's event number (5 touch, 6 leave,
+ * 11 ESD) even when the qsee log line with the interrupt type was lost.
+ * On 2026-10-20/21, 53 queries returned rc=5 with no logged type and
+ * were skipped as "leftover". The logged type still wins when present. */
+int fp5_qev_event(int32_t rc, int saw_itype, uint32_t itype, int esd)
+{
+	if (esd || rc == 11)
+		return FP5_EV_ESD;
+	if (saw_itype && itype == 0x2u)
+		return FP5_EV_DOWN;
+	if (saw_itype && itype == 0x4u)
+		return FP5_EV_UP;
+	if (rc == 5)
+		return FP5_EV_DOWN;
+	if (rc == 6)
+		return FP5_EV_UP;
+	return FP5_EV_NONE;
+}
+
+const char *fp5_ev_name(int ev)
+{
+	switch (ev) {
+	case FP5_EV_DOWN: return "down";
+	case FP5_EV_UP: return "up";
+	case FP5_EV_ESD: return "esd";
+	default: return "none";
+	}
+}
+
+/* A finger was seen down but the burst had no in-range frame and the
+ * finger is already gone: Android's "finger touched but is leaving too
+ * fast". A burst with no in-range frame under a finger that is still
+ * down is a partial (light or misplaced) press instead. */
+int fp5_too_fast(int burst_ok, int held)
+{
+	return !burst_ok && !held;
+}
+
+/* 1 when the session was suspended since the last sample: CLOCK_BOOTTIME
+ * moved ahead of CLOCK_MONOTONIC by at least min_ms. */
+int fp5_resumed(long long prev_gap_ms, long long now_gap_ms, long min_ms)
+{
+	return now_gap_ms - prev_gap_ms >= (long long)min_ms;
+}
+
+int fp5_qev_fill(struct fp5_log *l, int32_t rc)
+{
+	if (l->saw_itype)
+		return 0;
+	switch (fp5_qev_event(rc, 0, 0, 0)) {
+	case FP5_EV_DOWN:
+		l->itype = 0x2u;
+		break;
+	case FP5_EV_UP:
+		l->itype = 0x4u;
+		break;
+	case FP5_EV_ESD:
+		l->itype = 0;
+		l->esd = 1;
+		break;
+	default:
+		return 0;
+	}
+	l->saw_itype = 1;
+	return 1;
 }
