@@ -8,14 +8,44 @@
         {
           "event-name": "fp5-qtee-match",
           "type": "VibraPattern",
-          "magnitudes": [1.0],
-          "durations": [20]
+          "magnitudes": [
+            1.0
+          ],
+          "durations": [
+            20
+          ]
         },
         {
           "event-name": "fp5-qtee-miss",
           "type": "VibraPattern",
-          "magnitudes": [1.0, 0.0, 1.0],
-          "durations": [30, 100, 30]
+          "magnitudes": [
+            1.0,
+            0.0,
+            1.0
+          ],
+          "durations": [
+            30,
+            100,
+            30
+          ]
+        },
+        {
+          "event-name": "fp5-qtee-toofast",
+          "type": "VibraPattern",
+          "magnitudes": [
+            1.0,
+            0.0,
+            1.0,
+            0.0,
+            1.0
+          ],
+          "durations": [
+            15,
+            40,
+            15,
+            40,
+            15
+          ]
         }
       ]
     },
@@ -25,14 +55,44 @@
         {
           "event-name": "fp5-qtee-match",
           "type": "VibraPattern",
-          "magnitudes": [1.0],
-          "durations": [20]
+          "magnitudes": [
+            1.0
+          ],
+          "durations": [
+            20
+          ]
         },
         {
           "event-name": "fp5-qtee-miss",
           "type": "VibraPattern",
-          "magnitudes": [1.0, 0.0, 1.0],
-          "durations": [30, 100, 30]
+          "magnitudes": [
+            1.0,
+            0.0,
+            1.0
+          ],
+          "durations": [
+            30,
+            100,
+            30
+          ]
+        },
+        {
+          "event-name": "fp5-qtee-toofast",
+          "type": "VibraPattern",
+          "magnitudes": [
+            1.0,
+            0.0,
+            1.0,
+            0.0,
+            1.0
+          ],
+          "durations": [
+            15,
+            40,
+            15,
+            40,
+            15
+          ]
         }
       ]
     }

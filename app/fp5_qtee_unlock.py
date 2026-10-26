@@ -15,6 +15,7 @@ qsee_fingerpr and does not use the Phosh PAM stack.
 
 from __future__ import annotations
 
+import collections
 import os
 import queue
 import re
@@ -79,6 +80,19 @@ _ARM = re.compile(r"^AUTH \d+ arm ")
 _NOMATCH = re.compile(r"^AUTH FAIL \d+ itype=0x2 ")
 _PARTIAL = re.compile(r"^AUTH \d+ empty ")
 _DOWN = re.compile(r"^AUTH \d+ REAL DOWN ")
+# The finger left before any in-range frame (Android: "finger touched but
+# is leaving too fast"). Not a strike: nothing was scored.
+_TOOFAST = re.compile(r"^AUTH \d+ toofast ")
+# Keep the warm session loaded after an unlock (no ~1 s reload on the
+# next lock). It is quit as soon as the Finger app is running, which
+# needs the sensor to itself. FP5_QTEE_KEEP_WARM=0 restores quit-on-unlock.
+KEEP_WARM = os.environ.get("FP5_QTEE_KEEP_WARM", "1") != "0"
+APP_SCAN_S = 1.0
+# Buzz the wake-press miss (first no-match right after panel-on) instead
+# of dropping it silently. It still is not a strike.
+WAKE_MISS_BUZZ = os.environ.get("FP5_QTEE_WAKE_MISS_BUZZ", "1") != "0"
+# In the dark, a too-fast tap buzzes at most this often (pocket guard).
+DARK_TOOFAST_EVERY_S = 10.0
 # Named fbcli events. The fingerprint waveforms live in fp5_qtee_haptic
 # (one 20 ms click, or two 30 ms pulses). These stay so a drop-in can
 # still name an event; an empty name plays nothing through fbcli.
@@ -144,6 +158,7 @@ _LOCK_SIGNAL = re.compile(r"LockedHint|\.Session\.(Lock|Unlock) ")
 MISS_TEXT = {
     "nomatch": "Not recognized. Try again, or use your PIN.",
     "partial": "Finger not read. Cover the whole sensor and hold still.",
+    "toofast": "Finger lifted too fast. Rest it on the sensor a moment.",
 }
 
 
@@ -436,6 +451,68 @@ class LockSignals:
                 except (OSError, ValueError):
                     pass
         self.alive = False
+
+
+def is_toofast(line: str) -> bool:
+    return _TOOFAST.match(line.strip()) is not None
+
+
+def app_running(proc_root: Path = Path("/proc")) -> bool:
+    """The Finger app (fp5-qtee-app.py) is running and may want the sensor."""
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return False
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            raw = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue
+        if b"fp5-qtee-app" in raw:
+            return True
+    return False
+
+
+def serve_running(ps_text: str) -> bool:
+    """A watcher serve session is in `ps -eo pid,args` output."""
+    for line in ps_text.splitlines():
+        if "fp5-qtee-session" in line and " serve" in line:
+            return True
+    return False
+
+
+def wait_serve_gone(timeout_s: float = 4.0,
+                    ps: "Callable[[], str] | None" = None,
+                    clock: Callable[[], float] = time.monotonic,
+                    nap: Callable[[float], None] = time.sleep) -> bool:
+    """For the Finger app: wait until the watcher quit its kept session.
+
+    The watcher sees the app within APP_SCAN_S and quits. True once no
+    serve session is left, False if one is still there after timeout_s.
+    """
+    def read_ps() -> str:
+        try:
+            return _run(["ps", "-eo", "pid,args"], timeout=3)
+        except subprocess.TimeoutExpired:
+            return ""
+
+    reader = ps if ps is not None else read_ps
+    end = clock() + timeout_s
+    while serve_running(reader()):
+        if clock() >= end:
+            return False
+        nap(0.2)
+    return True
+
+
+def take_line(warm: object) -> "str | None":
+    """Next queued session line. Raises queue.Empty when there is none."""
+    pending = getattr(warm, "pending", None)
+    if pending:
+        return pending.popleft()
+    return warm.lines.get_nowait()  # type: ignore[attr-defined]
 
 
 def miss_kind(line: str) -> str | None:
@@ -905,7 +982,9 @@ class UnlockWatcher:
         return rose
 
     def note(self, text: str) -> None:
-        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        now = time.time()
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+        stamp += f".{int(now * 1000) % 1000:03d}"
         line = f"{stamp} {text}\n"
         try:
             LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -960,6 +1039,16 @@ class UnlockWatcher:
         self.haptic.play("miss")
         # Transient, so misses do not pile up in the notification list.
         self._background(notify_args(MISS_TEXT[kind], 2500, transient=True))
+
+    def tell_toofast(self) -> None:
+        """A short triple tick: the finger left before it could be read."""
+        self.note("miss toofast")
+        self.haptic.play("toofast")
+        self._background(notify_args(MISS_TEXT["toofast"], 2000, transient=True))
+
+    def tell_wake_miss(self) -> None:
+        """The wake-press no-match: buzz, but it is not a strike."""
+        self.haptic.play("miss")
 
     def session_id(self) -> str | None:
         sid = self._sid.get()
@@ -1320,10 +1409,13 @@ class UnlockWatcher:
                 loop.resume_lock = Inhibitor("block", RESUME_HOLD_S)
             held = loop.delay_lock.take()
             self.note(f"touch-to-wake on: delay inhibitor={held} {fp_wake_counts()}")
+        loop.keep_warm = KEEP_WARM
+        loop.wake_buzz = WAKE_MISS_BUZZ
+        self.note(f"fast-tap: keep_warm={KEEP_WARM} wake_buzz={WAKE_MISS_BUZZ}")
         try:
             while True:
                 loop.step()
-                time.sleep(PANEL_POLL_S)
+                loop.wait(PANEL_POLL_S)
         finally:
             loop.stop()
             signals.close()
@@ -1405,6 +1497,7 @@ class WarmSession:
     def __init__(self, proc: subprocess.Popen[str], log_path: Path | None) -> None:
         self.proc = proc
         self.lines: queue.Queue[str | None] = queue.Queue()
+        self.pending: collections.deque[str | None] = collections.deque()
         self.idle = False
         self.cancel_sent = False
         self._log = None
@@ -1449,6 +1542,16 @@ class WarmSession:
 
     def alive(self) -> bool:
         return self.proc.poll() is None
+
+    def wait_line(self, timeout: float) -> bool:
+        """Block until a line is queued or timeout. The line stays queued."""
+        if self.pending:
+            return True
+        try:
+            self.pending.append(self.lines.get(timeout=timeout))
+        except queue.Empty:
+            return False
+        return True
 
     def close(self) -> None:
         """quit, then EOF, then signals."""
@@ -1543,6 +1646,25 @@ class WarmLoop:
         self.wake_claimed = False
         self.down_at: float | None = None
         self.press_nz = False
+        # Fast-tap options. run_warm turns them on; tests opt in.
+        self.keep_warm = False
+        self.wake_buzz = False
+        self.app_running: Callable[[], bool] = app_running
+        self.app_scan_at = 0.0
+        self.dark_toofast_at: float | None = None
+
+    def wait(self, timeout: float) -> None:
+        """Sleep until the session prints a line, or timeout.
+
+        A hit is handled as soon as it is printed and the next auth goes
+        out right after SERVE idle, instead of on the next 0.2 s poll.
+        """
+        warm = self.warm
+        waiter = getattr(warm, "wait_line", None)
+        if waiter is None:
+            self.nap(timeout)
+            return
+        waiter(timeout)
 
     def _signalled(self) -> bool:
         return self.signals is not None and self.signals.poll()
@@ -1594,7 +1716,7 @@ class WarmLoop:
         dead = False
         while True:
             try:
-                line = warm.lines.get_nowait()
+                line = take_line(warm)
             except queue.Empty:
                 break
             if line is None:
@@ -1631,6 +1753,12 @@ class WarmLoop:
             if score not in (None, 0):
                 self.press_nz = True
                 continue
+            if is_toofast(line):
+                self.down_at = None
+                self.press_nz = False
+                if self.believed_locked and self.live_attempt is not None:
+                    self._toofast(panel)
+                continue
             fid = hit_fid(line)
             if fid is not None:
                 at = self.clock() if self.down_at is None else self.down_at
@@ -1649,8 +1777,15 @@ class WarmLoop:
                 )
                 self.press_nz = False
                 if ignore:
-                    # The power-key press that woke the panel. Not a try.
-                    self.w.note(f"miss {kind} ignored: wake press")
+                    # The power-key press that woke the panel. Not a try,
+                    # but say it was read: a silent drop feels like the
+                    # sensor ignored a quick tap.
+                    buzz = (self.wake_buzz and self.believed_locked
+                            and self.live_attempt is not None)
+                    self.w.note(f"miss {kind} ignored: wake press"
+                                + (" (buzzed)" if buzz else ""))
+                    if buzz:
+                        self.w.tell_wake_miss()
                     continue
                 # A real press was scored for an auth we sent. It counts
                 # even if the panel went off or we cancelled meanwhile.
@@ -1666,6 +1801,19 @@ class WarmLoop:
             self.w.note("warm session ended")
             self.stop()
             self.retry_at = self.clock() + WARM_RETRY_S
+
+    def _toofast(self, panel: bool) -> None:
+        """Too-fast tap: a distinct tick, no strike. Rate-limited dark."""
+        if not panel:
+            if not self.dark_arm:
+                return
+            now = self.clock()
+            if (self.dark_toofast_at is not None
+                    and now - self.dark_toofast_at < DARK_TOOFAST_EVERY_S):
+                self.w.note("miss toofast (dark, not buzzed)")
+                return
+            self.dark_toofast_at = now
+        self.w.tell_toofast()
 
     def on_hit(self, fid: int, panel: bool, attempt: int | None = None) -> None:
         if self.live_attempt is None or attempt != self.live_attempt:
@@ -1712,8 +1860,24 @@ class WarmLoop:
 
     def _unlocked(self) -> None:
         self.believed_locked = False
-        self.stop()
+        if self.keep_warm and self.warm is not None and self.warm.alive():
+            # Stay loaded for the next lock. Nothing is armed while
+            # unlocked; the Finger app check below frees the sensor.
+            self.cancel()
+            self.live_attempt = None
+            self._close_armed_listen()
+        else:
+            self.stop()
         self.w._told_reason = None
+
+    def _free_for_app(self, now: float) -> None:
+        """Unlocked with a kept session: quit it once the Finger app runs."""
+        if self.warm is None or self.believed_locked or now < self.app_scan_at:
+            return
+        self.app_scan_at = now + APP_SCAN_S
+        if self.app_running():
+            self.w.note("finger app running: warm session quit")
+            self.stop()
 
     def _sleep_events(self) -> None:
         """PrepareForSleep from logind, only in touch-wake mode."""
@@ -1781,6 +1945,7 @@ class WarmLoop:
             self.wake_claimed = False
             self.down_at = None
         self.drain(panel)
+        self._free_for_app(now)
         if not panel and not self.dark_arm:
             self.cancel()
             if self.prev_panel:

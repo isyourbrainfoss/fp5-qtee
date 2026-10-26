@@ -1992,5 +1992,203 @@ class TouchWakeHelpersTest(unittest.TestCase):
         self.assertEqual(sig.take_sleep_events(), [True, False])
         sig.close()
 
+
+class FastTapTest(WarmLoopTest.__base__):  # type: ignore[misc]
+    """2026-10-26 fast-tap: keep warm, wake-miss buzz, too fast, wait."""
+
+    HIT = WarmLoopTest.HIT
+    FAIL = WarmLoopTest.FAIL
+    step = WarmLoopTest.step
+    unlocks = WarmLoopTest.unlocks
+    _unlock_by_finger = WarmRelockTest._unlock_by_finger
+
+    def setUp(self) -> None:
+        WarmLoopTest.setUp(self)  # type: ignore[arg-type]
+        self.sig = FakeSignals()
+        self.loop.signals = self.sig  # type: ignore[assignment]
+        self.loop.keep_warm = True
+        self.loop.wake_buzz = True
+        self.app = [False]
+        self.loop.app_running = lambda: self.app[0]
+        self.w.tell_toofast = lambda: self.events.append(("toofast",))  # type: ignore[method-assign]
+        self.w.tell_wake_miss = lambda: self.events.append(("wake-miss",))  # type: ignore[method-assign]
+        self.notes: list[str] = []
+        self.w.note = lambda text: self.notes.append(text)  # type: ignore[method-assign]
+
+    def test_unlock_keeps_session_and_next_lock_arms_at_once(self) -> None:
+        warm = self._unlock_by_finger()
+        self.assertFalse(warm.closed)
+        self.assertIs(self.loop.warm, warm)
+        self.lock[0] = True
+        self.sig.pending = True
+        self.step()
+        self.assertEqual(len(self.started), 1)   # no reload
+        self.assertEqual(warm.sent[-1], "auth")
+
+    def test_unlocked_never_arms_kept_session(self) -> None:
+        warm = self._unlock_by_finger()
+        sent = list(warm.sent)
+        warm.say("SERVE idle")
+        for _ in range(10):
+            self.step()
+        self.assertEqual(warm.sent, sent)
+
+    def test_finger_app_frees_the_sensor(self) -> None:
+        warm = self._unlock_by_finger()
+        self.app[0] = True
+        self.step(1.1)
+        self.step()
+        self.assertTrue(warm.closed)
+        self.assertIsNone(self.loop.warm)
+        self.assertTrue(any("finger app running" in n for n in self.notes))
+
+    def test_app_check_only_while_unlocked(self) -> None:
+        self.step()
+        warm = self.started[0]
+        warm.say("SERVE idle")
+        self.app[0] = True
+        self.step()
+        self.step(1.1)
+        self.assertFalse(warm.closed)
+
+    def test_keep_warm_off_quits_on_unlock(self) -> None:
+        self.loop.keep_warm = False
+        warm = self._unlock_by_finger()
+        self.assertTrue(warm.closed)
+
+    def _wake_miss(self) -> None:
+        self.step()
+        warm = self.started[0]
+        warm.say("SERVE idle")
+        self.panel[0] = False
+        self.step()
+        self.panel[0] = True
+        self.step()
+        warm.say("AUTH 1 arm mode=1 irq=428",
+                 "AUTH 1 REAL DOWN itype=0x2", self.FAIL,
+                 "SERVE result 2", "SERVE idle")
+        self.step()
+
+    def test_wake_press_miss_buzzes_without_strike(self) -> None:
+        self._wake_miss()
+        self.assertEqual(self.w.policy.failed, 0)
+        self.assertIn(("wake-miss",), self.events)
+        self.assertNotIn(("miss", "nomatch"), self.events)
+        self.assertTrue(any("(buzzed)" in n for n in self.notes))
+
+    def test_wake_press_buzz_can_be_turned_off(self) -> None:
+        self.loop.wake_buzz = False
+        self._wake_miss()
+        self.assertNotIn(("wake-miss",), self.events)
+
+    def test_toofast_ticks_and_is_not_a_strike(self) -> None:
+        self.step()
+        warm = self.started[0]
+        warm.say("SERVE idle")
+        self.step()
+        warm.say("AUTH 1 REAL DOWN itype=0x2",
+                 "AUTH 1 toofast avgv=866,865,867")
+        self.step()
+        self.assertEqual(self.events.count(("toofast",)), 1)
+        self.assertEqual(self.w.policy.failed, 0)
+        self.assertNotIn(("miss", "partial"), self.events)
+
+    def test_toofast_after_cancel_is_silent(self) -> None:
+        self.step()
+        warm = self.started[0]
+        warm.say("SERVE idle")
+        self.step()
+        self.panel[0] = False
+        self.step()                              # cancel
+        warm.say("AUTH 1 toofast avgv=866,865,867")
+        self.step()
+        self.assertNotIn(("toofast",), self.events)
+
+    def test_dark_toofast_is_rate_limited(self) -> None:
+        self.loop.dark_arm = True
+        self.panel[0] = False
+        self.step()
+        warm = self.started[0]
+        warm.say("SERVE idle")
+        self.step()
+        for n in range(1, 4):
+            warm.say(f"AUTH {n} toofast avgv=866,865,867",
+                     "SERVE result 2", "SERVE idle")
+            self.step(1.0)
+        self.assertEqual(self.events.count(("toofast",)), 1)
+        self.now[0] += fp5_qtee_unlock.DARK_TOOFAST_EVERY_S
+        warm.say("AUTH 9 toofast avgv=866,865,867")
+        self.step()
+        self.assertEqual(self.events.count(("toofast",)), 2)
+
+
+class FastTapHelpersTest(unittest.TestCase):
+    def test_toofast_line(self) -> None:
+        self.assertTrue(fp5_qtee_unlock.is_toofast("AUTH 3 toofast avgv=1,2,3\n"))
+        self.assertFalse(fp5_qtee_unlock.is_toofast("AUTH 3 empty avgv=1,2,3"))
+        self.assertIsNone(miss_kind("AUTH 3 toofast avgv=1,2,3"))
+
+    def test_app_running(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            base = Path(root)
+            (base / "12").mkdir()
+            (base / "12" / "cmdline").write_bytes(b"python3\0/x/fp5-qtee-app.py\0")
+            (base / "self").mkdir()
+            self.assertTrue(fp5_qtee_unlock.app_running(base))
+            (base / "12" / "cmdline").write_bytes(b"python3\0other.py\0")
+            self.assertFalse(fp5_qtee_unlock.app_running(base))
+        self.assertFalse(fp5_qtee_unlock.app_running(Path("/nonexistent-fp5")))
+
+    def test_serve_running_and_wait(self) -> None:
+        busy = "  12 sudo -n /k/fp5-qtee-session serve /lib/firmware/qsee\n"
+        self.assertTrue(fp5_qtee_unlock.serve_running(busy))
+        self.assertFalse(fp5_qtee_unlock.serve_running(
+            "  13 /k/fp5-qtee-session enroll /lib/firmware/qsee\n"))
+        outs = [busy, busy, ""]
+        now = [0.0]
+        ok = fp5_qtee_unlock.wait_serve_gone(
+            4.0, ps=lambda: outs.pop(0), clock=lambda: now[0],
+            nap=lambda s: now.__setitem__(0, now[0] + s))
+        self.assertTrue(ok)
+        now[0] = 0.0
+        ok = fp5_qtee_unlock.wait_serve_gone(
+            1.0, ps=lambda: busy, clock=lambda: now[0],
+            nap=lambda s: now.__setitem__(0, now[0] + s))
+        self.assertFalse(ok)
+
+    def test_take_line_prefers_pending(self) -> None:
+        import collections
+        warm = FakeWarm()
+        warm.pending = collections.deque(["a\n"])  # type: ignore[attr-defined]
+        warm.say("b")
+        self.assertEqual(fp5_qtee_unlock.take_line(warm), "a\n")
+        self.assertEqual(fp5_qtee_unlock.take_line(warm), "b\n")
+        with self.assertRaises(queue.Empty):
+            fp5_qtee_unlock.take_line(warm)
+
+    def test_note_has_milliseconds(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch.object(fp5_qtee_unlock, "LOG_DIR", Path(root)):
+                UnlockWatcher().note("x")
+            text = (Path(root) / "unlock-watcher.log").read_text()
+        self.assertRegex(text, r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3} x\n$")
+
+
+class WarmWaitTest(unittest.TestCase):
+    def test_wait_line_wakes_on_output_and_keeps_it(self) -> None:
+        proc = subprocess.Popen(
+            ["sh", "-c", "sleep 0.1; echo AUTH HIT; exec sleep 5"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
+        self.addCleanup(lambda: (proc.kill(), proc.wait()))
+        warm = WarmSession(proc, None)
+        t0 = time.monotonic()
+        self.assertTrue(warm.wait_line(3.0))
+        self.assertLess(time.monotonic() - t0, 1.5)
+        self.assertEqual(fp5_qtee_unlock.take_line(warm), "AUTH HIT\n")
+        t0 = time.monotonic()
+        self.assertFalse(warm.wait_line(0.1))
+        self.assertGreaterEqual(time.monotonic() - t0, 0.09)
+
+
 if __name__ == "__main__":
     unittest.main()

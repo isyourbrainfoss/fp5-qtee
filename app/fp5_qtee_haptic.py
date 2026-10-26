@@ -1,7 +1,8 @@
 """Android fingerprint haptics for the FP5 aw86927.
 
 Success is one 20 ms pulse. A miss is two 30 ms pulses whose starts are
-130 ms apart, at the same amplitude. Lockout adds nothing. The silent
+130 ms apart, at the same amplitude. A too-fast tap is three 15 ms ticks
+55 ms apart. Lockout adds nothing. The silent
 feedbackd profile plays nothing, and so does an unreadable profile.
 
 The aw86927 on this phone is an input force-feedback device, not an LED.
@@ -31,6 +32,10 @@ from typing import Callable
 SUCCESS_MS = 20
 MISS_ON_MS = 30
 MISS_OFF_MS = 100
+# Too fast: three short ticks, so it is not confused with the single
+# success click or the double miss pulse.
+TOOFAST_ON_MS = 15
+TOOFAST_OFF_MS = 40
 AMPLITUDE = 1.0
 GAIN = 0x80
 # aw86927_play_sine writes (magnitude * 0x80 / 0xffff) into PLAYCFG2.
@@ -42,6 +47,7 @@ FEEDBACKD_GAIN = 0xC000
 FULL_GAIN = 0xFFFF
 SUCCESS_EVENT = "fp5-qtee-match"
 MISS_EVENT = "fp5-qtee-miss"
+TOOFAST_EVENT = "fp5-qtee-toofast"
 APP_ID = "org.fp5.qtee"
 LED_MARKS = ("aw869", "haptic", "vibrator")
 FF_MARKS = ("aw869", "haptic")
@@ -66,6 +72,14 @@ def waveform(kind: str) -> list[tuple[float, int]] | None:
             (AMPLITUDE, MISS_ON_MS),
             (0.0, MISS_OFF_MS),
             (AMPLITUDE, MISS_ON_MS),
+        ]
+    if kind == "toofast":
+        return [
+            (AMPLITUDE, TOOFAST_ON_MS),
+            (0.0, TOOFAST_OFF_MS),
+            (AMPLITUDE, TOOFAST_ON_MS),
+            (0.0, TOOFAST_OFF_MS),
+            (AMPLITUDE, TOOFAST_ON_MS),
         ]
     return None
 
@@ -129,7 +143,8 @@ def sysfs_steps(kind: str) -> list[tuple[str, int]] | None:
 
 
 def fbcli_args(kind: str) -> list[str] | None:
-    event = {"success": SUCCESS_EVENT, "miss": MISS_EVENT}.get(kind)
+    event = {"success": SUCCESS_EVENT, "miss": MISS_EVENT,
+             "toofast": TOOFAST_EVENT}.get(kind)
     if event is None:
         return None
     return ["fbcli", "-A", APP_ID, "-E", event]

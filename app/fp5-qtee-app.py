@@ -275,6 +275,15 @@ class FingerWindow(Adw.ApplicationWindow):
         stamp = time.strftime("%Y%m%d-%H%M%S")
         path = LOG_DIR / f"finger-{mode}-{stamp}.txt"
         limit = "1500" if mode == "enroll" else "400"
+        # The unlock watcher may keep its serve session loaded while the
+        # phone is unlocked. It quits that session once it sees this app;
+        # wait for that so two sessions never share the trustlet.
+        try:
+            from fp5_qtee_unlock import wait_serve_gone
+
+            wait_serve_gone()
+        except Exception:  # noqa: BLE001 - never block the app on this
+            pass
         self._log_path = path
         self._ui(self._paint_only)
         with path.open("w", encoding="utf-8") as log:

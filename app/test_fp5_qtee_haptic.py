@@ -141,6 +141,30 @@ class ThemeTest(unittest.TestCase):
                 by_name["fp5-qtee-miss"]["magnitudes"],
                 [AMPLITUDE, 0.0, AMPLITUDE],
             )
+            self.assertEqual(
+                by_name["fp5-qtee-toofast"]["durations"],
+                [ms for _a, ms in fp5_qtee_haptic.waveform("toofast")],
+            )
+            self.assertEqual(
+                by_name["fp5-qtee-toofast"]["magnitudes"],
+                [a for a, _ms in fp5_qtee_haptic.waveform("toofast")],
+            )
+
+
+class TooFastWaveTest(unittest.TestCase):
+    def test_distinct_triple_tick(self) -> None:
+        wave = fp5_qtee_haptic.waveform("toofast")
+        pulses = [ms for a, ms in wave if a > 0]
+        self.assertEqual(len(pulses), 3)
+        self.assertNotEqual(wave, fp5_qtee_haptic.waveform("miss"))
+        self.assertNotEqual(wave, fp5_qtee_haptic.waveform("success"))
+        self.assertLess(sum(ms for _a, ms in wave), 200)
+        self.assertEqual(
+            fp5_qtee_haptic.fbcli_args("toofast")[-1], "fp5-qtee-toofast"
+        )
+        steps = fp5_qtee_haptic.ff_steps("toofast")
+        self.assertEqual([op for op, _v in steps].count("rumble"), 3)
+        self.assertEqual([v for op, v in steps if op == "sleep"], [55, 55])
 
 
 class PlayTest(unittest.TestCase):
