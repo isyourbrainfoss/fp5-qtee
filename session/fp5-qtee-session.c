@@ -3206,6 +3206,10 @@ static int serve_loop(struct svc *s)
 		if (cmd == FP5_CMD_QUIT)
 			break;
 		a = auth_once(s, ++n);
+		/* Every exit of an attempt ends the press boost and the
+		 * cpu_dma_latency hold, so an idle session never keeps the
+		 * CPU out of deep idle. */
+		boost_press(0);
 		{
 			char ex[24];
 
