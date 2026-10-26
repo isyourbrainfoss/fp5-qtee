@@ -39,6 +39,9 @@ EOT
 mv -f "$OURS.tmp" "$OURS"
 say "drop-in $OURS"
 flock -u 9
+systemctl --user daemon-reload
+systemctl --user show -p ExecStart "$UNIT" | grep -q "$K/app/fp5_qtee_unlock.py" ||
+	die "ExecStart is not ours; another drop-in sorts after $OURS (run restore.sh)"
 start_unit
 check_null
 echo "$(date +%FT%T%z) deploy $(sha "$LIVE")" >> "$K/history.txt"

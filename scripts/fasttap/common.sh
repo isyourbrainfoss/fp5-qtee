@@ -6,7 +6,9 @@ STORE=/mnt/persist/misc
 LOCK=/tmp/fp5-qtee-phone.lock
 UNIT=fp5-qtee-unlock.service
 DROP=$HOME/.config/systemd/user/$UNIT.d
-OURS=$DROP/zz-fasttap.conf
+# Must sort after every other drop-in (zzz-fp-fix-20261025.conf sets
+# ExecStart too; the last one in name order wins).
+OURS=$DROP/zzzz-fasttap.conf
 BEFORE=$K/before
 : "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
 export XDG_RUNTIME_DIR
