@@ -77,4 +77,31 @@ int fp5_att_down(struct fp5_attempt *a);
 /* Verdict after capture and report: HIT only for a live match. */
 int fp5_att_finish(const struct fp5_attempt *a, int matched);
 
+/*
+ * Held miss (Android: a wrong finger held still is one miss, one buzz,
+ * one strike). In touch mode the chip only raises an irq on finger-down,
+ * never on lift (0 up edges in the Oct 26 logs), but a fresh AUTH_ARM +
+ * WMODE_TOUCH + QEV reports a finger that is still there as down (rc 5,
+ * itype 0x2). So after a press that ended without a hit:
+ * - the down found by the arm query (or a panel/resume query) is that
+ *   same finger: wait, do not capture;
+ * - re-arm and query every fp5_lift_check_ms() (200 ms, later 0.5/2 s) until the query says no
+ *   finger: that is the lift. Only then a new down is a new press;
+ * - a down irq edge at least FP5_LIFT_EDGE_MS after the last re-arm is a
+ *   new touch (the chip saw a lift we could not), so it is a press.
+ * A hit or a cancel does not ask for a lift.
+ */
+#define FP5_LIFT_EDGE_MS 300
+enum {
+	FP5_GATE_NONE = 0,	/* no finger-down in this sample */
+	FP5_GATE_PRESS,		/* new press: capture */
+	FP5_GATE_HELD,		/* the finger from the last miss: wait */
+};
+/* 1 when the next attempt must see the finger lifted first. */
+int fp5_lift_after(int result);
+int fp5_lift_gate(int need_lift, int from_query, int real_down,
+		  long ms_since_arm);
+/* Re-arm check interval while a missed finger stays down for held_ms. */
+int fp5_lift_check_ms(long held_ms);
+
 #endif

@@ -2104,6 +2104,38 @@ class FastTapTest(WarmLoopTest.__base__):  # type: ignore[misc]
         self.step()
         self.assertNotIn(("toofast",), self.events)
 
+    def test_held_wrong_finger_is_one_strike(self) -> None:
+        """Oct 26 report: a held wrong finger was retried until lockout.
+
+        The session now waits for the lift after a miss and prints only
+        "held after miss" / "still held" / "lifted" lines for that finger.
+        None of them is a press, a miss or a too-fast tap.
+        """
+        self.step()
+        warm = self.started[0]
+        warm.say("SERVE idle")
+        self.step()
+        warm.say("AUTH 1 arm mode=1 irq=1206",
+                 "AUTH 1 already down itype=0x2",
+                 "AUTH 1 REAL DOWN itype=0x2", self.FAIL,
+                 "SERVE result 5", "SERVE idle")
+        self.step()
+        self.assertEqual(warm.sent.count("auth"), 2)
+        for _ in range(5):
+            warm.say("LIFTGATE on edge=300",
+                     "AUTH 2 arm mode=1 irq=1207",
+                     "AUTH 2 held after miss: wait for lift itype=0x2",
+                     "AUTH 2 still held itype=0x2",
+                     "AUTH 2 held after miss at panel itype=0x2")
+            self.step(0.7)
+        warm.say("AUTH 2 lifted how=check ms=3400 checks=17")
+        self.step()
+        self.assertEqual(self.w.policy.failed, 1)
+        self.assertEqual(self.events.count(("miss", "nomatch")), 1)
+        self.assertNotIn(("toofast",), self.events)
+        # Still the same attempt: no new auth was sent while held.
+        self.assertEqual(warm.sent.count("auth"), 2)
+
     def test_dark_toofast_is_rate_limited(self) -> None:
         self.loop.dark_arm = True
         self.panel[0] = False
@@ -2127,6 +2159,18 @@ class FastTapHelpersTest(unittest.TestCase):
         self.assertTrue(fp5_qtee_unlock.is_toofast("AUTH 3 toofast avgv=1,2,3\n"))
         self.assertFalse(fp5_qtee_unlock.is_toofast("AUTH 3 empty avgv=1,2,3"))
         self.assertIsNone(miss_kind("AUTH 3 toofast avgv=1,2,3"))
+
+    def test_lift_gate_lines_are_not_presses(self) -> None:
+        for line in ("AUTH 2 held after miss: wait for lift itype=0x2",
+                     "AUTH 2 held after miss at resume itype=0x2",
+                     "AUTH 2 still held itype=0x2",
+                     "AUTH 2 lifted how=edge ms=900 checks=4",
+                     "LIFTGATE on edge=300"):
+            self.assertFalse(fp5_qtee_unlock.is_down(line), line)
+            self.assertFalse(fp5_qtee_unlock.armed(line), line)
+            self.assertIsNone(miss_kind(line), line)
+            self.assertIsNone(hit_fid(line), line)
+            self.assertFalse(fp5_qtee_unlock.is_toofast(line), line)
 
     def test_app_running(self) -> None:
         with tempfile.TemporaryDirectory() as root:

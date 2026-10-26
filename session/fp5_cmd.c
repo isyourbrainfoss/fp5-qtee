@@ -115,3 +115,32 @@ int fp5_att_finish(const struct fp5_attempt *a, int matched)
 	 * watcher counts the strike even if it cancelled meanwhile. */
 	return FP5_ATT_MISS;
 }
+
+int fp5_lift_after(int result)
+{
+	/* Scored no-match (stay or not), empty, too fast. Not a hit,
+	 * not a cancel, not "no finger", not an error. */
+	return result == FP5_ATT_MISS || result == FP5_ATT_AGAIN;
+}
+
+int fp5_lift_gate(int need_lift, int from_query, int real_down,
+		  long ms_since_arm)
+{
+	if (!real_down)
+		return FP5_GATE_NONE;
+	if (!need_lift)
+		return FP5_GATE_PRESS;
+	if (from_query)
+		return FP5_GATE_HELD;
+	return ms_since_arm >= FP5_LIFT_EDGE_MS ? FP5_GATE_PRESS
+						: FP5_GATE_HELD;
+}
+
+int fp5_lift_check_ms(long held_ms)
+{
+	if (held_ms < 5000)
+		return 200;
+	if (held_ms < 20000)
+		return 500;
+	return 2000;
+}

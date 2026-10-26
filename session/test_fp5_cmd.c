@@ -149,8 +149,40 @@ static void test_cancel_queued_behind_auth(void)
 	CHECK(a.cancelled && !fp5_att_irq(&a, 2), "queued cancel applies to the new auth");
 }
 
+/* User report Oct 26: a held wrong finger was matched again and again
+ * (arm query "already down" every ~0.7 s, 5 strikes, lockout). */
+static void test_held_miss_is_one_attempt(void)
+{
+	CHECK(fp5_lift_after(FP5_ATT_MISS), "miss asks for a lift");
+	CHECK(fp5_lift_after(FP5_ATT_AGAIN), "all-zero miss asks for a lift");
+	CHECK(!fp5_lift_after(FP5_ATT_HIT), "hit does not");
+	CHECK(!fp5_lift_after(FP5_ATT_CANCELLED), "cancel does not");
+	CHECK(!fp5_lift_after(FP5_ATT_NONE), "no finger does not");
+	CHECK(!fp5_lift_after(-1), "error does not");
+
+	/* Normal arming is unchanged. */
+	CHECK(fp5_lift_gate(0, 1, 1, 0) == FP5_GATE_PRESS, "already down, fresh");
+	CHECK(fp5_lift_gate(0, 0, 1, 5) == FP5_GATE_PRESS, "irq down, fresh");
+	CHECK(fp5_lift_gate(0, 0, 0, 5) == FP5_GATE_NONE, "idle");
+	/* After a miss the re-arm query sees the same finger. */
+	CHECK(fp5_lift_gate(1, 1, 1, 0) == FP5_GATE_HELD, "held after miss");
+	CHECK(fp5_lift_gate(1, 1, 1, 60000) == FP5_GATE_HELD, "held for a minute");
+	CHECK(fp5_lift_gate(1, 1, 0, 0) == FP5_GATE_NONE, "query: no finger");
+	/* A late arm irq for that finger is still the same press. */
+	CHECK(fp5_lift_gate(1, 0, 1, FP5_LIFT_EDGE_MS - 1) == FP5_GATE_HELD,
+	      "edge right after re-arm");
+	CHECK(fp5_lift_gate(1, 0, 1, FP5_LIFT_EDGE_MS) == FP5_GATE_PRESS,
+	      "new edge later is a new touch");
+
+	CHECK(fp5_lift_check_ms(0) == 200, "fast checks first");
+	CHECK(fp5_lift_check_ms(4999) == 200, "for 5 s");
+	CHECK(fp5_lift_check_ms(5000) == 500, "then 0.5 s");
+	CHECK(fp5_lift_check_ms(60000) == 2000, "long hold (pocket) 2 s");
+}
+
 int main(void)
 {
+	test_held_miss_is_one_attempt();
 	test_lines();
 	test_parse();
 	test_overlong();

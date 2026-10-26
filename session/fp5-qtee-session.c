@@ -2974,6 +2974,55 @@ static int query_held(struct svc *s, uint32_t *itype, int *esd)
 	return 1;
 }
 
+/*
+ * Held-miss gate state (fp5_cmd.h). Kept across serve attempts: the
+ * watcher sends the next auth right after a miss result.
+ * FP5_QTEE_LIFT_GATE=0 turns it off (old behaviour).
+ */
+static int lift_gate_on = 1;
+static int lift_wait;
+static long lift_since;
+static int lift_checks;
+
+static void lift_clear(int which, const char *how)
+{
+	char ex[64];
+
+	snprintf(ex, sizeof(ex), "how=%s ms=%ld checks=%d", how,
+		 now_ms() - lift_since, lift_checks);
+	tlog(which, "lift", ex);
+	logf("AUTH %d lifted %s", which, ex);
+	lift_wait = 0;
+	lift_checks = 0;
+}
+
+/* Re-arm touch mode and ask whether a finger is on the sensor. The arm
+ * itself raises irq for a finger that is down; that is absorbed into
+ * the baseline. 1 held, 0 not, -1 on invoke. */
+static int lift_probe(struct svc *s, unsigned *irq, uint32_t *itype,
+		      int *esd)
+{
+	uint32_t mode = fp5_wmode_touch();
+	uint8_t hat[0x4a];
+	int held;
+
+	lift_checks++;
+	fp5_hat_auth(hat);
+	if (send_cmd(s, fp5_op_auth(), fp5_auth_plen(), hat, "AUTH_ARM"))
+		return -1;
+	if (s->last_rc != 0) {
+		logf("AUTH lift check: arm rc=%d, still waiting", (int)s->last_rc);
+		return 1;
+	}
+	if (send_cmd(s, fp5_op_wmode(), 4, &mode, "WMODE_TOUCH"))
+		return -1;
+	held = query_held(s, itype, esd);
+	*irq = read_irq();
+	if (serve_on && !serve_att.cancelled)
+		serve_att.irq = *irq;
+	return held;
+}
+
 static int auth_once(struct svc *s, int which)
 {
 	unsigned irq = read_irq();
@@ -2987,8 +3036,17 @@ static int auth_once(struct svc *s, int which)
 	uint32_t itype = 0;
 	int esd = 0, down = 0, from_query = 0;
 	int left = 90000;
+	long t_arm, next_check = 0;
 	uint8_t hat[0x4a];
 	uint8_t z[4] = { 0 };
+	static int lift_env;
+
+	if (!lift_env) {
+		lift_env = 1;
+		lift_gate_on = (int)env_long("FP5_QTEE_LIFT_GATE", 1, 0, 1);
+		logf("LIFTGATE %s edge=%d", lift_gate_on ? "on" : "off",
+		     FP5_LIFT_EDGE_MS);
+	}
 
 	/*
 	 * 0x2008 stores operation mode 2 (do_authenticate) and returns 0
@@ -3029,19 +3087,32 @@ static int auth_once(struct svc *s, int which)
 	 * inside that baseline, and wait_irq will not see it. Ask once.
 	 * A mode-switch leftover is not a finger.
 	 */
+	t_arm = now_ms();
 	{
 		int held = query_held(s, &itype, &esd);
 
 		if (held < 0)
 			return -1;
-		if (held) {
+		if (held && lift_wait) {
+			/* Same finger as the last miss. Not a new try. */
+			logf("AUTH %d held after miss: wait for lift itype=0x%x",
+			     which, itype);
+			tlog(which, "held", NULL);
+			irq = read_irq();
+			if (serve_on && !serve_att.cancelled)
+				serve_att.irq = irq;
+			next_check = now_ms() + fp5_lift_check_ms(now_ms() - lift_since);
+		} else if (held) {
 			down = 1;
 			from_query = 1;
 			boost_press(1);
 			logf("AUTH %d already down itype=0x%x", which, itype);
-		} else if (s->last.saw_itype) {
-			logf("skip leftover itype=0x%x esd=%d",
-			     s->last.itype, s->last.esd);
+		} else {
+			if (lift_wait)
+				lift_clear(which, "arm");
+			if (s->last.saw_itype)
+				logf("skip leftover itype=0x%x esd=%d",
+				     s->last.itype, s->last.esd);
 		}
 	}
 	{
@@ -3074,6 +3145,16 @@ static int auth_once(struct svc *s, int which)
 					 (int)s->last_rc, itype, fp5_ev_name(ev));
 				tlog(which, "qev", ex);
 				if (fp5_real_down(itype, esd)) {
+					if (fp5_lift_gate(lift_wait, 0, 1,
+							  now_ms() - t_arm) ==
+					    FP5_GATE_HELD) {
+						boost_press(0);
+						logf("AUTH %d still held itype=0x%x",
+						     which, itype);
+						continue;
+					}
+					if (lift_wait)
+						lift_clear(which, "edge");
 					down = 1;
 					break;
 				}
@@ -3082,6 +3163,23 @@ static int auth_once(struct svc *s, int which)
 					tlog(which, "up-early", NULL);
 				/* Keep the screen on PRESS. An AUTH-prefixed skip would say LIFT. */
 				logf("skip leftover itype=0x%x esd=%d", itype, esd);
+				continue;
+			}
+			if (lift_wait && now_ms() >= next_check) {
+				int h = lift_probe(s, &irq, &itype, &esd);
+
+				if (h < 0)
+					return -1;
+				t_arm = now_ms();
+				if (h) {
+					next_check = t_arm + fp5_lift_check_ms(t_arm - lift_since);
+				} else {
+					/* Re-armed with no finger: the next
+					 * touch raises irq as usual. */
+					lift_clear(which, "check");
+				}
+				panel = dsi_is_on();
+				gap0 = suspend_gap_ms();
 				continue;
 			}
 			/*
@@ -3101,7 +3199,11 @@ static int auth_once(struct svc *s, int which)
 
 				if (held < 0)
 					return -1;
-				if (held) {
+				if (held && lift_wait) {
+					logf("AUTH %d held after miss at %s itype=0x%x",
+					     which, resumed ? "resume" : "panel",
+					     itype);
+				} else if (held) {
 					down = 1;
 					from_query = 1;
 					boost_press(1);
@@ -3131,6 +3233,11 @@ static int auth_once(struct svc *s, int which)
 		int r = auth_press(s, which, &irq, itype, esd, from_query);
 
 		boost_press(0);
+		if (lift_gate_on && fp5_lift_after(r)) {
+			lift_wait = 1;
+			lift_since = now_ms();
+			lift_checks = 0;
+		}
 		return r;
 	}
 }
