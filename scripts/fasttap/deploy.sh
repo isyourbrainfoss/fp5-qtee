@@ -25,6 +25,8 @@ if [ ! -d "$BEFORE" ]; then
 	systemctl --user cat "$UNIT" > "$BEFORE/unit-cat.txt" 2>&1 || true
 	say "backed up live binary $(cat "$BEFORE/fp5-qtee-session.sha256") and drop-ins: $(ls "$BEFORE/dropins" | tr '\n' ' ')"
 fi
+# If anything below fails, never leave the phone without unlock.
+trap 'rc=$?; [ "$rc" = 0 ] || { echo "deploy failed rc=$rc; starting $UNIT again (run restore.sh if needed)" >&2; systemctl --user start "$UNIT" || true; }' EXIT
 stop_all
 install_file "$NEW_BIN" "$LIVE"
 say "live session binary $(sha "$LIVE")"

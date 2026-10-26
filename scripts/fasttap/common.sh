@@ -55,7 +55,7 @@ install_file() { # $1 source, $2 destination
 		die "$2 exists and is not a regular file"
 	fi
 	cp "$1" "$2.new"
-	chmod --reference="$1" "$2.new"
+	chmod "$(stat -c %a "$1")" "$2.new" # BusyBox: no --reference
 	mv -f "$2.new" "$2"
 	[ "$(sha "$1")" = "$(sha "$2")" ] || die "$2 differs from $1 after install"
 }
