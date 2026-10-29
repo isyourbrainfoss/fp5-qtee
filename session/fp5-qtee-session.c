@@ -1,6 +1,7 @@
 #include "fp5_cmd.h"
 #include "fp5_finger.h"
 #include "fp5_image.h"
+#include "fp5_fw.h"
 #include "fp5_tee.h"
 #include "fp5_wire.h"
 
@@ -19,7 +20,6 @@
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
-#include <sys/utsname.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -160,42 +160,6 @@ static void tune_init(void)
 	tlog(0, "start", wall);
 	logf("TUNE scans=%d rescan_ms=%ld skip_falling=%d", auth_scans,
 	     auth_rescan_ms, auth_skip_falling);
-}
-
-static int read_whole(const char *path, uint8_t **out, size_t *len)
-{
-	FILE *f;
-	long sz;
-	uint8_t *b;
-	size_t n;
-
-	f = fopen(path, "rb");
-	if (!f)
-		return -1;
-	if (fseek(f, 0, SEEK_END) != 0) {
-		fclose(f);
-		return -1;
-	}
-	sz = ftell(f);
-	if (sz <= 0 || sz > 8 * 1024 * 1024) {
-		fclose(f);
-		return -1;
-	}
-	rewind(f);
-	b = malloc((size_t)sz);
-	if (!b) {
-		fclose(f);
-		return -1;
-	}
-	n = fread(b, 1, (size_t)sz, f);
-	fclose(f);
-	if (n != (size_t)sz) {
-		free(b);
-		return -1;
-	}
-	*out = b;
-	*len = n;
-	return 0;
 }
 
 static int sysfs_write(const char *path, const char *text)
@@ -341,6 +305,46 @@ static void diag_from_env(struct fp5_diag *d)
 #define IRQ_COUNT "/sys/class/focaltech_fp/focaltech_fp/irq_count"
 
 /*
+ * Two sensor drivers, picked by what the running kernel offers (feature
+ * checks, never the kernel version):
+ *  - FP_BACKEND_MISC: the in-tree focaltech-fp driver (Marcus Ramberg,
+ *    drivers/misc/focaltech-fp.c). Recognised by its firmware_name sysfs
+ *    attribute. Events come from read()/poll() on /dev/focaltech_fp, which
+ *    must stay open: the driver disarms the interrupt on the last close.
+ *  - FP_BACKEND_LIFE: the old out-of-tree focaltech_fp_life.ko, with its
+ *    sysfs irq_count/vdd/spiclk/listen and its own ioctl numbers.
+ */
+#define FP5_MISC_FWNAME "/sys/class/misc/focaltech_fp/device/firmware_name"
+#define FP5_LIFE_BASE "/sys/class/focaltech_fp/focaltech_fp"
+#define FF_IOC_RESET_DEVICE _IO('f', 0x02)
+#define FF_IOC_ENABLE_IRQ _IO('f', 0x05)
+enum { FP_BACKEND_NONE, FP_BACKEND_MISC, FP_BACKEND_LIFE };
+static int fp_backend = FP_BACKEND_NONE;
+static int fp_misc_fd = -1;
+static unsigned fp_misc_seq;
+
+static int fp_detect_backend(void)
+{
+	if (access(FP5_MISC_FWNAME, R_OK) == 0)
+		return FP_BACKEND_MISC;
+	if (access(FP5_LIFE_BASE, F_OK) == 0)
+		return FP_BACKEND_LIFE;
+	return FP_BACKEND_NONE;
+}
+
+/* Drain every event the misc driver has queued; it reports a sequence. */
+static unsigned misc_read_seq(void)
+{
+	uint32_t v;
+
+	if (fp_misc_fd < 0)
+		return fp_misc_seq;
+	while (read(fp_misc_fd, &v, sizeof(v)) == (ssize_t)sizeof(v))
+		fp_misc_seq = v;
+	return fp_misc_seq;
+}
+
+/*
  * serve mode keeps one session open and takes commands on stdin
  * (fp5_cmd.h). A wait for a finger also watches stdin, so "cancel"
  * ends it at once. irq_fd stays open there so the wait can poll it.
@@ -359,6 +363,8 @@ static unsigned read_irq(void)
 	char b[32];
 	int fd, n;
 
+	if (fp_backend == FP_BACKEND_MISC)
+		return misc_read_seq();
 	if (irq_fd >= 0) {
 		/* pread also re-arms sysfs poll for the next change. */
 		n = (int)pread(irq_fd, b, sizeof(b) - 1, 0);
@@ -480,7 +486,14 @@ static void irq_ep_open(void)
 
 	if (irq_ep >= 0)
 		return;
-	irq_dev = open(FP5_IRQ_DEV, O_RDONLY | O_CLOEXEC);
+	/*
+	 * misc backend: wait on a dup of the fd that holds the line armed, so
+	 * irq_ep_close() never drops the last reference (that would disarm).
+	 */
+	if (fp_backend == FP_BACKEND_MISC && fp_misc_fd >= 0)
+		irq_dev = fcntl(fp_misc_fd, F_DUPFD_CLOEXEC, 3);
+	else
+		irq_dev = open(FP5_IRQ_DEV, O_RDONLY | O_CLOEXEC);
 	if (irq_dev < 0) {
 		logf("IRQWAIT poll %dms (open %s: %s)", FP5_IRQ_POLL_MS,
 		     FP5_IRQ_DEV, strerror(errno));
@@ -649,6 +662,18 @@ static int mount_persist(void)
 	}
 	if (mounted)
 		return 0;
+	/*
+	 * BengalOS: persist is mounted by a unit (read-only until the owner
+	 * decides otherwise, see fingerprint-prep.md). Never mount it here then.
+	 */
+	{
+		const char *m = getenv("FP5_QTEE_MOUNT_PERSIST");
+
+		if (m && !strcmp(m, "0")) {
+			logl("persist not mounted (FP5_QTEE_MOUNT_PERSIST=0)");
+			return -1;
+		}
+	}
 	mkdir("/mnt/persist", 0755);
 	if (mount("/dev/disk/by-partlabel/persist", "/mnt/persist", "ext4",
 		  MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) &&
@@ -660,54 +685,69 @@ static int mount_persist(void)
 	return 0;
 }
 
-static int sensor_on(void)
+static int sensor_on_misc(void)
 {
-	const char *base = "/sys/class/focaltech_fp/focaltech_fp";
-	char path[128];
-	struct utsname u;
-	char ko[256];
+	int rc;
 
-	if (access(base, F_OK) != 0) {
-		if (uname(&u))
-			return -1;
-		snprintf(ko, sizeof(ko),
-			 "/lib/modules/%s/extra/focaltech_fp_life.ko", u.release);
-		if (access(ko, R_OK) != 0) {
-			logf("no focaltech_fp_life at %s", ko);
-			return -1;
-		}
-		{
-			pid_t pid = fork();
-
-			if (pid == 0) {
-				sigset_t none;
-
-				sigemptyset(&none);
-				sigprocmask(SIG_SETMASK, &none, NULL);
-				execl("/sbin/insmod", "insmod", ko, "auto_spiclk=1",
-				      (char *)NULL);
-				execl("/usr/sbin/insmod", "insmod", ko, "auto_spiclk=1",
-				      (char *)NULL);
-				_exit(127);
-			}
-			if (pid > 0) {
-				int st = 0;
-
-				waitpid(pid, &st, 0);
-				logf("insmod focaltech_fp_life status=%d", st);
-			}
-		}
+	if (fp_misc_fd < 0)
+		fp_misc_fd = open(FP5_IRQ_DEV, O_RDWR | O_CLOEXEC | O_NONBLOCK);
+	if (fp_misc_fd < 0) {
+		logf("open %s: %s", FP5_IRQ_DEV, strerror(errno));
+		return -1;
 	}
+	/* The driver powers the sensor at probe; reset, then arm the line. */
+	rc = ioctl(fp_misc_fd, FF_IOC_RESET_DEVICE, 0);
+	if (ioctl(fp_misc_fd, FF_IOC_ENABLE_IRQ, 0))
+		logf("focaltech-fp enable irq: %s", strerror(errno));
+	logf("sensor (focaltech-fp) reset rc=%d irq=%u", rc, misc_read_seq());
+	usleep(50 * 1000);
+	return 0;
+}
+
+/* Load the old module by name (modprobe), or from $FP5_FP_LIFE_KO. */
+static void life_load(void)
+{
+	const char *ko = getenv("FP5_FP_LIFE_KO");
+	pid_t pid = fork();
+
+	if (pid == 0) {
+		sigset_t none;
+
+		sigemptyset(&none);
+		sigprocmask(SIG_SETMASK, &none, NULL);
+		if (ko && *ko) {
+			execl("/usr/sbin/insmod", "insmod", ko, "auto_spiclk=1",
+			      (char *)NULL);
+			execl("/sbin/insmod", "insmod", ko, "auto_spiclk=1",
+			      (char *)NULL);
+		} else {
+			execl("/usr/sbin/modprobe", "modprobe", "focaltech_fp_life",
+			      "auto_spiclk=1", (char *)NULL);
+			execl("/sbin/modprobe", "modprobe", "focaltech_fp_life",
+			      "auto_spiclk=1", (char *)NULL);
+		}
+		_exit(127);
+	}
+	if (pid > 0) {
+		int st = 0;
+
+		waitpid(pid, &st, 0);
+		logf("load focaltech_fp_life (%s) status=%d",
+		     ko && *ko ? ko : "modprobe", st);
+	}
+}
+
+static int sensor_on_life(void)
+{
+	const char *base = FP5_LIFE_BASE;
+	char path[128];
+
 	snprintf(path, sizeof(path), "%s/vdd", base);
 	sysfs_write(path, "1\n");
 	snprintf(path, sizeof(path), "%s/spiclk", base);
 	sysfs_write(path, "1\n");
 	snprintf(path, sizeof(path), "%s/listen", base);
 	sysfs_write(path, "1\n");
-	if (access(base, F_OK) != 0) {
-		logl("focaltech sysfs missing");
-		return -1;
-	}
 	{
 		int fd = open("/dev/focaltech_fp", O_RDWR);
 		int rc = -1;
@@ -719,10 +759,30 @@ static int sensor_on(void)
 			ioctl(fd, _IO('f', 0x03), 0);
 			close(fd);
 		}
-		logf("sensor reset rc=%d irq=%u", rc, read_irq());
+		logf("sensor (fp_life) reset rc=%d irq=%u", rc, read_irq());
 		usleep(50 * 1000);
 	}
 	return 0;
+}
+
+static int sensor_on(void)
+{
+	fp_backend = fp_detect_backend();
+	if (fp_backend == FP_BACKEND_NONE) {
+		/* Neither driver is bound. Only the old module can be loaded on demand. */
+		life_load();
+		fp_backend = fp_detect_backend();
+	}
+	switch (fp_backend) {
+	case FP_BACKEND_MISC:
+		return sensor_on_misc();
+	case FP_BACKEND_LIFE:
+		return sensor_on_life();
+	default:
+		logl("no focaltech sensor driver (neither " FP5_MISC_FWNAME
+		     " nor " FP5_LIFE_BASE ")");
+		return -1;
+	}
 }
 
 static int rpmb_xfer(int fd, void *buf, uint32_t len, int send)
@@ -1929,35 +1989,20 @@ static const char *verdict_name(uint32_t r)
 static int load_once(struct svc *s, uint64_t loader, const char *dir, uint64_t *app,
 		     uint32_t *qret_out)
 {
-	char path[256];
-	uint8_t *mdt = NULL, *img = NULL, *raw[8] = { 0 };
-	size_t mdt_len = 0, img_len = 0, raw_len[8] = { 0 };
-	struct fp5_seg segs[8];
+	uint8_t *img = NULL;
+	size_t img_len = 0;
+	char used[512];
 	char dist[128];
 	uint32_t qret = 0;
-	int i, rc;
+	int rc;
 
-	snprintf(path, sizeof(path), "%s/focal32.mdt", dir);
-	if (read_whole(path, &mdt, &mdt_len)) {
-		logf("open %s failed", path);
+	/* A prebuilt focal32.mbn (droid-juicer) first, then .mdt + .bNN. */
+	rc = fp5_fw_load(dir, "focal32", &img, &img_len, used, sizeof(used));
+	if (rc) {
+		logf("focal32 not found in %s (.mbn or .mdt+.bNN) rc=%d", dir, rc);
 		return -1;
 	}
-	for (i = 0; i < 8; i++) {
-		snprintf(path, sizeof(path), "%s/focal32.b%02d", dir, i);
-		if (read_whole(path, &raw[i], &raw_len[i])) {
-			logf("open %s failed", path);
-			rc = -1;
-			goto out;
-		}
-		segs[i].data = raw[i];
-		segs[i].len = raw_len[i];
-	}
-	rc = fp5_mbn_from_mdt(mdt, mdt_len, segs, 8, &img, &img_len);
-	if (rc) {
-		logf("image place rc=%d", rc);
-		goto out;
-	}
-	logf("image bytes=%zu mdt=%zu", img_len, mdt_len);
+	logf("image bytes=%zu from %s", img_len, used);
 	memset(dist, 0, sizeof(dist));
 	rc = fp5_tee_load_buffer(&s->tee, loader, img, img_len, "focal32", 7, dist,
 				 sizeof(dist), app, &qret);
@@ -1970,11 +2015,7 @@ static int load_once(struct svc *s, uint64_t loader, const char *dir, uint64_t *
 		rc = qret == 16 ? 16 : -1;
 	else
 		rc = 0;
-out:
-	free(mdt);
 	free(img);
-	for (i = 0; i < 8; i++)
-		free(raw[i]);
 	return rc;
 }
 
@@ -3433,7 +3474,7 @@ static int bench_mode(struct svc *s)
 int main(int argc, char **argv)
 {
 	const char *mode = argc > 1 ? argv[1] : "enroll";
-	const char *dir = argc > 2 ? argv[2] : "/lib/firmware/qsee";
+	const char *dir = fp5_fw_dir(argc > 2 ? argv[2] : NULL);
 	struct svc s;
 	int rc, i;
 	uint32_t rm_fid = 0;

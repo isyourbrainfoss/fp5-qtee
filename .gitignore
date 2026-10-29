@@ -8,3 +8,4 @@ session/test_fp5_finger
 *.ko
 __pycache__/
 *.pyc
+session/test_fp5_fw
