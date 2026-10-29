@@ -1,18 +1,23 @@
 #!/bin/sh
-# Load the out-of-tree qcomtee module, or accept a built-in one.
-# The .ko is not in this repo.
-# Refuses qsee_fingerpr. No-op if qcomtee is already loaded or built in.
-# 7.2.0-nfc-test+ still insmods qcomtee-bridge.ko. A kernel that already
-# has /dev/tee0 or the qcomtee driver (7.2.9, CONFIG_QCOMTEE=y,
-# CONFIG_QCOM_TZMEM_MODE_GENERIC=y) does not.
+# Make sure the fingerprint reader has a QTEE device (/dev/tee0).
+# Decides by what the kernel offers, never by the kernel version:
+#  - qsee_fingerpr loaded            -> refuse (never load both)
+#  - qcomtee module already loaded   -> nothing to do
+#  - /dev/tee0 or the qcomtee driver -> built in (CONFIG_QCOMTEE=y), nothing to do
+#  - else, if the out-of-tree bridge module exists ($QCOMTEE_BRIDGE_KO,
+#    default /home/user/fp5-qtee-keep/qcomtee-bridge.ko) -> insmod it
+#  - else refuse.
+# BengalOS test kernel: CONFIG_QCOMTEE=y, so this only ever says "built-in".
 # A root caller (the boot unit) runs the commands directly. Everyone
-# else still uses sudo -n.
+# else still uses sudo -n (Nura only; BengalOS has no sudo).
 set -e
 
-# qcomtee_plan REL FINGERPR MODULE TEE0 DRIVER CLASS
+# qcomtee_plan BRIDGE_KO FINGERPR MODULE TEE0 DRIVER CLASS
+# BRIDGE_KO is 1 when the out-of-tree bridge module file exists.
+# CLASS (/sys/class/tee) alone is not enough: OPTEE also creates it.
 # Prints refuse-fingerpr, already, builtin, insmod, or refuse-kernel.
 qcomtee_plan() {
-	rel=$1
+	ko=$1
 	fingerpr=$2
 	mod=$3
 	tee0=$4
@@ -31,16 +36,11 @@ qcomtee_plan() {
 		echo builtin
 		return 0
 	fi
-	# 7.2.0-nfc-test+ has CONFIG_OPTEE, so /sys/class/tee exists with no
-	# qcomtee. That kernel still needs the out-of-tree module.
-	if [ "$rel" = "7.2.0-nfc-test+" ]; then
+	if [ "$ko" = 1 ]; then
 		echo insmod
 		return 0
 	fi
-	if [ "$class" = 1 ]; then
-		echo builtin
-		return 0
-	fi
+	: "$class"
 	echo refuse-kernel
 	return 0
 }
@@ -50,6 +50,11 @@ if [ "${1:-}" = "--plan" ]; then
 	exit 0
 fi
 
+BRIDGE_KO=${QCOMTEE_BRIDGE_KO:-/home/user/fp5-qtee-keep/qcomtee-bridge.ko}
+ko=0
+if [ -f "$BRIDGE_KO" ]; then
+	ko=1
+fi
 fingerpr=0
 mod=0
 tee0=0
@@ -71,7 +76,7 @@ if [ -d /sys/class/tee ]; then
 	class=1
 fi
 
-plan=$(qcomtee_plan "$(uname -r)" "$fingerpr" "$mod" "$tee0" "$drv" "$class")
+plan=$(qcomtee_plan "$ko" "$fingerpr" "$mod" "$tee0" "$drv" "$class")
 case "$plan" in
 refuse-fingerpr)
 	echo "qsee_fingerpr is loaded"
@@ -86,7 +91,7 @@ builtin)
 	exit 0
 	;;
 refuse-kernel)
-	echo "kernel $(uname -r)"
+	echo "kernel has no qcomtee (no /dev/tee0, no qcomtee driver) and no $BRIDGE_KO"
 	exit 1
 	;;
 insmod)
@@ -104,5 +109,5 @@ else
 fi
 SCM=$(run awk "\$3==\"__scm_smc_call\" {print \$1}" /proc/kallsyms)
 CONV=$(run awk "\$3==\"qcom_scm_convention\" {print \$1}" /proc/kallsyms)
-run insmod /home/user/fp5-qtee-keep/qcomtee-bridge.ko scm_call_addr=0x$SCM scm_conv_addr=0x$CONV
+run insmod "$BRIDGE_KO" scm_call_addr=0x$SCM scm_conv_addr=0x$CONV
 echo INSMOD_OK

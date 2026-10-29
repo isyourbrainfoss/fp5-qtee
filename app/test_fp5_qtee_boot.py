@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import unittest
 from pathlib import Path
@@ -14,14 +15,16 @@ UNIT = ROOT / "scripts" / "fp5-qtee-load.service"
 
 class BootUnitTest(unittest.TestCase):
     def test_wrong_kernel_exits_before_insmod(self) -> None:
+        env = dict(os.environ, QCOMTEE_BRIDGE_KO="/nonexistent/qcomtee-bridge.ko")
         proc = subprocess.run(
             ["sh", str(SCRIPT)],
             capture_output=True,
             text=True,
             check=False,
+            env=env,
         )
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("kernel ", proc.stdout)
+        self.assertIn("kernel has no qcomtee", proc.stdout)
         self.assertNotIn("INSMOD_OK", proc.stdout + proc.stderr)
         self.assertNotIn("insmod", proc.stdout + proc.stderr)
 
@@ -36,16 +39,19 @@ class BootUnitTest(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
             return proc.stdout.strip()
 
-        # rel fingerpr module tee0 driver class
-        self.assertEqual(plan("7.2.0-nfc-test+", "0", "0", "0", "0", "1"), "insmod")
-        self.assertEqual(plan("7.2.9", "0", "0", "1", "1", "1"), "builtin")
-        self.assertEqual(plan("7.2.9", "1", "0", "1", "1", "1"), "refuse-fingerpr")
-        self.assertEqual(plan("7.2.9", "0", "1", "1", "1", "1"), "already")
-        self.assertEqual(plan("7.2.10", "0", "0", "0", "0", "0"), "refuse-kernel")
+        # bridge_ko fingerpr module tee0 driver class
+        self.assertEqual(plan("1", "0", "0", "0", "0", "1"), "insmod")
+        self.assertEqual(plan("0", "0", "0", "1", "1", "1"), "builtin")
+        self.assertEqual(plan("0", "0", "0", "0", "1", "1"), "builtin")
+        self.assertEqual(plan("1", "1", "0", "1", "1", "1"), "refuse-fingerpr")
+        self.assertEqual(plan("0", "0", "1", "1", "1", "1"), "already")
+        # OPTEE's /sys/class/tee without qcomtee is not enough
+        self.assertEqual(plan("0", "0", "0", "0", "0", "1"), "refuse-kernel")
+        self.assertEqual(plan("0", "0", "0", "0", "0", "0"), "refuse-kernel")
 
     def test_script_still_refuses_the_old_driver(self) -> None:
         text = SCRIPT.read_text(encoding="utf-8")
-        self.assertIn("7.2.0-nfc-test+", text)
+        self.assertNotIn("uname", text)
         self.assertIn("qsee_fingerpr is loaded", text)
         self.assertIn("qcomtee already loaded", text)
         self.assertIn("qcomtee built-in", text)
