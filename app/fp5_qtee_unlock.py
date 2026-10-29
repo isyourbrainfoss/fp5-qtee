@@ -26,15 +26,21 @@ import time
 from pathlib import Path
 from typing import Callable, Iterable
 
+import fp5_qtee_transport
 from fp5_qtee_haptic import Haptic
 
 SESSION_CANDIDATES = (
+    Path("/usr/libexec/fp5-qtee/fp5-qtee-session"),  # package / sysext
     Path("/home/user/fp5-qtee-keep/session/fp5-qtee-session"),
     Path("/tmp/fp5-qtee/fp5-qtee-session"),
 )
 LOAD_SCRIPT = Path("/home/user/fp5-qtee-keep/load-qcomtee.sh")
-FIRMWARE = "/lib/firmware/qsee"
-LOG_DIR = Path("/home/user/fp5-qtee-keep/logs")
+FIRMWARE = os.environ.get("FP5_QTEE_FW_DIR", "/var/lib/firmware/qsee")
+LOG_DIR = Path(
+    os.environ.get("FP5_QTEE_LOG_DIR")
+    or ("/home/user/fp5-qtee-keep/logs" if Path("/home/user/fp5-qtee-keep").is_dir()
+        else str(Path.home() / ".local/state/fp5-qtee/logs"))
+)
 OLD_DRIVER = Path("/sys/module/qsee_fingerpr")
 DSI_DPMS = Path("/sys/class/drm")
 BACKLIGHT = Path("/sys/class/backlight/ae94000.dsi.0/bl_power")
@@ -1149,28 +1155,14 @@ class UnlockWatcher:
         return True
 
     def spawn(self, binary: Path) -> subprocess.Popen[str]:
-        return subprocess.Popen(
-            [
-                "sudo",
-                "-n",
-                "timeout",
-                "-k",
-                "10",
-                str(UNLOCK_HOLD_S),
-                str(binary),
-                "unlock",
-                FIRMWARE,
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            start_new_session=True,
+        # BengalOS: socket-activated system service (no sudo). Nura: sudo -n.
+        return fp5_qtee_transport.spawn(
+            binary, "unlock", FIRMWARE, stdin=False, hold_s=UNLOCK_HOLD_S
         )
 
     def prepare(self) -> str | None:
         """Load qcomtee if needed. Returns an outcome to stop with, or None."""
-        if LOAD_SCRIPT.is_file():
+        if LOAD_SCRIPT.is_file() and fp5_qtee_transport.transport() == "sudo":
             loaded = subprocess.run(
                 ["sudo", "-n", str(LOAD_SCRIPT)],
                 check=False,
@@ -1369,17 +1361,11 @@ class UnlockWatcher:
     def _stop(self, proc: subprocess.Popen[str]) -> None:
         if proc.poll() is not None:
             return
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except OSError:
-            proc.terminate()
+        fp5_qtee_transport.signal_group(proc, signal.SIGTERM)
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except OSError:
-                proc.kill()
+            fp5_qtee_transport.signal_group(proc, signal.SIGKILL)
             proc.wait(timeout=5)
 
     def start_warm(self) -> WarmSession | None:
@@ -1513,15 +1499,7 @@ class WarmSession:
 
     @classmethod
     def spawn(cls, binary: Path, log_path: Path | None) -> "WarmSession":
-        proc = subprocess.Popen(
-            ["sudo", "-n", str(binary), "serve", FIRMWARE],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            start_new_session=True,
-        )
+        proc = fp5_qtee_transport.spawn(binary, "serve", FIRMWARE, stdin=True)
         return cls(proc, log_path)
 
     def send(self, cmd: str) -> None:
@@ -1565,10 +1543,7 @@ class WarmSession:
             self.proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             for sig in (signal.SIGTERM, signal.SIGKILL):
-                try:
-                    os.killpg(self.proc.pid, sig)
-                except OSError:
-                    self.proc.kill()
+                fp5_qtee_transport.signal_group(self.proc, sig)
                 try:
                     self.proc.wait(timeout=5)
                     break

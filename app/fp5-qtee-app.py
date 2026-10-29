@@ -18,11 +18,13 @@ from pathlib import Path
 
 for p in (
     os.path.dirname(os.path.abspath(__file__)),
+    "/usr/share/fp5-qtee",
     "/home/user/.local/share/fp5-qtee",
 ):
     if p not in sys.path:
         sys.path.insert(0, p)
 
+import fp5_qtee_transport  # noqa: E402
 from fp5_qtee_coach import Coach  # noqa: E402
 from fp5_qtee_haptic import Haptic, enroll_accept  # noqa: E402
 
@@ -35,12 +37,17 @@ from gi.repository import Adw, GLib, Gtk, Gdk  # noqa: E402
 APP_ID = "org.fp5.qtee"
 APP_TITLE = "Finger"
 SESSION_CANDIDATES = (
+    Path("/usr/libexec/fp5-qtee/fp5-qtee-session"),  # package / sysext
     Path("/home/user/fp5-qtee-keep/session/fp5-qtee-session"),
     Path("/tmp/fp5-qtee/fp5-qtee-session"),
 )
 LOAD_SCRIPT = Path("/home/user/fp5-qtee-keep/load-qcomtee.sh")
-FIRMWARE = "/lib/firmware/qsee"
-LOG_DIR = Path("/home/user/fp5-qtee-keep/logs")
+FIRMWARE = os.environ.get("FP5_QTEE_FW_DIR", "/var/lib/firmware/qsee")
+LOG_DIR = Path(
+    os.environ.get("FP5_QTEE_LOG_DIR")
+    or ("/home/user/fp5-qtee-keep/logs" if Path("/home/user/fp5-qtee-keep").is_dir()
+        else str(Path.home() / ".local/state/fp5-qtee/logs"))
+)
 OLD_DRIVER = Path("/sys/module/qsee_fingerpr")
 
 CSS = """
@@ -200,17 +207,11 @@ class FingerWindow(Adw.ApplicationWindow):
             proc = self._proc
         if proc is None or proc.poll() is not None:
             return
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except OSError:
-            return
+        fp5_qtee_transport.signal_group(proc, signal.SIGTERM)
 
         def later() -> bool:
             if proc.poll() is None:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except OSError:
-                    pass
+                fp5_qtee_transport.signal_group(proc, signal.SIGKILL)
             return False
 
         GLib.timeout_add(2000, later)
@@ -252,7 +253,7 @@ class FingerWindow(Adw.ApplicationWindow):
         binary = session_bin()
         if binary is None:
             raise RuntimeError("The reader program is not on this phone.")
-        if not LOAD_SCRIPT.is_file():
+        if not LOAD_SCRIPT.is_file() or fp5_qtee_transport.transport() == "socket":
             return
         try:
             proc = subprocess.run(
@@ -287,23 +288,9 @@ class FingerWindow(Adw.ApplicationWindow):
         self._log_path = path
         self._ui(self._paint_only)
         with path.open("w", encoding="utf-8") as log:
-            proc = subprocess.Popen(
-                [
-                    "sudo",
-                    "-n",
-                    "timeout",
-                    "-k",
-                    "15",
-                    limit,
-                    str(binary),
-                    mode,
-                    FIRMWARE,
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                start_new_session=True,
+            # BengalOS: system service over a socket (polkit). Nura: sudo -n.
+            proc = fp5_qtee_transport.spawn(
+                binary, mode, FIRMWARE, stdin=False, hold_s=int(limit)
             )
             with self._lock:
                 self._proc = proc
