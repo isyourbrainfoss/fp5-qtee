@@ -1,0 +1,6 @@
+fp5-qtee (0.0~git20261029-1) UNRELEASED; urgency=medium
+
+  * Skeleton: BengalOS layout (system socket + polkit, /usr/libexec,
+    focal32.mbn from /var/lib/firmware/qsee). Not tested on the phone.
+
+ -- Isyour Brainfoss <isyourbrainfoss@users.noreply.github.com>  Thu, 29 Oct 2026 12:00:00 +0100

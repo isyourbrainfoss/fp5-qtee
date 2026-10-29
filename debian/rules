@@ -1,0 +1,14 @@
+#!/usr/bin/make -f
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	$(MAKE) -C session all CC=$(DEB_HOST_GNU_TYPE)-gcc CFLAGS="$(CFLAGS) $(CPPFLAGS)"
+
+override_dh_auto_test:
+	-cd app && python3 -m unittest test_fp5_qtee_transport test_fp5_qtee_boot
+
+override_dh_auto_install:
+	$(MAKE) -C service install DESTDIR=$(CURDIR)/debian/fp5-qtee

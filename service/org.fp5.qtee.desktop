@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Finger
+Comment=Enroll or match a finger on the power button. New reader. Does not unlock the phone.
+Exec=/usr/bin/python3 /usr/share/fp5-qtee/fp5-qtee-app.py
+Icon=fingerprint-symbolic
+Terminal=false
+Categories=Utility;
+Keywords=fingerprint;finger;qtee;
+StartupNotify=true

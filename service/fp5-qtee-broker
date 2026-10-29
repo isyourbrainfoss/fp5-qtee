@@ -1,0 +1,117 @@
+#!/usr/bin/python3
+"""fp5-qtee-broker: the system side of the fp5-qtee socket (no sudo).
+
+Started by fp5-qtee-session@.service, one instance per connection, with
+the accepted socket as stdin/stdout. It:
+
+1. reads exactly one line "MODE <mode> [args...]" (byte by byte, so no
+   later protocol bytes are swallowed);
+2. finds the caller with SO_PEERCRED;
+3. asks polkit (pkcheck) whether that process may run the mode;
+4. execs the session binary with the socket still on stdin/stdout.
+
+Modes and polkit actions:
+  serve, unlock          org.fp5.qtee.unlock   (active session: yes)
+  list                   org.fp5.qtee.list     (active session: yes)
+  enroll, remove         org.fp5.qtee.manage   (auth_admin_keep)
+Anything else (probe, bench, ...) is refused: those are developer modes
+and stay a root-shell thing.
+"""
+
+import os
+import re
+import socket
+import struct
+import subprocess
+import sys
+
+SESSION = os.environ.get("FP5_QTEE_SESSION", "/usr/libexec/fp5-qtee/fp5-qtee-session")
+FW_DIR = os.environ.get("FP5_QTEE_FW_DIR", "/var/lib/firmware/qsee")
+ACTIONS = {
+    "serve": "org.fp5.qtee.unlock",
+    "unlock": "org.fp5.qtee.unlock",
+    "list": "org.fp5.qtee.list",
+    "enroll": "org.fp5.qtee.manage",
+    "remove": "org.fp5.qtee.manage",
+}
+ARG_RE = re.compile(r"^[0-9A-Za-z_.-]{1,32}$")
+MAX_ARGS = {"remove": 4}
+MAX_LINE = 256
+
+
+def say(msg: str) -> None:
+    try:
+        os.write(1, (msg + "\n").encode())
+    except OSError:
+        pass
+    print(msg, file=sys.stderr, flush=True)
+
+
+def read_line(fd: int) -> str:
+    buf = bytearray()
+    while len(buf) < MAX_LINE:
+        b = os.read(fd, 1)
+        if not b:
+            break
+        if b == b"\n":
+            return buf.decode("ascii", "strict")
+        buf += b
+    raise ValueError("no MODE line")
+
+
+def peer(sock: socket.socket) -> tuple[int, int, int]:
+    data = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+    return struct.unpack("3i", data)
+
+
+def start_time(pid: int) -> str:
+    with open(f"/proc/{pid}/stat") as f:
+        stat = f.read()
+    # Field 22, counted after the ")" that ends the comm field.
+    return stat.rsplit(")", 1)[1].split()[19]
+
+
+def allowed(action: str, pid: int, uid: int) -> bool:
+    if uid == 0:
+        return True
+    subject = f"{pid},{start_time(pid)},{uid}"
+    res = subprocess.run(
+        ["pkcheck", "--action-id", action, "--process", subject,
+         "--allow-user-interaction"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, timeout=120,
+    )
+    return res.returncode == 0
+
+
+def main() -> int:
+    sock = socket.socket(fileno=os.dup(0))
+    try:
+        pid, uid, _gid = peer(sock)
+        words = read_line(0).split()
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        say(f"BROKER refused: {exc}")
+        return 2
+    if len(words) < 2 or words[0] != "MODE" or words[1] not in ACTIONS:
+        say("BROKER refused: unknown mode")
+        return 2
+    mode, args = words[1], words[2:]
+    if len(args) > MAX_ARGS.get(mode, 0) or not all(ARG_RE.match(a) for a in args):
+        say("BROKER refused: bad arguments")
+        return 2
+    try:
+        ok = allowed(ACTIONS[mode], pid, uid)
+    except (OSError, subprocess.SubprocessError) as exc:
+        say(f"BROKER refused: polkit check failed: {exc}")
+        return 3
+    if not ok:
+        say(f"BROKER refused: not authorized for {ACTIONS[mode]}")
+        return 3
+    print(f"fp5-qtee: uid {uid} pid {pid} mode {mode}", file=sys.stderr, flush=True)
+    sock.close()
+    os.execv(SESSION, [SESSION, mode, FW_DIR, *args])
+    return 127
+
+
+if __name__ == "__main__":
+    sys.exit(main())

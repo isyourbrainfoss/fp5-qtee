@@ -1,0 +1,18 @@
+Source: fp5-qtee
+Section: misc
+Priority: optional
+Maintainer: Isyour Brainfoss <isyourbrainfoss@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.7.0
+Homepage: https://github.com/isyourbrainfoss/fp5-qtee
+Rules-Requires-Root: no
+
+Package: fp5-qtee
+Architecture: arm64
+Depends: ${shlibs:Depends}, ${misc:Depends}, python3, python3-gi, gir1.2-gtk-4.0, polkitd, systemd
+Recommends: droid-juicer
+Description: Fairphone 5 fingerprint unlock through the Qualcomm TEE
+ Loads the FocalTech trustlet through the upstream qcomtee driver and
+ matches fingerprints for the Phosh lock screen. A socket-activated system
+ service runs the session; polkit decides who may use it (no sudo).
+ Needs a kernel with CONFIG_QCOMTEE and the focaltech-fp driver.

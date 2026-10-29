@@ -1,0 +1,17 @@
+[Unit]
+Description=FP5 fingerprint (QTEE) session socket
+Documentation=file:///usr/share/doc/fp5-qtee/bengalos-mbn.md
+# Only when the kernel has the TEE and the sensor driver.
+ConditionPathExists=/dev/tee0
+
+[Socket]
+ListenStream=/run/fp5-qtee/session.sock
+SocketMode=0666
+DirectoryMode=0755
+Accept=yes
+# One trustlet session at a time: the sensor and the TA are single-user.
+MaxConnections=1
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

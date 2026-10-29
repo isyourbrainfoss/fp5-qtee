@@ -1,0 +1,18 @@
+# User unit: the lock-screen watcher. It talks to the system socket, so it
+# needs no sudo and no root.
+[Unit]
+Description=FP5 fingerprint unlock watcher
+PartOf=graphical-session.target
+After=graphical-session.target
+ConditionPathExists=/run/fp5-qtee/session.sock
+
+[Service]
+Type=simple
+Environment=FP5_QTEE_TRANSPORT=socket
+Environment=PYTHONPATH=/usr/share/fp5-qtee
+ExecStart=/usr/bin/python3 /usr/share/fp5-qtee/fp5_qtee_unlock.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
