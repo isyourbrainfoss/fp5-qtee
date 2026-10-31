@@ -1,0 +1,21 @@
+{
+  "name": "fp5-strong",
+  "parent-name": "$device",
+  "profiles": [
+    {
+      "name": "full",
+      "feedbacks": [
+        { "event-name": "phone-incoming-call",  "type": "VibraPattern", "magnitudes": [1.0, 0.0], "durations": [800, 600] },
+        { "event-name": "alarm-clock-elapsed",  "type": "VibraPattern", "magnitudes": [1.0, 0.0], "durations": [800, 600] },
+        { "event-name": "timeout-completed",    "type": "VibraPattern", "magnitudes": [1.0, 0.0, 1.0], "durations": [300, 200, 300] },
+        { "event-name": "message-new-sms",      "type": "VibraPattern", "magnitudes": [1.0, 0.0, 1.0], "durations": [300, 150, 300] },
+        { "event-name": "message-new-instant",  "type": "VibraPattern", "magnitudes": [1.0], "durations": [200] },
+        { "event-name": "message-new-email",    "type": "VibraPattern", "magnitudes": [1.0], "durations": [200] },
+        { "event-name": "notification-new-generic", "type": "VibraPattern", "magnitudes": [1.0, 0.0, 1.0], "durations": [80, 150, 80] },
+        { "event-name": "button-pressed",       "type": "VibraPattern", "magnitudes": [0.8], "durations": [18] },
+        { "event-name": "key-pressed",          "type": "VibraPattern", "magnitudes": [0.7], "durations": [15] },
+        { "event-name": "theme-demo",           "type": "VibraPattern", "magnitudes": [1.0, 0.0], "durations": [400, 300] }
+      ]
+    }
+  ]
+}

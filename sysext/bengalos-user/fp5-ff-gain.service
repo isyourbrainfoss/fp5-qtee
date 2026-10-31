@@ -1,0 +1,13 @@
+# FP5 2026-10-31: full vibration strength after feedbackd opens the motor.
+# Revert: systemctl --user disable --now fp5-ff-gain.service; rm this file and ~/.local/bin/fp5-ff-gain.py
+[Unit]
+Description=FP5 vibration gain 100%
+After=graphical-session.target
+PartOf=graphical-session.target
+[Service]
+Type=oneshot
+ExecStartPre=-/usr/bin/gdbus wait --session --timeout 60 org.sigxcpu.Feedback
+ExecStartPre=/bin/sleep 3
+ExecStart=/usr/bin/python3 %h/.local/bin/fp5-ff-gain.py
+[Install]
+WantedBy=graphical-session.target
