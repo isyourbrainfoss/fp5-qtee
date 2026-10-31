@@ -7,6 +7,7 @@
 # Install on the phone (owner step):
 #   cp OUT.raw /var/lib/extensions/fp5-qtee.raw && systemd-sysext refresh
 #   systemctl daemon-reload && systemctl enable --now fp5-qtee.socket
+#   busctl call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus ReloadConfig
 set -eu
 ver=${1:?VERSION_ID}
 out=${2:?OUT.raw}

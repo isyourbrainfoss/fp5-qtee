@@ -15,7 +15,13 @@ install:
 	$(MAKE) -C ../session install DESTDIR=$(DESTDIR) PREFIX=$(PREFIX) LIBEXECDIR=$(LIBEXECDIR)
 	install -Dm755 fp5-qtee-broker $(DESTDIR)$(LIBEXECDIR)/fp5-qtee-broker
 	install -Dm644 fp5-qtee.socket $(DESTDIR)$(UNITDIR)/fp5-qtee.socket
-	install -Dm644 fp5-qtee-session@.service $(DESTDIR)$(UNITDIR)/fp5-qtee-session@.service
+	install -Dm644 fp5-qtee@.service $(DESTDIR)$(UNITDIR)/fp5-qtee@.service
+	install -Dm644 fp5-fprintd.service $(DESTDIR)$(UNITDIR)/fp5-fprintd.service
+	install -Dm755 ../fprintd/fp5_fprintd.py $(DESTDIR)$(LIBEXECDIR)/fp5-fprintd
+	install -Dm644 net.reactivated.Fprint.conf $(DESTDIR)$(PREFIX)/share/dbus-1/system.d/net.reactivated.Fprint.conf
+	install -Dm644 net.reactivated.Fprint.service $(DESTDIR)$(PREFIX)/share/dbus-1/system-services/net.reactivated.Fprint.service
+	install -Dm644 ../fprintd/net.reactivated.fprint.device.policy $(DESTDIR)$(POLKITDIR)/net.reactivated.fprint.device.policy
+	install -Dm644 ../docs/fprintd.md $(DESTDIR)$(DOCDIR)/fprintd.md
 	install -Dm644 fp5-qtee-unlock.service $(DESTDIR)$(USERUNITDIR)/fp5-qtee-unlock.service
 	install -Dm644 org.fp5.qtee.policy $(DESTDIR)$(POLKITDIR)/org.fp5.qtee.policy
 	install -Dm644 org.fp5.qtee.desktop $(DESTDIR)$(PREFIX)/share/applications/org.fp5.qtee.desktop

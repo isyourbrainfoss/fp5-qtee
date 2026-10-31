@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 """fp5-qtee-broker: the system side of the fp5-qtee socket (no sudo).
 
-Started by fp5-qtee-session@.service, one instance per connection, with
+Started by fp5-qtee@.service, one instance per connection, with
 the accepted socket as stdin/stdout. It:
 
 1. reads exactly one line "MODE <mode> [args...]" (byte by byte, so no

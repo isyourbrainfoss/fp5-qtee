@@ -3,6 +3,7 @@ Description=FP5 fingerprint (QTEE) session for one client
 Documentation=file:///usr/share/doc/fp5-qtee/bengalos-mbn.md
 After=mnt-persist.mount
 Wants=mnt-persist.mount
+# The unit name must be <socket name>@.service: fp5-qtee.socket has Accept=yes.
 
 [Service]
 Type=simple

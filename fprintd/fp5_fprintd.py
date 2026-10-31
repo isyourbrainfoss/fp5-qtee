@@ -49,6 +49,7 @@ ERR = "net.reactivated.Fprint.Error."
 SESSION_CANDIDATES = (
     Path(os.environ.get("FP5_FPRINTD_SESSION", "/home/user/fp5-qtee-keep/session/fp5-qtee-session")),
     Path("/usr/local/lib/fp5-qtee/fp5-qtee-session"),
+    Path("/usr/libexec/fp5-qtee/fp5-qtee-session"),  # BengalOS sysext
 )
 FIRMWARE = os.environ.get("FP5_FPRINTD_FW", "/lib/firmware/qsee")
 LOAD_SCRIPT = Path(os.environ.get("FP5_FPRINTD_LOAD", "/home/user/fp5-qtee-keep/load-qcomtee.sh"))
@@ -62,6 +63,8 @@ DEFAULT_USER = os.environ.get("FP5_FPRINTD_USER", "user")
 # Known fids on this phone (enrolled 2026-10). Names are a guess until the
 # user renames them in fingers.json; the trustlet stores no names.
 SEED = {1558157930: "right-index-finger", 1979259351: "right-thumb"}
+if os.environ.get("FP5_FPRINTD_SEED", "1") == "0":  # other phones: no guessed fids
+    SEED = {}
 FINGERS = (
     "left-thumb", "left-index-finger", "left-middle-finger",
     "left-ring-finger", "left-little-finger", "right-thumb",

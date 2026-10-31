@@ -1,0 +1,31 @@
+[Unit]
+Description=FP5 fingerprint daemon (net.reactivated.Fprint over fp5-qtee-session)
+Documentation=file:///usr/share/doc/fp5-qtee/fprintd.md
+ConditionPathExists=/dev/tee0
+After=mnt-persist.mount
+Wants=mnt-persist.mount
+
+[Service]
+Type=dbus
+BusName=net.reactivated.Fprint
+ExecStart=/usr/bin/python3 /usr/libexec/fp5-qtee/fp5-fprintd
+Environment=FP5_FPRINTD_SESSION=/usr/libexec/fp5-qtee/fp5-qtee-session
+Environment=FP5_FPRINTD_FW=/var/lib/firmware/qsee
+Environment=FP5_FPRINTD_STATE=/var/lib/fp5-fprintd
+Environment=FP5_FPRINTD_SEED=0
+Environment=FP5_QTEE_FW_DIR=/var/lib/firmware/qsee
+Environment=FP5_QTEE_MOUNT_PERSIST=0
+StateDirectory=fp5-fprintd
+StateDirectoryMode=0700
+Restart=on-failure
+RestartSec=2
+# Root for /dev/tee0, the RPMB SG_IO path and the GP files on /mnt/persist.
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=-/mnt/persist
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+LockPersonality=yes
+SystemCallArchitectures=native

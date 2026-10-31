@@ -84,3 +84,16 @@ so the PIN is not delayed. Those files were not changed by this kit.
 Tests: `python3 -m unittest fprintd/test_fp5_fprintd.py` and
 `dbus-run-session -- python3 -m unittest fprintd/test_fp5_fprintd_dbus.py`
 (fake session binary in `fprintd/testdata/`).
+
+## BengalOS (sysext)
+
+The sysext installs the daemon as `/usr/libexec/fp5-qtee/fp5-fprintd` with
+`fp5-fprintd.service` (Type=dbus), D-Bus activation
+(`net.reactivated.Fprint.service`), the bus policy and the polkit actions.
+State is in `/var/lib/fp5-fprintd` and no fids are seeded
+(`FP5_FPRINTD_SEED=0`). The user name for new fingers comes from
+`FP5_FPRINTD_USER` (drop-in under `/etc`). After `systemd-sysext refresh`
+the bus needs a `ReloadConfig` to pick up the policy. The socket's
+template unit is `fp5-qtee@.service`. With `Accept=yes`, systemd
+looks for `<socket>@.service`, so the old `fp5-qtee-session@.service`
+name made every connection fail ("Failed to load connection service unit").
