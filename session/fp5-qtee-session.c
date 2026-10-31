@@ -2337,11 +2337,25 @@ static int enroll_load_gallery(struct svc *s)
 		return -1;
 	if (send_cmd(s, fp5_op_set_group(), (uint32_t)n, g, "SET_GROUP"))
 		return -1;
-	if (!gallery_in_cmd(s, &count)) {
-		logl("enroll refuse: trustlet did not report a template count");
-		return 2;
-	}
-	if (count < 1) {
+	if (!gallery_in_cmd(s, &count) || count < 1) {
+		/*
+		 * The guard keeps a phone that has fingers from getting a new
+		 * gallery that hides them. FP5_QTEE_ENROLL_EMPTY=1 is the owner
+		 * saying there is nothing to keep (for example BengalOS with the
+		 * templates on an SD copy of persist): enroll into whatever the
+		 * trustlet has now, without the ENUM that needs a real load.
+		 */
+		const char *e = getenv("FP5_QTEE_ENROLL_EMPTY");
+
+		if (e && !strcmp(e, "1")) {
+			logf("enroll gallery loaded=%d; FP5_QTEE_ENROLL_EMPTY=1, enrolling anyway",
+			     count);
+			return 0;
+		}
+		if (count < 0) {
+			logl("enroll refuse: trustlet did not report a template count");
+			return 2;
+		}
 		logf("enroll refuse: loaded=%d; not minting a finger", count);
 		return 2;
 	}

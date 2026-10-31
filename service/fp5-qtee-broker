@@ -11,7 +11,7 @@ the accepted socket as stdin/stdout. It:
 4. execs the session binary with the socket still on stdin/stdout.
 
 Modes and polkit actions:
-  serve, unlock          org.fp5.qtee.unlock   (active session: yes)
+  serve, unlock, auth    org.fp5.qtee.unlock   (active session: yes)
   list                   org.fp5.qtee.list     (active session: yes)
   enroll, remove         org.fp5.qtee.manage   (auth_admin_keep)
 Anything else (probe, bench, ...) is refused: those are developer modes
@@ -30,6 +30,7 @@ FW_DIR = os.environ.get("FP5_QTEE_FW_DIR", "/var/lib/firmware/qsee")
 ACTIONS = {
     "serve": "org.fp5.qtee.unlock",
     "unlock": "org.fp5.qtee.unlock",
+    "auth": "org.fp5.qtee.unlock",  # the app's Match button
     "list": "org.fp5.qtee.list",
     "enroll": "org.fp5.qtee.manage",
     "remove": "org.fp5.qtee.manage",
