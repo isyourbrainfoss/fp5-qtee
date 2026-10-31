@@ -45,6 +45,13 @@ FF_GAIN = 0x60
 # writes 0xc000 at open. 0xffff lets 0xffff through, which is register 0x80.
 FEEDBACKD_GAIN = 0xC000
 FULL_GAIN = 0xFFFF
+# Gain put back after a fingerprint pulse. feedbackd's own value by
+# default; a device whose motor is weak at 75% (BengalOS FP5, where a
+# hook raises the device gain to 0xffff) sets FP5_QTEE_FF_RESTORE_GAIN.
+try:
+    RESTORE_GAIN = max(0, min(0xFFFF, int(os.environ.get("FP5_QTEE_FF_RESTORE_GAIN", ""), 0)))
+except ValueError:
+    RESTORE_GAIN = FEEDBACKD_GAIN
 SUCCESS_EVENT = "fp5-qtee-match"
 MISS_EVENT = "fp5-qtee-miss"
 TOOFAST_EVENT = "fp5-qtee-toofast"
@@ -429,7 +436,7 @@ class Haptic:
             os.close(fd)
 
     def _bracket_gain(self, body: Callable[[], None], fd: int | None = None) -> None:
-        """Device gain 0xffff for body, then feedbackd's 0xc000.
+        """Device gain 0xffff for body, then RESTORE_GAIN (feedbackd's 0xc000).
 
         An injected player records the values and does not open a device.
         """
@@ -442,7 +449,7 @@ class Haptic:
         try:
             body()
         finally:
-            self._write_gain(opened, FEEDBACKD_GAIN)
+            self._write_gain(opened, RESTORE_GAIN)
             if own and opened is not None:
                 os.close(opened)
 
