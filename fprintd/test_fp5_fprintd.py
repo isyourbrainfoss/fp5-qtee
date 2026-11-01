@@ -129,6 +129,22 @@ class SyncHelpersTest(unittest.TestCase):
         self.assertEqual(f.free_order10(text2), 5)
         self.assertEqual(f.free_order10(""), 0)
 
+    def test_free_order10_zones(self):
+        text = ("Node 0, zone      DMA    1 1 1 1 1 1 1 1 1 1 4 \n"
+                "Node 0, zone   Normal    1 1 1 1 1 1 1 1 1 1 1 \n")
+        self.assertEqual(f.free_order10(text), 5)
+        self.assertEqual(f.free_order10(text, zones=("Normal",)), 1)
+
+    def test_memory_ok_for_yield(self):
+        seq = [1, 3]
+        compacted = []
+        self.assertTrue(f.memory_ok_for_yield(free=lambda: seq.pop(0),
+                                              compact=lambda: compacted.append(1), need=2))
+        self.assertEqual(compacted, [1])
+        self.assertFalse(f.memory_ok_for_yield(free=lambda: 0, compact=lambda: None, need=2))
+        self.assertFalse(f.memory_ok_for_yield(free=lambda: -1, compact=lambda: None, need=2))
+        self.assertTrue(f.memory_ok_for_yield(free=lambda: 5, compact=lambda: self.fail("compacted"), need=2))
+
     def test_map_sync_to_owner(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "fingers.json"

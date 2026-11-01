@@ -414,8 +414,8 @@ COMPACT = Path("/proc/sys/vm/compact_memory")
 BUDDYINFO = Path("/proc/buddyinfo")
 
 
-def free_order10(text: str | None = None) -> int:
-    """Free order-10 blocks over all zones (the last /proc/buddyinfo column)."""
+def free_order10(text: str | None = None, zones: "tuple[str, ...] | None" = None) -> int:
+    """Free order-10 blocks (the last /proc/buddyinfo column), in `zones` or all."""
     if text is None:
         try:
             text = BUDDYINFO.read_text()
@@ -426,7 +426,10 @@ def free_order10(text: str | None = None) -> int:
         parts = line.split()
         if "zone" not in parts:
             continue
-        counts = parts[parts.index("zone") + 2:]
+        at = parts.index("zone")
+        if zones is not None and (len(parts) <= at + 1 or parts[at + 1] not in zones):
+            continue
+        counts = parts[at + 2:]
         if len(counts) >= 11 and counts[10].isdigit():
             total += int(counts[10])
     return total
@@ -450,6 +453,37 @@ def compact_if_needed() -> int:
     return free
 
 
+# Handing the sensor over costs two fresh 4 MiB buffers: ours now and the
+# watcher's at the next lock. Seen 2026-11-01: with one block or none, ours
+# failed and the lock screen then went without a session for minutes. So
+# the watcher is only asked to let go with this many free order-10 blocks
+# in the Normal zone (after compacting).
+YIELD_MIN_ORDER10 = int(os.environ.get("FP5_FPRINTD_YIELD_MIN_ORDER10", "2"))
+
+
+def memory_ok_for_yield(free: "Callable[[], int] | None" = None,
+                        compact: "Callable[[], None] | None" = None,
+                        need: int | None = None) -> bool:
+    """Enough contiguous memory to take the sensor from the watcher."""
+    free = free if free is not None else (lambda: free_order10(zones=("Normal",)))
+    need = YIELD_MIN_ORDER10 if need is None else need
+    have = free()
+    if have < 0:
+        return False
+    if have >= need:
+        return True
+    if compact is None:
+        def compact() -> None:
+            try:
+                COMPACT.write_text("1\n")
+            except OSError:
+                pass
+    compact()
+    have = free()
+    log(f"order-10 blocks after compaction: {have} (need {need})")
+    return have >= need
+
+
 class Busy(Exception):
     pass
 
@@ -469,8 +503,9 @@ class SensorLock:
             # Taking the sensor from the watcher means two fresh 4 MiB
             # buffers (ours, then the watcher's at the next lock). Without
             # one free now, keep the lock-screen session and use the PIN.
-            if compact_if_needed() == 0:
-                raise Busy("no contiguous memory for a second session; keeping the unlock watcher's")
+            if not memory_ok_for_yield():
+                want_sensor(False)
+                raise Busy("not enough contiguous memory to take the sensor; keeping the unlock watcher's session")
             # The watcher's kept session quits when it sees WANT_MARKER.
             want_sensor(True)
             if not wait_sessions_gone():
@@ -899,7 +934,7 @@ def main() -> int:  # pragma: no cover - needs a system bus
             log(f"claimed by {sender} for {user}")
             # Ask the watcher to let go now, so VerifyStart finds the
             # sensor free. Only while unlocked: locked, it is the watcher's.
-            if seat_locked() is False:
+            if seat_locked() is False and (not other_session_pids() or memory_ok_for_yield()):
                 want_sensor(True)
 
         @dbus.service.method(IFACE_DEV, in_signature="", out_signature="",
