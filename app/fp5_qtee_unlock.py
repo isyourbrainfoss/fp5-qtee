@@ -120,13 +120,60 @@ PIN_MAX_AGE_S = 72 * 3600.0
 # not the PIN. Phosh clears LockedHint a little after logind unlocks.
 OUR_UNLOCK_GRACE_S = 10.0
 REQUIRE_PIN = os.environ.get("FP5_QTEE_REQUIRE_PIN_AFTER_BOOT", "1") != "0"
-POLICY_TEXT = {
-    "pin-after-boot": "Unlock with your PIN once to turn on fingerprint unlock.",
-    "pin-72h": "Fingerprint unlock needs your PIN every 72 hours.",
-    "lockout": "Too many attempts. Try again in 30 seconds, or use your PIN.",
-    "lockout-permanent": "Too many attempts. Unlock with your PIN.",
-    "no-state": "Fingerprint unlock is off until the lockout state can be saved.",
+POLICY_TEXTS = {
+    "en": {
+        "pin-after-boot": "Unlock with your PIN once to turn on fingerprint unlock.",
+        "pin-72h": "Fingerprint unlock needs your PIN every 72 hours.",
+        "lockout": "Too many attempts. Try again in 30 seconds, or use your PIN.",
+        "lockout-permanent": "Too many attempts. Unlock with your PIN.",
+        "no-state": "Fingerprint unlock is off until the lockout state can be saved.",
+    },
+    "nb": {
+        "pin-after-boot": "Bruk PIN én gang etter omstart for å slå på fingeravtrykk.",
+        "pin-72h": "Fingeravtrykk krever PIN hver 72. time. Bruk PIN.",
+        "lockout": "For mange forsøk. Prøv igjen om 30 sekunder, eller bruk PIN.",
+        "lockout-permanent": "For mange forsøk. Bruk PIN.",
+        "no-state": "Fingeravtrykk er av til sperretilstanden kan lagres.",
+    },
 }
+MISS_TEXTS = {
+    "en": {
+        "nomatch": "Not recognized. Try again, or use your PIN.",
+        "partial": "Finger not read. Cover the whole sensor and hold still.",
+        "toofast": "Finger lifted too fast. Rest it on the sensor a moment.",
+    },
+    "nb": {
+        "nomatch": "Ikke gjenkjent. Prøv igjen, eller bruk PIN.",
+        "partial": "Fingeren ble ikke lest. Dekk hele sensoren og hold stille.",
+        "toofast": "Fingeren ble løftet for fort. Hold den på sensoren litt.",
+    },
+}
+APP_NAMES = {"en": "Fingerprint", "nb": "Fingeravtrykk"}
+
+
+def text_lang(env: "dict[str, str] | None" = None) -> str:
+    """'nb' for Norwegian (FP5_QTEE_LANG, else the locale), else 'en'."""
+    env = os.environ if env is None else env
+    picks = [env.get("FP5_QTEE_LANG", "")]
+    picks += env.get("LANGUAGE", "").split(":")
+    picks += [env.get("LC_ALL", ""), env.get("LC_MESSAGES", ""), env.get("LANG", "")]
+    for value in picks:
+        value = value.strip().lower()
+        if not value or value in ("c", "posix") or value.startswith("c."):
+            continue
+        if value[:2] in ("nb", "nn", "no"):
+            return "nb"
+        return "en" if value[:2] not in POLICY_TEXTS else value[:2]
+    return "en"
+
+
+LANG = text_lang()
+POLICY_TEXT = POLICY_TEXTS[LANG]
+APP_NAME = APP_NAMES[LANG]
+# Running out of finger tries. These notices are critical: Phosh turns the
+# screen on and keeps them on the lock screen until we close them.
+LOCKOUT_REASONS = ("lockout", "lockout-permanent")
+URGENT_TEXTS = frozenset(t[r] for t in POLICY_TEXTS.values() for r in LOCKOUT_REASONS)
 # Warm mode keeps one "serve" session loaded while the phone is locked,
 # so a wake only has to arm the sensor. Opt in until it is proven on more
 # phones: FP5_QTEE_WARM=1.
@@ -165,11 +212,7 @@ WARM_RETRY_S = 5.0
 UNLOCKED_LOCK_POLL_S = 15.0
 DARK_LOCK_POLL_S = 10.0
 _LOCK_SIGNAL = re.compile(r"LockedHint|\.Session\.(Lock|Unlock) ")
-MISS_TEXT = {
-    "nomatch": "Not recognized. Try again, or use your PIN.",
-    "partial": "Finger not read. Cover the whole sensor and hold still.",
-    "toofast": "Finger lifted too fast. Rest it on the sensor a moment.",
-}
+MISS_TEXT = MISS_TEXTS[LANG]
 
 
 def should_arm(panel: bool, locked: bool, dark_arm: bool) -> bool:
@@ -778,16 +821,55 @@ class UnlockPolicy:
         return None
 
 
-def notify_args(text: str, timeout_ms: int, transient: bool = False) -> list[str]:
-    """notify-send command that puts the message in the summary.
+NOTIFY_DEST = ["--session", "--dest", "org.freedesktop.Notifications",
+               "--object-path", "/org/freedesktop/Notifications"]
+
+
+def gvariant_str(text: str) -> str:
+    """A GVariant text-format string literal for gdbus call."""
+    return "'" + text.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def notify_args(text: str, timeout_ms: int, transient: bool = False,
+                urgent: bool = False, replaces: int = 0) -> list[str]:
+    """gdbus Notify call that puts the message in the summary.
 
     The Phosh lock screen shows only the summary of a notification, so the
-    sentence itself must be the summary. No body is passed.
+    sentence itself must be the summary. No body is passed. gdbus, not
+    notify-send: BengalOS ships no libnotify-bin, and notify-send failing
+    silently meant no notice ever appeared. Phosh's own notification
+    vibration is turned off (x-phosh-fb-profile none); the watcher plays
+    its own pattern. A non-transient notice stays in the lock screen list.
     """
-    args = ["notify-send", "-a", "Fingerprint", "-t", str(timeout_ms)]
+    hints = [
+        "'desktop-entry': <'org.fp5.qtee'>",
+        "'x-phosh-fb-profile': <'none'>",
+        f"'urgency': <byte {2 if urgent else 1}>",
+    ]
     if transient:
-        args += ["-h", "boolean:transient:true"]
-    return args + [text]
+        hints.append("'transient': <true>")
+    return [
+        "gdbus", "call", *NOTIFY_DEST,
+        "--method", "org.freedesktop.Notifications.Notify",
+        gvariant_str(APP_NAME), f"uint32 {max(0, int(replaces))}",
+        gvariant_str("auth-fingerprint-symbolic"), gvariant_str(text), "''",
+        "@as []", "{" + ", ".join(hints) + "}", f"int32 {int(timeout_ms)}",
+    ]
+
+
+def close_note_args(note_id: int) -> list[str]:
+    return ["gdbus", "call", *NOTIFY_DEST,
+            "--method", "org.freedesktop.Notifications.CloseNotification",
+            f"uint32 {int(note_id)}"]
+
+
+_NOTE_ID = re.compile(r"\(uint32 (\d+),\)")
+
+
+def parse_note_id(out: str) -> int | None:
+    """gdbus prints `(uint32 7,)` for Notify."""
+    match = _NOTE_ID.search(out or "")
+    return int(match.group(1)) if match else None
 
 
 def pump_lines(stream: Iterable[str], out: "queue.Queue[str | None]") -> None:
@@ -970,6 +1052,9 @@ class UnlockWatcher:
         self.dark_arm = False
         self._policy_sid: str | None = None
         self._told_reason: str | None = None
+        # The policy notice on screen (lockout, PIN needed), so a new one
+        # replaces it and an unlock or the end of a lockout closes it.
+        self._note_id: int | None = None
         # The first listen after off -> on may ignore one no-match near
         # its arm line. Closed when that listen finishes after arming, so
         # a later press counts even when its own down is quick.
@@ -1012,14 +1097,47 @@ class UnlockWatcher:
             pass
 
     def notify(self, text: str) -> None:
+        urgent = text in URGENT_TEXTS
         try:
-            subprocess.run(
-                notify_args(text, 6000),
+            proc = subprocess.run(
+                notify_args(text, 0 if urgent else 6000, urgent=urgent,
+                            replaces=self._note_id or 0),
+                capture_output=True,
+                text=True,
                 check=False,
                 timeout=3,
             )
         except (OSError, subprocess.TimeoutExpired):
-            pass
+            return
+        note_id = parse_note_id(proc.stdout)
+        if note_id is not None:
+            self._note_id = note_id
+
+    def close_note(self) -> None:
+        note_id, self._note_id = self._note_id, None
+        if note_id is not None:
+            self._background(close_note_args(note_id))
+
+    def tell_policy(self, reason: str) -> None:
+        """Say once why the finger is not taken. Lockouts also buzz."""
+        self._told_reason = reason
+        self.note(f"not listening: {reason}")
+        self.notify(POLICY_TEXT[reason])
+        if reason in LOCKOUT_REASONS:
+            self.tell_lockout()
+
+    def policy_clear(self) -> None:
+        """The finger is taken again (or the phone unlocked): drop the notice."""
+        if self._told_reason is not None or self._note_id is not None:
+            self.close_note()
+        self._told_reason = None
+
+    def tell_lockout(self) -> None:
+        """Three long pulses, after the 5th miss's double click has ended."""
+        def go() -> None:
+            time.sleep(0.4)
+            self.haptic.play_sync("lockout")
+        threading.Thread(target=go, daemon=True).start()
 
     def _background(self, args: list[str]) -> None:
         def go() -> None:
@@ -1459,18 +1577,16 @@ class UnlockWatcher:
                 continue
             if not state:
                 believed_locked = False
-                self._told_reason = None
+                self.policy_clear()
                 continue
             believed_locked = True
             reason = self.policy.why_not()
             if reason is not None:
                 # The sensor is not armed at all, so nothing is spent.
                 if reason != self._told_reason:
-                    self._told_reason = reason
-                    self.note(f"not listening: {reason}")
-                    self.notify(POLICY_TEXT[reason])
+                    self.tell_policy(reason)
                 continue
-            self._told_reason = None
+            self.policy_clear()
             if other_session_running(None):
                 time.sleep(LOCK_POLL_S)
                 continue
@@ -1856,7 +1972,7 @@ class WarmLoop:
             self._close_armed_listen()
         else:
             self.stop()
-        self.w._told_reason = None
+        self.w.policy_clear()
 
     def _free_for_app(self, now: float) -> None:
         """Unlocked with a kept session: quit it once the Finger app runs
@@ -1995,11 +2111,9 @@ class WarmLoop:
         if reason is not None:
             self.cancel()
             if reason != self.w._told_reason:
-                self.w._told_reason = reason
-                self.w.note(f"not listening: {reason}")
-                self.w.notify(POLICY_TEXT[reason])
+                self.w.tell_policy(reason)
             return
-        self.w._told_reason = None
+        self.w.policy_clear()
         self.start()
         warm = self.warm
         if warm is None or not warm.idle or self.armed:

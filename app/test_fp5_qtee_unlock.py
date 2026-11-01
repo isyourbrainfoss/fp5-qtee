@@ -13,7 +13,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import fp5_qtee_unlock
+# The English texts are asserted below, whatever the box locale is.
+os.environ["FP5_QTEE_LANG"] = "en"
+
+import fp5_qtee_unlock  # noqa: E402
 from fp5_qtee_unlock import (
     LockSignals,
     Throttle,
@@ -181,12 +184,74 @@ class MissTest(unittest.TestCase):
 
     def test_notice_text_is_the_summary(self) -> None:
         # Phosh's lock screen shows only the summary; the sentence must be it.
-        args = notify_args(fp5_qtee_unlock.MISS_TEXT["nomatch"], 2500, transient=True)
-        self.assertEqual(args[0], "notify-send")
-        self.assertEqual(args[-1], fp5_qtee_unlock.MISS_TEXT["nomatch"])
-        self.assertNotIn("Fingerprint", args[-2:])
-        self.assertIn("boolean:transient:true", args)
-        self.assertEqual(notify_args("hi", 6000)[-1], "hi")
+        # gdbus: BengalOS has no notify-send. Arguments: app, replaces,
+        # icon, summary, body, actions, hints, timeout.
+        text = fp5_qtee_unlock.MISS_TEXT["nomatch"]
+        args = notify_args(text, 2500, transient=True)
+        self.assertEqual(args[:2], ["gdbus", "call"])
+        self.assertIn("org.freedesktop.Notifications.Notify", args)
+        self.assertEqual(args[-5], fp5_qtee_unlock.gvariant_str(text))
+        self.assertEqual(args[-4], "''")  # no body
+        self.assertIn("'transient': <true>", args[-2])
+        self.assertIn("'x-phosh-fb-profile': <'none'>", args[-2])
+        self.assertIn("<byte 1>", args[-2])
+        self.assertEqual(args[-1], "int32 2500")
+        self.assertEqual(notify_args("hi", 6000)[-5], "'hi'")
+        self.assertNotIn("transient", notify_args("hi", 6000)[-2])
+        self.assertEqual(notify_args("hi", 0, replaces=7)[-7], "uint32 7")
+        self.assertEqual(fp5_qtee_unlock.gvariant_str("it's"), "'it\\'s'")
+
+    def test_parse_note_id(self) -> None:
+        self.assertEqual(fp5_qtee_unlock.parse_note_id("(uint32 42,)\n"), 42)
+        self.assertIsNone(fp5_qtee_unlock.parse_note_id(""))
+
+    def test_norwegian_texts(self) -> None:
+        self.assertEqual(fp5_qtee_unlock.text_lang({"FP5_QTEE_LANG": "nb"}), "nb")
+        self.assertEqual(fp5_qtee_unlock.text_lang({"LANG": "nb_NO.UTF-8"}), "nb")
+        self.assertEqual(fp5_qtee_unlock.text_lang({"LANG": "en_US.UTF-8"}), "en")
+        self.assertEqual(fp5_qtee_unlock.text_lang({"LANG": "C.UTF-8"}), "en")
+        nb = fp5_qtee_unlock.POLICY_TEXTS["nb"]
+        self.assertEqual(nb["lockout-permanent"], "For mange forsøk. Bruk PIN.")
+        self.assertTrue(nb["lockout"].startswith("For mange forsøk."))
+        for lang in fp5_qtee_unlock.POLICY_TEXTS:
+            self.assertEqual(set(fp5_qtee_unlock.POLICY_TEXTS[lang]), set(fp5_qtee_unlock.POLICY_TEXTS["en"]))
+            self.assertEqual(set(fp5_qtee_unlock.MISS_TEXTS[lang]), set(fp5_qtee_unlock.MISS_TEXTS["en"]))
+            for key in fp5_qtee_unlock.LOCKOUT_REASONS:
+                self.assertIn(fp5_qtee_unlock.POLICY_TEXTS[lang][key], fp5_qtee_unlock.URGENT_TEXTS)
+        self.assertNotIn(nb["pin-after-boot"], fp5_qtee_unlock.URGENT_TEXTS)
+
+    def test_lockout_notice_is_critical_replaced_and_closed(self) -> None:
+        watcher = UnlockWatcher()
+        watcher.note = lambda text: None  # type: ignore[method-assign]
+        buzzed: list[str] = []
+        watcher.tell_lockout = lambda: buzzed.append("lockout")  # type: ignore[method-assign]
+        calls: list[list[str]] = []
+
+        class Done:
+            stdout = "(uint32 9,)\n"
+
+        def fake_run(args, **_kw):
+            calls.append(args)
+            return Done()
+
+        bg: list[list[str]] = []
+        watcher._background = bg.append  # type: ignore[method-assign]
+        with mock.patch.object(fp5_qtee_unlock.subprocess, "run", fake_run):
+            watcher.tell_policy("lockout")
+            watcher.tell_policy("lockout-permanent")
+        self.assertEqual(buzzed, ["lockout", "lockout"])
+        self.assertIn("<byte 2>", calls[0][-2])
+        self.assertEqual(calls[0][-1], "int32 0")   # stays until closed
+        self.assertEqual(calls[1][-7], "uint32 9")  # replaces the first
+        watcher.policy_clear()
+        self.assertEqual(bg, [fp5_qtee_unlock.close_note_args(9)])
+        self.assertIsNone(watcher._told_reason)
+        watcher.policy_clear()
+        self.assertEqual(len(bg), 1)
+        with mock.patch.object(fp5_qtee_unlock.subprocess, "run", fake_run):
+            watcher.tell_policy("pin-after-boot")
+        self.assertEqual(buzzed, ["lockout", "lockout"])
+        self.assertIn("<byte 1>", calls[2][-2])
 
     def test_lockout_notice_is_the_summary(self) -> None:
         # Phosh shows the summary only. The 5th miss is the double click;
@@ -195,7 +260,7 @@ class MissTest(unittest.TestCase):
             text = fp5_qtee_unlock.POLICY_TEXT[key]
             self.assertTrue(text.startswith("Too many attempts"))
             args = notify_args(text, 6000)
-            self.assertEqual(args[-1], text)
+            self.assertEqual(args[-5], fp5_qtee_unlock.gvariant_str(text))
             self.assertNotIn("-b", args)
         self.assertIn("30 seconds", fp5_qtee_unlock.POLICY_TEXT["lockout"])
         self.assertIn("PIN", fp5_qtee_unlock.POLICY_TEXT["lockout-permanent"])
