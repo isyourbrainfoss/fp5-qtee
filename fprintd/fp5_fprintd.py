@@ -407,6 +407,49 @@ def wait_sessions_gone(timeout_s: float = YIELD_WAIT_S,
     return True
 
 
+# qcomtee allocates one 4 MiB physically contiguous buffer (order 10) per
+# session. With fragmented RAM that fails ("page allocation failure:
+# order:10") and the session exits at once, so fingerprint unlock stops.
+COMPACT = Path("/proc/sys/vm/compact_memory")
+BUDDYINFO = Path("/proc/buddyinfo")
+
+
+def free_order10(text: str | None = None) -> int:
+    """Free order-10 blocks over all zones (the last /proc/buddyinfo column)."""
+    if text is None:
+        try:
+            text = BUDDYINFO.read_text()
+        except OSError:
+            return -1
+    total = 0
+    for line in text.splitlines():
+        parts = line.split()
+        if "zone" not in parts:
+            continue
+        counts = parts[parts.index("zone") + 2:]
+        if len(counts) >= 11 and counts[10].isdigit():
+            total += int(counts[10])
+    return total
+
+
+def compact_if_needed() -> int:
+    """Compact memory when no order-10 block is free. Returns free blocks after.
+
+    -1 when /proc/buddyinfo is unreadable (then nothing is done).
+    """
+    free = free_order10()
+    if free != 0:
+        return free
+    try:
+        COMPACT.write_text("1\n")
+    except OSError as exc:
+        print(f"fp5-qtee: compact_memory: {exc}", file=sys.stderr, flush=True)
+        return 0
+    free = free_order10()
+    print(f"fp5-qtee: no free order-10 block; compacted, now {free}", file=sys.stderr, flush=True)
+    return free
+
+
 class Busy(Exception):
     pass
 
@@ -423,6 +466,11 @@ class SensorLock:
         if seat_locked() is not False:
             raise Busy("the screen is locked; the unlock watcher owns the sensor")
         if other_session_pids():
+            # Taking the sensor from the watcher means two fresh 4 MiB
+            # buffers (ours, then the watcher's at the next lock). Without
+            # one free now, keep the lock-screen session and use the PIN.
+            if compact_if_needed() == 0:
+                raise Busy("no contiguous memory for a second session; keeping the unlock watcher's")
             # The watcher's kept session quits when it sees WANT_MARKER.
             want_sensor(True)
             if not wait_sessions_gone():
@@ -520,6 +568,7 @@ def run_once(mode_args: list[str], tag: str, timeout: float = 120) -> str:
     if binary is None:
         raise Busy("no fp5-qtee-session binary")
     prepare()
+    compact_if_needed()
     s = Session([str(binary)] + mode_args, tag)
     out = []
     end = time.monotonic() + timeout
@@ -649,6 +698,7 @@ def main() -> int:  # pragma: no cover - needs a system bus
                 raise dbus_err("AlreadyInUse", str(e))
             try:
                 prepare()
+                compact_if_needed()
                 self.sess = Session([str(binary), "serve", FIRMWARE], "fprintd-serve")
             except OSError as e:
                 self.lock.release()

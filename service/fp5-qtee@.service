@@ -22,6 +22,8 @@ ProtectHome=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ReadWritePaths=-/mnt/persist
+# Compact memory when no 4 MiB contiguous block is free (qcomtee session buffer).
+ReadWritePaths=/proc/sys/vm/compact_memory
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_UNIX AF_NETLINK

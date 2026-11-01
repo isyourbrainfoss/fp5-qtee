@@ -23,6 +23,7 @@ import re
 import socket
 import struct
 import subprocess
+from pathlib import Path
 import sys
 
 SESSION = os.environ.get("FP5_QTEE_SESSION", "/usr/libexec/fp5-qtee/fp5-qtee-session")
@@ -38,6 +39,49 @@ ACTIONS = {
 ARG_RE = re.compile(r"^[0-9A-Za-z_.-]{1,32}$")
 MAX_ARGS = {"remove": 4}
 MAX_LINE = 256
+
+
+# qcomtee allocates one 4 MiB physically contiguous buffer (order 10) per
+# session. With fragmented RAM that fails ("page allocation failure:
+# order:10") and the session exits at once, so fingerprint unlock stops.
+COMPACT = Path("/proc/sys/vm/compact_memory")
+BUDDYINFO = Path("/proc/buddyinfo")
+
+
+def free_order10(text: str | None = None) -> int:
+    """Free order-10 blocks over all zones (the last /proc/buddyinfo column)."""
+    if text is None:
+        try:
+            text = BUDDYINFO.read_text()
+        except OSError:
+            return -1
+    total = 0
+    for line in text.splitlines():
+        parts = line.split()
+        if "zone" not in parts:
+            continue
+        counts = parts[parts.index("zone") + 2:]
+        if len(counts) >= 11 and counts[10].isdigit():
+            total += int(counts[10])
+    return total
+
+
+def compact_if_needed() -> int:
+    """Compact memory when no order-10 block is free. Returns free blocks after.
+
+    -1 when /proc/buddyinfo is unreadable (then nothing is done).
+    """
+    free = free_order10()
+    if free != 0:
+        return free
+    try:
+        COMPACT.write_text("1\n")
+    except OSError as exc:
+        print(f"fp5-qtee: compact_memory: {exc}", file=sys.stderr, flush=True)
+        return 0
+    free = free_order10()
+    print(f"fp5-qtee: no free order-10 block; compacted, now {free}", file=sys.stderr, flush=True)
+    return free
 
 
 def say(msg: str) -> None:
@@ -110,6 +154,7 @@ def main() -> int:
         return 3
     print(f"fp5-qtee: uid {uid} pid {pid} mode {mode}", file=sys.stderr, flush=True)
     sock.close()
+    compact_if_needed()
     os.execv(SESSION, [SESSION, mode, FW_DIR, *args])
     return 127
 

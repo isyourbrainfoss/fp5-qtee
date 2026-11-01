@@ -121,6 +121,14 @@ class SyncHelpersTest(unittest.TestCase):
         t[0] = 0.0
         self.assertFalse(f.wait_sessions_gone(1, pids=lambda: [5], clock=clock, sleep=sleep))
 
+    def test_free_order10(self):
+        text = ("Node 0, zone      DMA    84     67     52     48     38     75     67     47     16      0      0 \n"
+                "Node 0, zone   Normal    252    808    371    169     33    198     22     27      0      0      0 \n")
+        self.assertEqual(f.free_order10(text), 0)
+        text2 = text.replace("16      0      0 \n", "16      4      5 \n", 1)
+        self.assertEqual(f.free_order10(text2), 5)
+        self.assertEqual(f.free_order10(""), 0)
+
     def test_map_sync_to_owner(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "fingers.json"
