@@ -52,13 +52,24 @@ class WaveTest(unittest.TestCase):
         self.assertEqual(pulses[0][1] + pulses[1][1], 130)
         self.assertEqual(pulses[0][0], pulses[2][0])
 
-    def test_lockout_adds_nothing(self) -> None:
-        self.assertIsNone(waveform("lockout"))
+    def test_lockout_is_three_long_pulses(self) -> None:
+        # Out of tries: distinct from the double 30 ms miss.
+        pulses = waveform("lockout")
+        assert pulses is not None
+        on = [ms for amp, ms in pulses if amp > 0]
+        self.assertEqual(on, [150, 150, 150])
+        self.assertEqual(fbcli_args("lockout"), ["fbcli", "-A", "org.fp5.qtee", "-E", "fp5-qtee-lockout"])
         self.assertIsNone(waveform("lockout-permanent"))
         self.assertIsNone(waveform(""))
-        self.assertIsNone(sysfs_steps("lockout"))
-        self.assertIsNone(fbcli_args("lockout"))
-        self.assertIsNone(ff_steps("lockout"))
+        self.assertIsNone(fbcli_args("lockout-permanent"))
+
+    def test_theme_json_has_every_event(self) -> None:
+        theme = json.loads((Path(fp5_qtee_haptic.__file__).parent / "fp5-qtee-feedback.json").read_text())
+        for profile in theme["profiles"]:
+            names = {f["event-name"] for f in profile["feedbacks"]}
+            for kind in ("success", "miss", "toofast", "lockout"):
+                self.assertIn(fbcli_args(kind)[-1], names)
+        self.assertIsNone(ff_steps("lockout-permanent"))
 
     def test_ff_steps_keep_the_130ms_gap(self) -> None:
         self.assertEqual(ff_steps("success"), [("rumble", SUCCESS_MS)])
@@ -250,8 +261,33 @@ class PlayTest(unittest.TestCase):
                 enabled=True,
             )
             self.assertEqual(haptic.play_sync("miss"), "fbcli")
-            self.assertEqual(haptic.play_sync("lockout"), "none")
+            self.assertEqual(haptic.play_sync("lockout-permanent"), "none")
         self.assertEqual(ran, [fbcli_args("miss")])
+
+    def test_theme_without_the_event_falls_back_to_evdev(self) -> None:
+        # feedbackd's active theme (e.g. fp5-strong) lacks fp5-qtee-match:
+        # fbcli plays nothing, so the rumble must play instead.
+        ran: list[list[str]] = []
+        played: list[int] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            haptic = Haptic(
+                profile="full",
+                leds=Path(tmp),
+                runner=lambda args: ran.append(args) or False,
+                rumble=played.append,
+                sleeper=lambda _s: None,
+                enabled=True,
+            )
+            self.assertEqual(haptic.play_sync("success"), "evdev")
+        self.assertEqual(ran, [fbcli_args("success")])
+        self.assertEqual(played, [SUCCESS_MS])
+
+    def test_fbcli_missed(self) -> None:
+        self.assertTrue(fp5_qtee_haptic.fbcli_missed(
+            "Triggering feedback for event 'fp5-qtee-match'\n"
+            "No feedback found for 'fp5-qtee-match' at level 'full'\n"))
+        self.assertFalse(fp5_qtee_haptic.fbcli_missed(
+            "Triggering feedback for event 'fp5-qtee-match'\n"))
 
     def test_no_feedbackd_uses_evdev_rumble(self) -> None:
         played: list[int] = []
@@ -267,7 +303,7 @@ class PlayTest(unittest.TestCase):
             )
             self.assertEqual(haptic.play_sync("miss"), "evdev")
             self.assertEqual(haptic.play_sync("success"), "evdev")
-            self.assertEqual(haptic.play_sync("lockout"), "none")
+            self.assertEqual(haptic.play_sync("lockout-permanent"), "none")
         self.assertEqual(played, [MISS_ON_MS, MISS_ON_MS, SUCCESS_MS])
         self.assertEqual(sleeps, [0.13])
 

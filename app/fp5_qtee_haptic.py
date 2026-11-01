@@ -2,8 +2,14 @@
 
 Success is one 20 ms pulse. A miss is two 30 ms pulses whose starts are
 130 ms apart, at the same amplitude. A too-fast tap is three 15 ms ticks
-55 ms apart. Lockout adds nothing. The silent
+55 ms apart. Running out of tries (lockout) is three long 150 ms pulses,
+so it cannot be taken for a miss. The silent
 feedbackd profile plays nothing, and so does an unreadable profile.
+
+feedbackd plays nothing for an event its active theme lacks (fbcli says
+"No feedback found"). A user theme such as fp5-strong that does not carry
+the fp5-qtee-* events made every fingerprint unlock silent, so that answer
+falls back to the evdev rumble.
 
 The aw86927 on this phone is an input force-feedback device, not an LED.
 feedbackd plays a named event from the theme beside this file when that
@@ -36,6 +42,8 @@ MISS_OFF_MS = 100
 # success click or the double miss pulse.
 TOOFAST_ON_MS = 15
 TOOFAST_OFF_MS = 40
+LOCKOUT_ON_MS = 150
+LOCKOUT_OFF_MS = 100
 AMPLITUDE = 1.0
 GAIN = 0x80
 # aw86927_play_sine writes (magnitude * 0x80 / 0xffff) into PLAYCFG2.
@@ -55,6 +63,9 @@ except ValueError:
 SUCCESS_EVENT = "fp5-qtee-match"
 MISS_EVENT = "fp5-qtee-miss"
 TOOFAST_EVENT = "fp5-qtee-toofast"
+LOCKOUT_EVENT = "fp5-qtee-lockout"
+# fbcli's answer when the active theme has no feedback for the event.
+_NO_FEEDBACK = "No feedback found"
 APP_ID = "org.fp5.qtee"
 LED_MARKS = ("aw869", "haptic", "vibrator")
 FF_MARKS = ("aw869", "haptic")
@@ -70,7 +81,7 @@ _PROFILE = re.compile(r'"([^"]*)"')
 def waveform(kind: str) -> list[tuple[float, int]] | None:
     """Pulses as (amplitude, milliseconds). A gap is amplitude 0.
 
-    None for lockout and anything else: those add no vibration.
+    None for anything else: that adds no vibration.
     """
     if kind == "success":
         return [(AMPLITUDE, SUCCESS_MS)]
@@ -79,6 +90,14 @@ def waveform(kind: str) -> list[tuple[float, int]] | None:
             (AMPLITUDE, MISS_ON_MS),
             (0.0, MISS_OFF_MS),
             (AMPLITUDE, MISS_ON_MS),
+        ]
+    if kind == "lockout":
+        return [
+            (AMPLITUDE, LOCKOUT_ON_MS),
+            (0.0, LOCKOUT_OFF_MS),
+            (AMPLITUDE, LOCKOUT_ON_MS),
+            (0.0, LOCKOUT_OFF_MS),
+            (AMPLITUDE, LOCKOUT_ON_MS),
         ]
     if kind == "toofast":
         return [
@@ -151,10 +170,15 @@ def sysfs_steps(kind: str) -> list[tuple[str, int]] | None:
 
 def fbcli_args(kind: str) -> list[str] | None:
     event = {"success": SUCCESS_EVENT, "miss": MISS_EVENT,
-             "toofast": TOOFAST_EVENT}.get(kind)
+             "toofast": TOOFAST_EVENT, "lockout": LOCKOUT_EVENT}.get(kind)
     if event is None:
         return None
     return ["fbcli", "-A", APP_ID, "-E", event]
+
+
+def fbcli_missed(output: str) -> bool:
+    """fbcli printed that the active theme has no feedback for the event."""
+    return _NO_FEEDBACK in output
 
 
 def ff_steps(kind: str) -> list[tuple[str, int]] | None:
@@ -351,8 +375,16 @@ class Haptic:
             args = fbcli_args(kind)
             if args is None:
                 return "none"
-            self._bracket_gain(lambda: self._run(args))
-            return "fbcli"
+            played = [True]
+            hold = max(0.5, sum(ms for _a, ms in waveform(kind) or []) / 1000.0 + 0.15)
+
+            def run() -> None:
+                played[0] = self._run(args, hold) is not False
+
+            self._bracket_gain(run)
+            if played[0]:
+                return "fbcli"
+            # The theme lacks the event: feedbackd played nothing.
         if self._play_ff(kind):
             return "evdev"
         return "none"
@@ -491,27 +523,37 @@ class Haptic:
         except OSError:
             pass
 
-    def _run(self, args: list[str]) -> None:
+    def _run(self, args: list[str], hold_s: float = 0.5) -> bool | None:
+        """False when feedbackd had no feedback for the event."""
         if self._runner is not None:
-            self._runner(args)
-            return
+            return self._runner(args)
         # fbcli ends the event when stdin hits EOF. A service has no tty,
-        # so leave the pipe open until the double pulse has finished.
+        # so leave the pipe open until the pattern has finished.
         try:
             proc = subprocess.Popen(
                 args,
                 stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
             )
         except OSError:
-            return
+            return None
+        out = ""
         try:
-            self._sleeper(0.5)
+            self._sleeper(hold_s)
         finally:
             if proc.stdin is not None:
-                proc.stdin.close()
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
             try:
-                proc.wait(timeout=2)
+                out, _ = proc.communicate(timeout=2)
             except subprocess.TimeoutExpired:
                 proc.kill()
+                try:
+                    out, _ = proc.communicate(timeout=1)
+                except subprocess.TimeoutExpired:
+                    out = ""
+        return not fbcli_missed(out or "")

@@ -46,6 +46,24 @@
             40,
             15
           ]
+        },
+        {
+          "event-name": "fp5-qtee-lockout",
+          "type": "VibraPattern",
+          "magnitudes": [
+            1.0,
+            0.0,
+            1.0,
+            0.0,
+            1.0
+          ],
+          "durations": [
+            150,
+            100,
+            150,
+            100,
+            150
+          ]
         }
       ]
     },
@@ -92,6 +110,24 @@
             15,
             40,
             15
+          ]
+        },
+        {
+          "event-name": "fp5-qtee-lockout",
+          "type": "VibraPattern",
+          "magnitudes": [
+            1.0,
+            0.0,
+            1.0,
+            0.0,
+            1.0
+          ],
+          "durations": [
+            150,
+            100,
+            150,
+            100,
+            150
           ]
         }
       ]
