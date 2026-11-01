@@ -24,6 +24,10 @@ NoNewPrivileges=yes
 ProtectHome=yes
 ProtectSystem=strict
 ReadWritePaths=-/mnt/persist
+# ProtectSystem=strict leaves /tmp read-only (no PrivateTmp here: the lock
+# is shared with app/fp5-qtee and the scripts), so /tmp/fp5-qtee-phone.lock
+# could not be created and every VerifyStart failed.
+ReadWritePaths=/tmp
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_UNIX AF_NETLINK
