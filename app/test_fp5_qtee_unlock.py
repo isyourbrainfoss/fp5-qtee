@@ -13,10 +13,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-# The English texts are asserted below, whatever the box locale is.
-os.environ["FP5_QTEE_LANG"] = "en"
-
-import fp5_qtee_unlock  # noqa: E402
+import fp5_qtee_unlock
 from fp5_qtee_unlock import (
     LockSignals,
     Throttle,
@@ -205,20 +202,17 @@ class MissTest(unittest.TestCase):
         self.assertEqual(fp5_qtee_unlock.parse_note_id("(uint32 42,)\n"), 42)
         self.assertIsNone(fp5_qtee_unlock.parse_note_id(""))
 
-    def test_norwegian_texts(self) -> None:
-        self.assertEqual(fp5_qtee_unlock.text_lang({"FP5_QTEE_LANG": "nb"}), "nb")
-        self.assertEqual(fp5_qtee_unlock.text_lang({"LANG": "nb_NO.UTF-8"}), "nb")
-        self.assertEqual(fp5_qtee_unlock.text_lang({"LANG": "en_US.UTF-8"}), "en")
-        self.assertEqual(fp5_qtee_unlock.text_lang({"LANG": "C.UTF-8"}), "en")
-        nb = fp5_qtee_unlock.POLICY_TEXTS["nb"]
-        self.assertEqual(nb["lockout-permanent"], "For mange forsøk. Bruk PIN.")
-        self.assertTrue(nb["lockout"].startswith("For mange forsøk."))
-        for lang in fp5_qtee_unlock.POLICY_TEXTS:
-            self.assertEqual(set(fp5_qtee_unlock.POLICY_TEXTS[lang]), set(fp5_qtee_unlock.POLICY_TEXTS["en"]))
-            self.assertEqual(set(fp5_qtee_unlock.MISS_TEXTS[lang]), set(fp5_qtee_unlock.MISS_TEXTS["en"]))
-            for key in fp5_qtee_unlock.LOCKOUT_REASONS:
-                self.assertIn(fp5_qtee_unlock.POLICY_TEXTS[lang][key], fp5_qtee_unlock.URGENT_TEXTS)
-        self.assertNotIn(nb["pin-after-boot"], fp5_qtee_unlock.URGENT_TEXTS)
+    def test_texts_are_short_english(self) -> None:
+        t = fp5_qtee_unlock.POLICY_TEXT
+        self.assertEqual(t["lockout"], "Too many attempts. Try again in 30 seconds or use PIN.")
+        self.assertEqual(t["lockout-permanent"], "Too many attempts. Use PIN.")
+        self.assertEqual(t["pin-after-boot"], "PIN required after restart.")
+        for key in fp5_qtee_unlock.LOCKOUT_REASONS:
+            self.assertIn(t[key], fp5_qtee_unlock.URGENT_TEXTS)
+        self.assertNotIn(t["pin-after-boot"], fp5_qtee_unlock.URGENT_TEXTS)
+        for text in list(t.values()) + list(fp5_qtee_unlock.MISS_TEXT.values()):
+            self.assertTrue(text.isascii(), text)
+            self.assertLessEqual(len(text), 60, text)
 
     def test_lockout_notice_is_critical_replaced_and_closed(self) -> None:
         watcher = UnlockWatcher()
@@ -1710,6 +1704,109 @@ class WarmPinCreditTest(unittest.TestCase):
         self.sig.pending = True
         self.run_for(3.0)
         self.assertEqual(self.w.policy.why_not(), "pin-72h")
+
+
+class WarmPinClearsLockoutTest(unittest.TestCase):
+    """After a finger lockout the PIN gives the finger back at once (Android).
+
+    A confirmed PIN unlock (locked -> unlocked held LOCK_FLICKER_S, not our
+    own finger unlock) clears the strikes and the lockout timer, closes the
+    lockout notice, and the next lock loads and arms a session.
+    """
+
+    step = WarmLoopTest.step
+    run_for = WarmPinCreditTest.run_for
+
+    def setUp(self) -> None:
+        WarmLoopTest.setUp(self)  # type: ignore[arg-type]
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.marker = Path(tmp.name) / "fp5-qtee-pin-ok"
+        self.now[0] = 1000.0
+        self.marker.write_text("10.0\n")      # PIN used this boot
+        lockout_state_for(self.marker).write_text("0 0.000\n")
+        self.w.policy = UnlockPolicy(
+            require_pin=True, marker=self.marker, clock=lambda: self.now[0],
+            state=lockout_state_for(self.marker),
+        )
+        self.sig = _FakeSignals()
+        self.loop.signals = self.sig  # type: ignore[assignment]
+        self.bg: list[list[str]] = []
+        self.w._background = self.bg.append  # type: ignore[method-assign]
+        self.buzz: list[str] = []
+        self.w.tell_lockout = lambda: self.buzz.append("lockout")  # type: ignore[method-assign]
+
+        def notify(text: str) -> None:
+            self.events.append(("notify", text))
+            self.w._note_id = 5
+
+        self.w.notify = notify  # type: ignore[method-assign]
+
+    def lock_out(self, misses: int) -> None:
+        for _ in range(misses):
+            self.w.policy.on_miss()
+
+    def pin_unlock_then_lock(self, unlocked_s: float = 3.0) -> None:
+        self.lock[0] = False                 # PIN entered
+        self.sig.pending = True
+        self.run_for(unlocked_s)
+        self.lock[0] = True                  # locked again
+        self.sig.pending = True
+        self.run_for(1.0)
+
+    def check(self, misses: int, reason: str) -> None:
+        self.lock_out(misses)
+        self.run_for(1.0)
+        self.assertEqual(self.w.policy.why_not(), reason)
+        self.assertIn(("notify", fp5_qtee_unlock.POLICY_TEXT[reason]), self.events)
+        self.assertEqual(self.buzz, ["lockout"])
+        armed_before = sum(w.sent.count("auth") for w in self.started)
+        self.pin_unlock_then_lock()
+        self.assertIsNone(self.w.policy.why_not())
+        self.assertEqual(self.w.policy.failed, 0)
+        self.assertEqual(self.w.policy.locked_until, 0.0)
+        self.assertEqual(lockout_state_for(self.marker).read_text().split()[0], "0")
+        self.assertIn(fp5_qtee_unlock.close_note_args(5), self.bg)   # notice gone
+        # The next lock loads a session and arms it.
+        warm = self.started[-1]
+        warm.say("SERVE ready", "SERVE idle")
+        self.run_for(1.0)
+        self.assertGreater(sum(w.sent.count("auth") for w in self.started), armed_before)
+        # A fresh restart reads the cleared state from disk.
+        again = UnlockPolicy(require_pin=True, marker=self.marker,
+                             clock=lambda: self.now[0], state=lockout_state_for(self.marker))
+        self.assertIsNone(again.why_not())
+
+    def test_pin_clears_timed_lockout(self) -> None:
+        self.check(5, "lockout")
+
+    def test_pin_clears_permanent_lockout(self) -> None:
+        self.check(20, "lockout-permanent")
+
+    def test_finger_unlock_never_clears_a_permanent_lockout(self) -> None:
+        self.lock_out(20)
+        self.run_for(1.0)
+        self.w.policy.on_hit()               # stale, would be refused anyway
+        self.w.policy.failed = 20
+        self.w.policy._save_state()
+        self.lock[0] = False
+        self.sig.pending = True
+        self.run_for(3.0)
+        self.lock[0] = True
+        self.sig.pending = True
+        self.run_for(1.0)
+        self.assertEqual(self.w.policy.why_not(), "lockout-permanent")
+
+    def test_glance_shorter_than_flicker_does_not_clear(self) -> None:
+        self.lock_out(20)
+        self.run_for(1.0)
+        self.lock[0] = False
+        self.sig.pending = True
+        self.step(0.2)
+        self.lock[0] = True
+        self.sig.pending = True
+        self.run_for(2.0)
+        self.assertEqual(self.w.policy.why_not(), "lockout-permanent")
 
 
 class WarmRelockTest(WarmLoopTest.__base__):  # type: ignore[misc]

@@ -120,60 +120,24 @@ PIN_MAX_AGE_S = 72 * 3600.0
 # not the PIN. Phosh clears LockedHint a little after logind unlocks.
 OUR_UNLOCK_GRACE_S = 10.0
 REQUIRE_PIN = os.environ.get("FP5_QTEE_REQUIRE_PIN_AFTER_BOOT", "1") != "0"
-POLICY_TEXTS = {
-    "en": {
-        "pin-after-boot": "Unlock with your PIN once to turn on fingerprint unlock.",
-        "pin-72h": "Fingerprint unlock needs your PIN every 72 hours.",
-        "lockout": "Too many attempts. Try again in 30 seconds, or use your PIN.",
-        "lockout-permanent": "Too many attempts. Unlock with your PIN.",
-        "no-state": "Fingerprint unlock is off until the lockout state can be saved.",
-    },
-    "nb": {
-        "pin-after-boot": "Bruk PIN én gang etter omstart for å slå på fingeravtrykk.",
-        "pin-72h": "Fingeravtrykk krever PIN hver 72. time. Bruk PIN.",
-        "lockout": "For mange forsøk. Prøv igjen om 30 sekunder, eller bruk PIN.",
-        "lockout-permanent": "For mange forsøk. Bruk PIN.",
-        "no-state": "Fingeravtrykk er av til sperretilstanden kan lagres.",
-    },
+# Short, Android-like. Phosh's lock screen shows only the summary.
+POLICY_TEXT = {
+    "pin-after-boot": "PIN required after restart.",
+    "pin-72h": "PIN required for additional security.",
+    "lockout": "Too many attempts. Try again in 30 seconds or use PIN.",
+    "lockout-permanent": "Too many attempts. Use PIN.",
+    "no-state": "Fingerprint off: lockout state can't be saved. Use PIN.",
 }
-MISS_TEXTS = {
-    "en": {
-        "nomatch": "Not recognized. Try again, or use your PIN.",
-        "partial": "Finger not read. Cover the whole sensor and hold still.",
-        "toofast": "Finger lifted too fast. Rest it on the sensor a moment.",
-    },
-    "nb": {
-        "nomatch": "Ikke gjenkjent. Prøv igjen, eller bruk PIN.",
-        "partial": "Fingeren ble ikke lest. Dekk hele sensoren og hold stille.",
-        "toofast": "Fingeren ble løftet for fort. Hold den på sensoren litt.",
-    },
+MISS_TEXT = {
+    "nomatch": "Not recognized. Try again or use PIN.",
+    "partial": "Finger not read. Cover the whole sensor.",
+    "toofast": "Finger moved too fast. Try again.",
 }
-APP_NAMES = {"en": "Fingerprint", "nb": "Fingeravtrykk"}
-
-
-def text_lang(env: "dict[str, str] | None" = None) -> str:
-    """'nb' for Norwegian (FP5_QTEE_LANG, else the locale), else 'en'."""
-    env = os.environ if env is None else env
-    picks = [env.get("FP5_QTEE_LANG", "")]
-    picks += env.get("LANGUAGE", "").split(":")
-    picks += [env.get("LC_ALL", ""), env.get("LC_MESSAGES", ""), env.get("LANG", "")]
-    for value in picks:
-        value = value.strip().lower()
-        if not value or value in ("c", "posix") or value.startswith("c."):
-            continue
-        if value[:2] in ("nb", "nn", "no"):
-            return "nb"
-        return "en" if value[:2] not in POLICY_TEXTS else value[:2]
-    return "en"
-
-
-LANG = text_lang()
-POLICY_TEXT = POLICY_TEXTS[LANG]
-APP_NAME = APP_NAMES[LANG]
+APP_NAME = "Fingerprint"
 # Running out of finger tries. These notices are critical: Phosh turns the
 # screen on and keeps them on the lock screen until we close them.
 LOCKOUT_REASONS = ("lockout", "lockout-permanent")
-URGENT_TEXTS = frozenset(t[r] for t in POLICY_TEXTS.values() for r in LOCKOUT_REASONS)
+URGENT_TEXTS = frozenset(POLICY_TEXT[r] for r in LOCKOUT_REASONS)
 # Warm mode keeps one "serve" session loaded while the phone is locked,
 # so a wake only has to arm the sensor. Opt in until it is proven on more
 # phones: FP5_QTEE_WARM=1.
@@ -212,7 +176,6 @@ WARM_RETRY_S = 5.0
 UNLOCKED_LOCK_POLL_S = 15.0
 DARK_LOCK_POLL_S = 10.0
 _LOCK_SIGNAL = re.compile(r"LockedHint|\.Session\.(Lock|Unlock) ")
-MISS_TEXT = MISS_TEXTS[LANG]
 
 
 def should_arm(panel: bool, locked: bool, dark_arm: bool) -> bool:
