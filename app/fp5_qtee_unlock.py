@@ -93,6 +93,10 @@ _TOOFAST = re.compile(r"^AUTH \d+ toofast ")
 # next lock). It is quit as soon as the Finger app is running, which
 # needs the sensor to itself. FP5_QTEE_KEEP_WARM=0 restores quit-on-unlock.
 KEEP_WARM = os.environ.get("FP5_QTEE_KEEP_WARM", "1") != "0"
+# fp5-fprintd (run0/polkit fingerprint) creates this from Claim to Release
+# while the seat is unlocked. A kept session is quit when it shows up, like
+# for the Finger app, so fprintd's VerifyStart finds the sensor free.
+FPRINTD_WANT = Path(os.environ.get("FP5_QTEE_FPRINTD_WANT", "/run/fp5-fprintd/want-sensor"))
 APP_SCAN_S = 1.0
 # Buzz the wake-press miss (first no-match right after panel-on) instead
 # of dropping it silently. It still is not a strike.
@@ -479,6 +483,14 @@ def app_running(proc_root: Path = Path("/proc")) -> bool:
         if b"fp5-qtee-app" in raw:
             return True
     return False
+
+
+def fprintd_wants(marker: Path | None = None) -> bool:
+    """fp5-fprintd holds a claim and asks for the sensor."""
+    try:
+        return (marker if marker is not None else FPRINTD_WANT).exists()
+    except OSError:
+        return False
 
 
 def serve_running(ps_text: str) -> bool:
@@ -1625,6 +1637,7 @@ class WarmLoop:
         self.keep_warm = False
         self.wake_buzz = False
         self.app_running: Callable[[], bool] = app_running
+        self.fprintd_wants: Callable[[], bool] = fprintd_wants
         self.app_scan_at = 0.0
         self.dark_toofast_at: float | None = None
 
@@ -1846,12 +1859,16 @@ class WarmLoop:
         self.w._told_reason = None
 
     def _free_for_app(self, now: float) -> None:
-        """Unlocked with a kept session: quit it once the Finger app runs."""
+        """Unlocked with a kept session: quit it once the Finger app runs
+        or fp5-fprintd claims the device (run0/polkit fingerprint)."""
         if self.warm is None or self.believed_locked or now < self.app_scan_at:
             return
         self.app_scan_at = now + APP_SCAN_S
         if self.app_running():
             self.w.note("finger app running: warm session quit")
+            self.stop()
+        elif self.fprintd_wants():
+            self.w.note("fprintd wants the sensor: warm session quit")
             self.stop()
 
     def _sleep_events(self) -> None:

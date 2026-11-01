@@ -2010,6 +2010,8 @@ class FastTapTest(WarmLoopTest.__base__):  # type: ignore[misc]
         self.loop.wake_buzz = True
         self.app = [False]
         self.loop.app_running = lambda: self.app[0]
+        self.fprintd = [False]
+        self.loop.fprintd_wants = lambda: self.fprintd[0]
         self.w.tell_toofast = lambda: self.events.append(("toofast",))  # type: ignore[method-assign]
         self.w.tell_wake_miss = lambda: self.events.append(("wake-miss",))  # type: ignore[method-assign]
         self.notes: list[str] = []
@@ -2041,6 +2043,33 @@ class FastTapTest(WarmLoopTest.__base__):  # type: ignore[misc]
         self.assertTrue(warm.closed)
         self.assertIsNone(self.loop.warm)
         self.assertTrue(any("finger app running" in n for n in self.notes))
+
+    def test_fprintd_claim_frees_the_sensor(self) -> None:
+        # run0/polkit: fp5-fprintd's VerifyStart must not find the
+        # watcher's kept session ("another fp5-qtee-session is running").
+        warm = self._unlock_by_finger()
+        self.fprintd[0] = True
+        self.step(1.1)
+        self.step()
+        self.assertTrue(warm.closed)
+        self.assertIsNone(self.loop.warm)
+        self.assertTrue(any("fprintd wants the sensor" in n for n in self.notes))
+
+    def test_fprintd_marker_ignored_while_locked(self) -> None:
+        self.step()
+        warm = self.started[0]
+        warm.say("SERVE idle")
+        self.fprintd[0] = True
+        self.step()
+        self.step(1.1)
+        self.assertFalse(warm.closed)
+
+    def test_fprintd_wants_reads_the_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            m = Path(d) / "want-sensor"
+            self.assertFalse(fp5_qtee_unlock.fprintd_wants(m))
+            m.write_text("1\n")
+            self.assertTrue(fp5_qtee_unlock.fprintd_wants(m))
 
     def test_app_check_only_while_unlocked(self) -> None:
         self.step()
