@@ -29,8 +29,12 @@ class Flow(unittest.TestCase):
                    FP5_FPRINTD_SESSION=str(HERE / "testdata" / "fake-session"),
                    FP5_FPRINTD_STATE=str(t / "state"), FP5_FPRINTD_LOCK=str(t / "lock"),
                    FP5_FPRINTD_FAKE_LOCKED=str(cls.lockflag), FP5_FPRINTD_LOAD="/nonexistent",
-                   FP5_FPRINTD_STORE=str(t / "store"), FAKE_SEQ_FILE=str(t / "seq"), FP5_FPRINTD_USER=os.environ.get("USER", "kb"))
+                   FP5_FPRINTD_STORE=str(t / "store"), FP5_FPRINTD_WANT=str(t / "want-sensor"), FAKE_SEQ_FILE=str(t / "seq"), FP5_FPRINTD_USER=os.environ.get("USER", "kb"))
         cls.env = env
+        # An empty map, as on first boot or after an enroll outside
+        # fprintd: ListEnrolledFingers must list the trustlet and fill it.
+        (t / "state").mkdir()
+        (t / "state" / "fingers.json").write_text('{"fingers": []}')
         cls.daemon = subprocess.Popen([sys.executable, str(HERE / "fp5_fprintd.py")], env=env,
                                       stderr=open(t / "daemon.log", "w"))
         cls.bus = dbus.SessionBus()
@@ -83,6 +87,7 @@ class Flow(unittest.TestCase):
         self.assertEqual("net.reactivated.Fprint.Error.NoEnrolledPrints", e.exception.get_dbus_name())
 
     def test_1_list(self):
+        # The map started empty; this call syncs from the fake trustlet.
         names = self.dev.ListEnrolledFingers("")
         self.assertEqual(sorted(names), ["right-index-finger", "right-thumb"])
 

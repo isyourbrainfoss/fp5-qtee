@@ -93,5 +93,44 @@ class MapTest(unittest.TestCase):
         self.assertEqual(m.details("other"), [])
 
 
+class SyncHelpersTest(unittest.TestCase):
+    def test_sync_owner(self):
+        self.assertEqual(f.sync_owner("fp5", ["fp5"], configured=None), "fp5")
+        self.assertEqual(f.sync_owner(None, ["fp5"], configured=None), "fp5")
+        self.assertEqual(f.sync_owner("kb", ["fp5", "kb"], configured=None), "kb")
+        self.assertEqual(f.sync_owner("x", [], configured=None), f.DEFAULT_USER)
+        self.assertEqual(f.sync_owner("fp5", ["fp5"], configured="user"), "user")
+
+    def test_want_marker(self):
+        with tempfile.TemporaryDirectory() as d:
+            m = Path(d) / "sub" / "want-sensor"
+            f.want_sensor(True, m)
+            self.assertTrue(m.is_file())
+            f.want_sensor(False, m)
+            self.assertFalse(m.exists())
+            f.want_sensor(False, m)  # already gone: no error
+
+    def test_wait_sessions_gone(self):
+        seq = [[5], [5], []]
+        t = [0.0]
+        def clock():
+            return t[0]
+        def sleep(s):
+            t[0] += s
+        self.assertTrue(f.wait_sessions_gone(5, pids=lambda: seq.pop(0), clock=clock, sleep=sleep))
+        t[0] = 0.0
+        self.assertFalse(f.wait_sessions_gone(1, pids=lambda: [5], clock=clock, sleep=sleep))
+
+    def test_map_sync_to_owner(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "fingers.json"
+            path.write_text('{"fingers": []}')
+            m = f.FingerMap(path)
+            self.assertEqual(m.names("fp5"), [])
+            self.assertTrue(m.sync([1088502210], "fp5"))
+            self.assertEqual(m.names("fp5"), ["right-index-finger"])
+            self.assertEqual(json.loads(path.read_text())["fingers"][0]["user"], "fp5")
+
+
 if __name__ == "__main__":
     unittest.main()

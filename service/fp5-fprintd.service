@@ -28,6 +28,10 @@ ReadWritePaths=-/mnt/persist
 # is shared with app/fp5-qtee and the scripts), so /tmp/fp5-qtee-phone.lock
 # could not be created and every VerifyStart failed.
 ReadWritePaths=/tmp
+# /run/fp5-fprintd/want-sensor: tells the unlock watcher to quit its kept
+# session while unlocked. 0755 so the user watcher can see it.
+RuntimeDirectory=fp5-fprintd
+RuntimeDirectoryMode=0755
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_UNIX AF_NETLINK

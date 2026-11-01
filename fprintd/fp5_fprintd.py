@@ -11,14 +11,20 @@ One owner of the sensor at a time:
     sensor (it keeps a warm serve session). We do not open the trustlet
     then; Verify/Enroll/Delete fail fast with an error, so PAM falls back
     to the password at once.
-  - While unlocked the watcher quits its session. We take
-    /tmp/fp5-qtee-phone.lock and start our own session only if no other
-    fp5-qtee-session runs, and quit it when the client releases.
+  - While unlocked the watcher may keep its warm session (KEEP_WARM).
+    From Claim to Release we create WANT_MARKER (/run/fp5-fprintd/
+    want-sensor); the watcher sees it and quits its kept session. We wait
+    up to YIELD_WAIT_S for that, take /tmp/fp5-qtee-phone.lock and start
+    our own session only if no other fp5-qtee-session runs, and quit it
+    when the client releases.
   - If the seat locks while we hold the sensor, we stop and release it.
 
 Finger names: the trustlet knows only numeric fids. fingers.json maps
 fid -> {user, finger}. Fids the trustlet lists that the map lacks get the
-next free name from DEFAULT_ORDER and are written back.
+next free name from DEFAULT_ORDER and are written back. When a user has
+no names (first boot, or a finger enrolled outside fprintd), Claim,
+ListEnrolledFingers and VerifyStart list the trustlet once (if the seat
+is unlocked and the sensor can be had), at most every SYNC_RETRY_S.
 """
 from __future__ import annotations
 
@@ -37,6 +43,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Callable
 
 BUS_NAME = "net.reactivated.Fprint"
 MGR_PATH = "/net/reactivated/Fprint/Manager"
@@ -59,7 +66,15 @@ BACKUP_DIR = STATE_DIR / "backup"
 LOG_DIR = STATE_DIR / "logs"
 STORE = Path(os.environ.get("FP5_FPRINTD_STORE", "/mnt/persist/misc"))
 PHONE_LOCK = os.environ.get("FP5_FPRINTD_LOCK", "/tmp/fp5-qtee-phone.lock")
-DEFAULT_USER = os.environ.get("FP5_FPRINTD_USER", "user")
+USER_ENV = os.environ.get("FP5_FPRINTD_USER")
+DEFAULT_USER = USER_ENV or "user"
+# Present while fprintd holds a claim and wants the sensor. The unlock
+# watcher quits its kept (KEEP_WARM) session while unlocked when it sees it.
+WANT_MARKER = Path(os.environ.get("FP5_FPRINTD_WANT", "/run/fp5-fprintd/want-sensor"))
+# How long to wait for the watcher's session to go after asking.
+YIELD_WAIT_S = float(os.environ.get("FP5_FPRINTD_YIELD_WAIT_S", "5"))
+# An empty map is refreshed from the trustlet at most this often.
+SYNC_RETRY_S = float(os.environ.get("FP5_FPRINTD_SYNC_RETRY_S", "30"))
 # Known fids on this phone (enrolled 2026-10). Names are a guess until the
 # user renames them in fingers.json; the trustlet stores no names.
 SEED = {1558157930: "right-index-finger", 1979259351: "right-thumb"}
@@ -320,6 +335,78 @@ def seat_locked() -> bool | None:
     return False
 
 
+def graphical_users() -> list[str]:
+    """Names of the users with a wayland/x11 logind session."""
+    try:
+        out = subprocess.run(
+            ["loginctl", "list-sessions", "--no-legend"],
+            capture_output=True, text=True, timeout=5, check=False,
+        ).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    users: list[str] = []
+    for line in out.splitlines():
+        sid = line.split()[0] if line.split() else ""
+        if not sid:
+            continue
+        try:
+            show = subprocess.run(
+                ["loginctl", "show-session", sid, "-p", "Type", "-p", "Name"],
+                capture_output=True, text=True, timeout=5, check=False,
+            ).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        props = dict(l.split("=", 1) for l in show.splitlines() if "=" in l)
+        name = props.get("Name", "")
+        if props.get("Type") in ("wayland", "x11") and name and name not in users:
+            users.append(name)
+    return users
+
+
+def sync_owner(requester: str | None, users: list[str],
+               configured: str | None = USER_ENV) -> str:
+    """Who gets trustlet fids the map does not know yet.
+
+    FP5_FPRINTD_USER if set. Otherwise the only graphical user (a phone),
+    else the requester if it has a graphical session, else "user".
+    """
+    if configured:
+        return configured
+    if len(users) == 1:
+        return users[0]
+    if requester and requester in users:
+        return requester
+    return DEFAULT_USER
+
+
+def want_sensor(on: bool, marker: Path | None = None) -> None:
+    """Create or remove the marker that asks the watcher to let go."""
+    marker = marker if marker is not None else WANT_MARKER
+    try:
+        if on:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(f"{os.getpid()}\n")
+            os.chmod(marker, 0o644)
+        else:
+            marker.unlink()
+    except OSError:
+        pass
+
+
+def wait_sessions_gone(timeout_s: float = YIELD_WAIT_S,
+                       pids: "Callable[[], list[int]] | None" = None,
+                       clock: "Callable[[], float]" = time.monotonic,
+                       sleep: "Callable[[float], None]" = time.sleep) -> bool:
+    """True once no other fp5-qtee-session runs (polled), False on timeout."""
+    pids = pids if pids is not None else other_session_pids
+    end = clock() + timeout_s
+    while pids():
+        if clock() >= end:
+            return False
+        sleep(0.2)
+    return True
+
+
 class Busy(Exception):
     pass
 
@@ -336,7 +423,10 @@ class SensorLock:
         if seat_locked() is not False:
             raise Busy("the screen is locked; the unlock watcher owns the sensor")
         if other_session_pids():
-            raise Busy("another fp5-qtee-session is running")
+            # The watcher's kept session quits when it sees WANT_MARKER.
+            want_sensor(True)
+            if not wait_sessions_gone():
+                raise Busy("another fp5-qtee-session is running")
         fd = os.open(PHONE_LOCK, os.O_RDWR | os.O_CREAT, 0o666)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -527,6 +617,7 @@ def main() -> int:  # pragma: no cover - needs a system bus
             self.enroll_rem: int | None = None
             self.enroll_fid: int | None = None
             self.watch = None
+            self.sync_at = 0.0
             GLib.timeout_add(100, self._tick)
             GLib.timeout_add_seconds(2, self._lock_check)
 
@@ -579,7 +670,45 @@ def main() -> int:  # pragma: no cover - needs a system bus
                 log("claimer left the bus; releasing")
                 self._release()
 
+        def _sync_if_empty(self, user: str) -> None:
+            """List the trustlet when this user has no names yet.
+
+            First boot, or a finger enrolled outside fprintd: the map is
+            empty and pam_fprintd would give up with NoEnrolledPrints.
+            Only while the seat is unlocked, never while our own session
+            runs, and at most every SYNC_RETRY_S.
+            """
+            if fmap.names(user) or (self.sess is not None and self.sess.alive()):
+                return
+            now = time.monotonic()
+            if self.sync_at and now - self.sync_at < SYNC_RETRY_S:
+                return
+            self.sync_at = now
+            lock = SensorLock()
+            try:
+                lock.take()
+            except Busy as e:
+                log(f"sync skipped: {e}")
+                if self.claimer is None:
+                    want_sensor(False)
+                return
+            try:
+                out = run_once(["list", FIRMWARE], "fprintd-list", timeout=30)
+                fids = listed_fids(out)
+                log(f"sync: trustlet lists {fids}")
+                if fids:
+                    owner = sync_owner(user, graphical_users())
+                    if fmap.sync(fids, owner):
+                        log(f"sync: map now {fmap.rows}")
+            except Busy as e:
+                log(f"sync: {e}")
+            finally:
+                lock.release()
+                if self.claimer is None:
+                    want_sensor(False)
+
         def _release(self) -> None:
+            want_sensor(False)
             self._close_sess()
             self.claimer = None
             self.user = None
@@ -700,6 +829,7 @@ def main() -> int:  # pragma: no cover - needs a system bus
                              sender_keyword="sender")
         def ListEnrolledFingers(self, username, sender=None):
             user = self._user_for(str(username), sender)
+            self._sync_if_empty(user)
             names = fmap.names(user)
             if not names:
                 raise dbus_err("NoEnrolledPrints", "Failed to discover prints")
@@ -717,6 +847,10 @@ def main() -> int:  # pragma: no cover - needs a system bus
             self.user = user
             self.watch = bus.watch_name_owner(sender, self._sender_gone)
             log(f"claimed by {sender} for {user}")
+            # Ask the watcher to let go now, so VerifyStart finds the
+            # sensor free. Only while unlocked: locked, it is the watcher's.
+            if seat_locked() is False:
+                want_sensor(True)
 
         @dbus.service.method(IFACE_DEV, in_signature="", out_signature="",
                              sender_keyword="sender")
@@ -730,6 +864,7 @@ def main() -> int:  # pragma: no cover - needs a system bus
             self._need_claim(sender)
             if self.op is not None:
                 raise dbus_err("AlreadyInUse", "Action already in progress")
+            self._sync_if_empty(self.user or "")
             names = fmap.names(self.user or "")
             if not names:
                 raise dbus_err("NoEnrolledPrints", "No fingerprints enrolled")
@@ -995,7 +1130,8 @@ def main() -> int:  # pragma: no cover - needs a system bus
                 out = run_once(["list", FIRMWARE], "fprintd-list")
                 fids = listed_fids(out)
                 if fids:
-                    GLib.idle_add(lambda: fmap.sync(fids) and False)
+                    owner = sync_owner(None, graphical_users())
+                    GLib.idle_add(lambda: fmap.sync(fids, owner) and False)
                     log(f"trustlet lists {fids}")
             except Busy as e:
                 log(f"list: {e}")
@@ -1005,6 +1141,7 @@ def main() -> int:  # pragma: no cover - needs a system bus
             threading.Thread(target=work, daemon=True).start()
         return False
 
+    want_sensor(False)  # a marker left by a crash
     GLib.idle_add(initial_sync)
     log(f"fp5-fprintd (qtee) on {bus.get_unique_name()} as {name.get_name()}; map {fmap.rows}")
     loop = GLib.MainLoop()
