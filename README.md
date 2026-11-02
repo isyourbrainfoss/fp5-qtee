@@ -497,6 +497,14 @@ the session binary (`unlock`, and the Finger app's `enroll` and
 `match`), and for `<session> serve /lib/firmware/qsee`. The boot unit
 is root and does not use sudo.
 
+BengalOS (sysext, `sysext/build-sysext.sh`): run `sysext/install-etc.sh`
+once as root. It installs
+`/etc/systemd/system/polkit.service.d/10-after-sysext.conf`, which starts
+polkit after the sysext is merged. Without it the `org.fp5.qtee.*`
+polkit actions can be "not registered" after boot and the lock-screen
+fingerprint fails. The same drop-in inside the image is read too late
+when the sysext is merged late; see `docs/fprintd.md`.
+
 ## SERVE
 
 `fp5-qtee-session serve` stays loaded and waits on stdin. There is no

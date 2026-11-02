@@ -5,6 +5,7 @@
 # or pass _any to skip the version check (then also needs ID=_any or
 # matching ID; we keep ID=bengalos).
 # Install on the phone (owner step):
+#   sysext/install-etc.sh   # polkit after the merge (/etc drop-in, once)
 #   cp OUT.raw /var/lib/extensions/fp5-qtee.raw && systemd-sysext refresh
 #   systemctl daemon-reload && systemctl enable --now fp5-qtee.socket
 #   busctl call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus ReloadConfig

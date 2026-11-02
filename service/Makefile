@@ -24,6 +24,7 @@ install:
 	install -Dm644 ../docs/fprintd.md $(DESTDIR)$(DOCDIR)/fprintd.md
 	install -Dm644 fp5-qtee-unlock.service $(DESTDIR)$(USERUNITDIR)/fp5-qtee-unlock.service
 	install -Dm644 org.fp5.qtee.policy $(DESTDIR)$(POLKITDIR)/org.fp5.qtee.policy
+	install -Dm644 polkit-after-sysext.conf $(DESTDIR)$(UNITDIR)/polkit.service.d/10-fp5-qtee-after-sysext.conf
 	install -Dm644 org.fp5.qtee.desktop $(DESTDIR)$(PREFIX)/share/applications/org.fp5.qtee.desktop
 	install -Dm644 $(APP)/fp5-qtee-feedback.json $(DESTDIR)$(DATADIR)/fp5-qtee-feedback.json
 	for f in $(PY); do install -Dm644 $(APP)/$$f $(DESTDIR)$(DATADIR)/$$f; done

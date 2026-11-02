@@ -97,3 +97,14 @@ the bus needs a `ReloadConfig` to pick up the policy. The socket's
 template unit is `fp5-qtee@.service`. With `Accept=yes`, systemd
 looks for `<socket>@.service`, so the old `fp5-qtee-session@.service`
 name made every connection fail ("Failed to load connection service unit").
+
+polkit reads its actions only when it starts. If it starts before the
+sysext is merged, `org.fp5.qtee.*` and `net.reactivated.fprint.*` are
+"not registered" until polkit restarts, and the lock-screen fingerprint
+fails. `polkit.service` must therefore run after `systemd-sysext.service`
+(and `fp5-fpnfc-sysext.service` on the test kernel). The image ships
+that drop-in as `/usr/lib/systemd/system/polkit.service.d/10-fp5-qtee-after-sysext.conf`,
+but a drop-in inside a sysext is only seen after the merge, which is too
+late when the image is merged late. Install the same file once under
+`/etc` with `sysext/install-etc.sh` (as root):
+`/etc/systemd/system/polkit.service.d/10-after-sysext.conf`.
