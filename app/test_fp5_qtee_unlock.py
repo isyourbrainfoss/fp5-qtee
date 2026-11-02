@@ -2217,6 +2217,37 @@ class FastTapTest(WarmLoopTest.__base__):  # type: ignore[misc]
         self.assertIsNone(self.loop.warm)
         self.assertTrue(any("fprintd wants the sensor" in n for n in self.notes))
 
+    def test_reload_after_fprintd_is_done(self) -> None:
+        warm = self._unlock_by_finger()
+        self.fprintd[0] = True
+        self.step(1.1)
+        self.step()
+        self.assertTrue(warm.closed)
+        n = len(self.started)
+        with mock.patch.object(fp5_qtee_unlock, "other_session_running", lambda _p: False):
+            self.step(1.1)
+            self.step()
+            self.assertEqual(len(self.started), n)      # fprintd still busy
+            self.fprintd[0] = False
+            self.step(1.1)
+            self.step()
+        self.assertEqual(len(self.started), n + 1)      # loaded again, unlocked
+        self.assertNotIn("auth", self.started[-1].sent)  # never armed unlocked
+        self.assertTrue(any("warm session reload" in t for t in self.notes))
+        self.assertFalse(self.loop.reload_after_yield)
+
+    def test_no_reload_while_fprintd_session_runs(self) -> None:
+        self._unlock_by_finger()
+        self.fprintd[0] = True
+        self.step(1.1)
+        self.step()
+        n = len(self.started)
+        self.fprintd[0] = False
+        with mock.patch.object(fp5_qtee_unlock, "other_session_running", lambda _p: True):
+            self.step(1.1)
+            self.step()
+        self.assertEqual(len(self.started), n)
+
     def test_fprintd_marker_ignored_while_locked(self) -> None:
         self.step()
         warm = self.started[0]

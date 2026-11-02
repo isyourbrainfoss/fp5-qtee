@@ -1718,6 +1718,11 @@ class WarmLoop:
         self.app_running: Callable[[], bool] = app_running
         self.fprintd_wants: Callable[[], bool] = fprintd_wants
         self.app_scan_at = 0.0
+        # Set when the kept session was given to fp5-fprintd. Once fprintd
+        # lets go (still unlocked), the session is loaded again right away,
+        # while the 4 MiB fprintd just freed is likely still there, so the
+        # lock screen never has to allocate at lock time.
+        self.reload_after_yield = False
         self.dark_toofast_at: float | None = None
 
     def wait(self, timeout: float) -> None:
@@ -1939,8 +1944,20 @@ class WarmLoop:
 
     def _free_for_app(self, now: float) -> None:
         """Unlocked with a kept session: quit it once the Finger app runs
-        or fp5-fprintd claims the device (run0/polkit fingerprint)."""
-        if self.warm is None or self.believed_locked or now < self.app_scan_at:
+        or fp5-fprintd claims the device (run0/polkit fingerprint), and
+        load it again once fprintd is done."""
+        if self.believed_locked or now < self.app_scan_at:
+            return
+        if self.warm is None:
+            if not (self.reload_after_yield and self.keep_warm):
+                return
+            self.app_scan_at = now + APP_SCAN_S
+            if self.fprintd_wants() or self.app_running() or other_session_running(None):
+                return
+            self.w.note("fprintd done: warm session reload")
+            self.start()
+            if self.warm is not None:
+                self.reload_after_yield = False
             return
         self.app_scan_at = now + APP_SCAN_S
         if self.app_running():
@@ -1949,6 +1966,7 @@ class WarmLoop:
         elif self.fprintd_wants():
             self.w.note("fprintd wants the sensor: warm session quit")
             self.stop()
+            self.reload_after_yield = True
 
     def _sleep_events(self) -> None:
         """PrepareForSleep from logind, only in touch-wake mode."""
