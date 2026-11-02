@@ -145,6 +145,37 @@ class SyncHelpersTest(unittest.TestCase):
         self.assertFalse(f.memory_ok_for_yield(free=lambda: -1, compact=lambda: None, need=2))
         self.assertTrue(f.memory_ok_for_yield(free=lambda: 5, compact=lambda: self.fail("compacted"), need=2))
 
+    def _compact_cases(self, mod):
+        # Free already: nothing written.
+        writes = []
+        self.assertEqual(mod.compact_if_needed(free=lambda: 3, write=lambda p, t: writes.append(p.name),
+                                               sleep=lambda s: None), 3)
+        self.assertEqual(writes, [])
+        # Compaction alone finds nothing (Waydroid); drop_caches=1 + compact does.
+        seq = [0, 0, 55]
+        writes = []
+        self.assertEqual(mod.compact_if_needed(free=lambda: seq.pop(0),
+                                               write=lambda p, t: writes.append((p.name, t.strip())),
+                                               sleep=lambda s: None), 55)
+        self.assertEqual(writes, [("compact_memory", "1"), ("drop_caches", "1"), ("compact_memory", "1")])
+        # Nothing helps: drop 1, drop 3, then the backoff; never loops forever.
+        writes, sleeps = [], []
+        self.assertEqual(mod.compact_if_needed(free=lambda: 0, write=lambda p, t: writes.append((p.name, t.strip())),
+                                               sleep=sleeps.append), 0)
+        self.assertIn(("drop_caches", "3"), writes)
+        self.assertEqual(sleeps, list(mod.BACKOFF_S))
+        self.assertEqual(mod.compact_if_needed(free=lambda: -1, write=lambda p, t: self.fail("wrote"),
+                                               sleep=lambda s: None), -1)
+
+    def test_compact_escalates_fprintd(self):
+        self._compact_cases(f)
+
+    def test_compact_escalates_broker(self):
+        from importlib.machinery import SourceFileLoader
+        broker = SourceFileLoader("fp5_qtee_broker", str(Path(__file__).resolve().parent.parent
+                                                         / "service" / "fp5-qtee-broker")).load_module()
+        self._compact_cases(broker)
+
     def test_map_sync_to_owner(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "fingers.json"

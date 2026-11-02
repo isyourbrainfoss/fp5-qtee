@@ -24,7 +24,9 @@ import socket
 import struct
 import subprocess
 from pathlib import Path
+from typing import Callable
 import sys
+import time
 
 SESSION = os.environ.get("FP5_QTEE_SESSION", "/usr/libexec/fp5-qtee/fp5-qtee-session")
 FW_DIR = os.environ.get("FP5_QTEE_FW_DIR", "/var/lib/firmware/qsee")
@@ -45,6 +47,9 @@ MAX_LINE = 256
 # session. With fragmented RAM that fails ("page allocation failure:
 # order:10") and the session exits at once, so fingerprint unlock stops.
 COMPACT = Path("/proc/sys/vm/compact_memory")
+DROP_CACHES = Path("/proc/sys/vm/drop_caches")
+# Short waits between the last compactions (kcompactd and reclaim catch up).
+BACKOFF_S = (0.3, 0.7)
 BUDDYINFO = Path("/proc/buddyinfo")
 
 
@@ -66,22 +71,51 @@ def free_order10(text: str | None = None) -> int:
     return total
 
 
-def compact_if_needed() -> int:
-    """Compact memory when no order-10 block is free. Returns free blocks after.
+def compact_if_needed(free: "Callable[[], int] | None" = None,
+                      write: "Callable[[Path, str], None] | None" = None,
+                      sleep: "Callable[[float], None] | None" = None) -> int:
+    """Make one order-10 block free before a session. Returns free blocks after.
 
-    -1 when /proc/buddyinfo is unreadable (then nothing is done).
+    Steps, each only while none is free: compact; drop the page cache and
+    compact; drop caches and slab (3) and compact; then wait a little and
+    look again (BACKOFF_S). With Waydroid running (about 1-1.5 GB, 1 GB in
+    swap) compaction alone found nothing ("compacted, now 0") while drop
+    caches + compact gave 55 blocks. -1 when /proc/buddyinfo is unreadable
+    (then nothing is done).
     """
-    free = free_order10()
-    if free != 0:
-        return free
-    try:
-        COMPACT.write_text("1\n")
-    except OSError as exc:
-        print(f"fp5-qtee: compact_memory: {exc}", file=sys.stderr, flush=True)
-        return 0
-    free = free_order10()
-    print(f"fp5-qtee: no free order-10 block; compacted, now {free}", file=sys.stderr, flush=True)
-    return free
+    free = free if free is not None else free_order10
+    sleep = sleep if sleep is not None else time.sleep
+
+    def put(path: Path, text: str) -> None:
+        if write is not None:
+            write(path, text)
+            return
+        try:
+            path.write_text(text)
+        except OSError as exc:
+            print(f"fp5-qtee: {path.name}: {exc}", file=sys.stderr, flush=True)
+
+    have = free()
+    if have != 0:
+        return have
+    steps = [None, "1", "3"]
+    for n, drop in enumerate(steps):
+        if drop is not None:
+            put(DROP_CACHES, drop + "\n")
+        put(COMPACT, "1\n")
+        have = free()
+        print(f"fp5-qtee: no free order-10 block; step {n + 1}"
+              f" (drop_caches={drop or '-'}) now {have}", file=sys.stderr, flush=True)
+        if have != 0:
+            return have
+    for wait in BACKOFF_S:
+        sleep(wait)
+        put(COMPACT, "1\n")
+        have = free()
+        if have != 0:
+            break
+    print(f"fp5-qtee: after backoff {have} order-10 blocks", file=sys.stderr, flush=True)
+    return have
 
 
 def say(msg: str) -> None:
