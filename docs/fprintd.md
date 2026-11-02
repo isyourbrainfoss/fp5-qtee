@@ -91,7 +91,9 @@ The sysext installs the daemon as `/usr/libexec/fp5-qtee/fp5-fprintd` with
 `fp5-fprintd.service` (Type=dbus), D-Bus activation
 (`net.reactivated.Fprint.service`), the bus policy and the polkit actions.
 State is in `/var/lib/fp5-fprintd` and no fids are seeded
-(`FP5_FPRINTD_SEED=0`). The user name for new fingers comes from
+(`FP5_FPRINTD_SEED=0`). At start the daemon lists the trustlet once and
+syncs `fingers.json` with it (`FP5_FPRINTD_LIST_AT_START=1`, default in
+the unit; skipped when the sensor is busy). The user name for new fingers comes from
 `FP5_FPRINTD_USER` (drop-in under `/etc`). After `systemd-sysext refresh`
 the bus needs a `ReloadConfig` to pick up the policy. The socket's
 template unit is `fp5-qtee@.service`. With `Accept=yes`, systemd

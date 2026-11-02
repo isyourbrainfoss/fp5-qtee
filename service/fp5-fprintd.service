@@ -13,6 +13,9 @@ Environment=FP5_FPRINTD_SESSION=/usr/libexec/fp5-qtee/fp5-qtee-session
 Environment=FP5_FPRINTD_FW=/var/lib/firmware/qsee
 Environment=FP5_FPRINTD_STATE=/var/lib/fp5-fprintd
 Environment=FP5_FPRINTD_SEED=0
+# Sync fingers.json from the trustlet's list once at start (only if the
+# sensor is free). Set to 0 in a drop-in to skip.
+Environment=FP5_FPRINTD_LIST_AT_START=1
 Environment=FP5_QTEE_FW_DIR=/var/lib/firmware/qsee
 Environment=FP5_QTEE_MOUNT_PERSIST=0
 StateDirectory=fp5-fprintd
