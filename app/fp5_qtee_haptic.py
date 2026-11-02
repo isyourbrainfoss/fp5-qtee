@@ -1,8 +1,8 @@
 """Android fingerprint haptics for the FP5 aw86927.
 
-Success is one 20 ms pulse. A miss is two 30 ms pulses whose starts are
-130 ms apart, at the same amplitude. A too-fast tap is three 15 ms ticks
-55 ms apart. Running out of tries (lockout) is three long 150 ms pulses,
+Success is one 60 ms pulse. A miss is two 60 ms pulses whose starts are
+160 ms apart, at the same amplitude. A too-fast tap is three 35 ms ticks
+85 ms apart. Running out of tries (lockout) is three long 150 ms pulses,
 so it cannot be taken for a miss. The silent
 feedbackd profile plays nothing, and so does an unreadable profile.
 
@@ -35,13 +35,14 @@ import time
 from pathlib import Path
 from typing import Callable
 
-SUCCESS_MS = 20
-MISS_ON_MS = 30
+# FP5 LRA (aw86927): 20/30 ms pulses were too short to feel.
+SUCCESS_MS = 60
+MISS_ON_MS = 60
 MISS_OFF_MS = 100
 # Too fast: three short ticks, so it is not confused with the single
 # success click or the double miss pulse.
-TOOFAST_ON_MS = 15
-TOOFAST_OFF_MS = 40
+TOOFAST_ON_MS = 35
+TOOFAST_OFF_MS = 50
 LOCKOUT_ON_MS = 150
 LOCKOUT_OFF_MS = 100
 AMPLITUDE = 1.0

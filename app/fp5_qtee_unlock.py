@@ -104,7 +104,7 @@ WAKE_MISS_BUZZ = os.environ.get("FP5_QTEE_WAKE_MISS_BUZZ", "1") != "0"
 # In the dark, a too-fast tap buzzes at most this often (pocket guard).
 DARK_TOOFAST_EVERY_S = 10.0
 # Named fbcli events. The fingerprint waveforms live in fp5_qtee_haptic
-# (one 20 ms click, or two 30 ms pulses). These stay so a drop-in can
+# (one 60 ms click, or two 60 ms pulses). These stay so a drop-in can
 # still name an event; an empty name plays nothing through fbcli.
 MISS_EVENT = os.environ.get("FP5_QTEE_MISS_EVENT", "bell-terminal")
 HIT_EVENT = os.environ.get("FP5_QTEE_HIT_EVENT", "")

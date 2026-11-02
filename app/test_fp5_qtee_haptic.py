@@ -40,20 +40,20 @@ from fp5_qtee_haptic import (
 class WaveTest(unittest.TestCase):
     def test_success_is_one_click(self) -> None:
         self.assertEqual(waveform("success"), [(AMPLITUDE, SUCCESS_MS)])
-        self.assertEqual(SUCCESS_MS, 20)
+        self.assertEqual(SUCCESS_MS, 60)
 
-    def test_miss_is_two_pulses_130ms_apart(self) -> None:
+    def test_miss_is_two_pulses_160ms_apart(self) -> None:
         pulses = waveform("miss")
         self.assertEqual(
             pulses,
             [(AMPLITUDE, MISS_ON_MS), (0.0, MISS_OFF_MS), (AMPLITUDE, MISS_ON_MS)],
         )
         assert pulses is not None
-        self.assertEqual(pulses[0][1] + pulses[1][1], 130)
+        self.assertEqual(pulses[0][1] + pulses[1][1], 160)
         self.assertEqual(pulses[0][0], pulses[2][0])
 
     def test_lockout_is_three_long_pulses(self) -> None:
-        # Out of tries: distinct from the double 30 ms miss.
+        # Out of tries: distinct from the double 60 ms miss.
         pulses = waveform("lockout")
         assert pulses is not None
         on = [ms for amp, ms in pulses if amp > 0]
@@ -71,11 +71,11 @@ class WaveTest(unittest.TestCase):
                 self.assertIn(fbcli_args(kind)[-1], names)
         self.assertIsNone(ff_steps("lockout-permanent"))
 
-    def test_ff_steps_keep_the_130ms_gap(self) -> None:
+    def test_ff_steps_keep_the_160ms_gap(self) -> None:
         self.assertEqual(ff_steps("success"), [("rumble", SUCCESS_MS)])
         self.assertEqual(
             ff_steps("miss"),
-            [("rumble", MISS_ON_MS), ("sleep", 130), ("rumble", MISS_ON_MS)],
+            [("rumble", MISS_ON_MS), ("sleep", 160), ("rumble", MISS_ON_MS)],
         )
 
     def test_rumble_magnitude_is_android_gain(self) -> None:
@@ -169,13 +169,13 @@ class TooFastWaveTest(unittest.TestCase):
         self.assertEqual(len(pulses), 3)
         self.assertNotEqual(wave, fp5_qtee_haptic.waveform("miss"))
         self.assertNotEqual(wave, fp5_qtee_haptic.waveform("success"))
-        self.assertLess(sum(ms for _a, ms in wave), 200)
+        self.assertLess(sum(ms for _a, ms in wave), 250)
         self.assertEqual(
             fp5_qtee_haptic.fbcli_args("toofast")[-1], "fp5-qtee-toofast"
         )
         steps = fp5_qtee_haptic.ff_steps("toofast")
         self.assertEqual([op for op, _v in steps].count("rumble"), 3)
-        self.assertEqual([v for op, v in steps if op == "sleep"], [55, 55])
+        self.assertEqual([v for op, v in steps if op == "sleep"], [85, 85])
 
 
 class PlayTest(unittest.TestCase):
@@ -229,9 +229,9 @@ class PlayTest(unittest.TestCase):
             self.assertEqual(haptic.play_sync("success"), "sysfs")
         self.assertEqual(
             writes,
-            [("gain", str(GAIN)), ("duration", "20"), ("activate", "1"), ("activate", "0")],
+            [("gain", str(GAIN)), ("duration", "60"), ("activate", "1"), ("activate", "0")],
         )
-        self.assertEqual(sleeps, [0.02])
+        self.assertEqual(sleeps, [0.06])
 
     def test_miss_is_two_pulses_with_one_gain(self) -> None:
         writes: list[tuple[str, str]] = []
@@ -247,8 +247,8 @@ class PlayTest(unittest.TestCase):
             )
             self.assertEqual(haptic.play_sync("miss"), "sysfs")
         self.assertEqual(writes.count(("gain", str(GAIN))), 1)
-        self.assertEqual(writes.count(("duration", "30")), 2)
-        self.assertEqual(sleeps, [0.03, 0.1, 0.03])
+        self.assertEqual(writes.count(("duration", "60")), 2)
+        self.assertEqual(sleeps, [0.06, 0.1, 0.06])
 
     def test_no_led_falls_back_to_fbcli(self) -> None:
         ran: list[list[str]] = []
@@ -305,7 +305,7 @@ class PlayTest(unittest.TestCase):
             self.assertEqual(haptic.play_sync("success"), "evdev")
             self.assertEqual(haptic.play_sync("lockout-permanent"), "none")
         self.assertEqual(played, [MISS_ON_MS, MISS_ON_MS, SUCCESS_MS])
-        self.assertEqual(sleeps, [0.13])
+        self.assertEqual(sleeps, [0.16])
 
     def test_evdev_uses_full_gain_for_the_pulse_only(self) -> None:
         played: list[int] = []

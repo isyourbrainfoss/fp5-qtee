@@ -373,9 +373,9 @@ From the same 2026-10-09 capture, and from the lockout rules in
 - A partial press does not count. A miss never wakes the screen. Only
   a hit can unlock, and the panel has to be on or come on within 4 s.
   The watcher does not turn the panel on.
-- Haptics on the aw86927. A match is one 20 ms pulse, theme event
-  `fp5-qtee-match`, magnitude 1.0. A miss is 30 ms on, 100 ms off,
-  30 ms on (`fp5-qtee-miss`), so the second pulse starts 130 ms after
+- Haptics on the aw86927. A match is one 60 ms pulse, theme event
+  `fp5-qtee-match`, magnitude 1.0. A miss is 60 ms on, 100 ms off,
+  60 ms on (`fp5-qtee-miss`), so the second pulse starts 160 ms after
   the first, at the same magnitude. The driver's gain register is
   `strong_magnitude * 0x80 / 0xffff`, so magnitude `0xffff` is register
   `0x80` when the device gain is also `0xffff`. feedbackd writes gain
@@ -439,8 +439,8 @@ All of these are read from the environment when the watcher starts.
   the once-per-boot and 72-hour PIN rule. The 5-miss and 20-miss
   lockout still applies.
 - `FP5_QTEE_HAPTIC` defaults to `1`. Set it to `0` to play no vibration.
-  The waveforms live in `app/fp5_qtee_haptic.py`: one 20 ms pulse on a
-  hit, two 30 ms pulses on a miss.
+  The waveforms live in `app/fp5_qtee_haptic.py`: one 60 ms pulse on a
+  hit, two 60 ms pulses on a miss.
 - `FP5_QTEE_HAPTIC_PROFILE` overrides the feedbackd profile. `silent`,
   and a profile that cannot be read, play nothing. When this is unset
   the player reads the profile from feedbackd.
