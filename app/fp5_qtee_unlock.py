@@ -166,6 +166,13 @@ WAKE = os.environ.get("FP5_QTEE_WAKE", "0") == "1"
 if WAKE:
     WARM = True
 SLEEP_ARM_WAIT_S = 1.5
+# Default since 2026-11-03: do not stay armed into s2idle. On
+# PrepareForSleep(true) the armed attempt is cancelled (bounded by the
+# delay lock), nothing is armed while sleeping, and the next step arms
+# again after PrepareForSleep(false). The power key still wakes the
+# phone. FP5_QTEE_SLEEP_DISARM=0 keeps the old touch-to-wake behaviour
+# (arm before sleep so a press can resume s2idle).
+SLEEP_DISARM = os.environ.get("FP5_QTEE_SLEEP_DISARM", "1") != "0"
 try:
     RESUME_HOLD_S = max(0, int(os.environ.get("FP5_QTEE_WAKE_HOLD_S", "0")))
 except ValueError:
@@ -1758,6 +1765,7 @@ class WarmLoop:
         self.dark_toofast_at: float | None = None
         # TEMPLATES loaded=<n> of the current serve session (None: not seen).
         self.templates: int | None = None
+        self.sleep_disarm = SLEEP_DISARM
 
     def wait(self, timeout: float) -> None:
         """Sleep until the session prints a line, or timeout.
@@ -2025,8 +2033,25 @@ class WarmLoop:
                 self.after_sleep()
 
     def before_sleep(self) -> None:
-        """Arm the sensor (finger-detect) if locked, then let sleep go on."""
+        """Arm the sensor (finger-detect) if locked, then let sleep go on.
+
+        With sleep_disarm: cancel the armed attempt instead and wait for
+        the session to go idle, so nothing is armed in s2idle.
+        """
         self.sleeping = True
+        if self.sleep_disarm:
+            if self.warm is not None and self.armed:
+                self.cancel()
+                for _ in range(int(SLEEP_ARM_WAIT_S / 0.05)):
+                    self.drain(False)
+                    if not self.armed:
+                        break
+                    self.nap(0.05)
+            self.w.note(f"sleep: disarmed locked={self.believed_locked} "
+                        f"session={self.warm is not None} armed={self.armed}")
+            if self.delay_lock is not None:
+                self.delay_lock.release()
+            return
         armed_now = False
         if self.warm is not None and self.believed_locked:
             if self.warm.idle and not self.armed:
@@ -2046,6 +2071,7 @@ class WarmLoop:
             self.delay_lock.release()
 
     def after_sleep(self) -> None:
+        """Back from sleep. With sleep_disarm the next step arms again."""
         self.sleeping = False
         self.w.note(f"resume: armed={self.armed} {fp_wake_counts()}")
         if self.resume_lock is not None and self.believed_locked:
@@ -2141,6 +2167,9 @@ class WarmLoop:
         self.start()
         warm = self.warm
         if warm is None or not warm.idle or self.armed:
+            return
+        # Between PrepareForSleep(true) and (false): stay disarmed.
+        if self.sleeping and self.sleep_disarm:
             return
         # Immediately before arming: the panel (unless dark arming), and
         # LockedHint unless it was read in this very step.

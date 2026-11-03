@@ -51,3 +51,14 @@ Short logind suspend ended by RTC (`scripts/fp-wake/test-suspend.sh`):
 
 The serve session kept working after resume (re-armed, TEE commands rc 0).
 Not verified: a real touch while suspended (needs the user's finger).
+
+## Disarm in s2idle (default since 2026-11-03)
+
+`FP5_QTEE_SLEEP_DISARM=1` is now the default: on `PrepareForSleep(true)`
+the watcher cancels the armed attempt (inside the delay inhibitor),
+arms nothing while the system sleeps, and arms again on the first step
+after `PrepareForSleep(false)`. The power key still wakes the phone; a
+press on the sensor alone does not. Reason: s2idle wake debugging on
+BengalOS (IRQ floods and spurious wakes); a sensor armed into s2idle is
+one more wake source to rule out. Set `FP5_QTEE_SLEEP_DISARM=0` in the
+user drop-in to get the old touch-to-wake from suspend back.

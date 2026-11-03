@@ -2114,6 +2114,7 @@ class TouchWakeTest(WarmLoopTest.__base__):  # type: ignore[misc]
         self.assertEqual(self.screen, [])
 
     def test_sleep_arms_idle_session_then_releases_delay_lock(self) -> None:
+        self.loop.sleep_disarm = False   # FP5_QTEE_SLEEP_DISARM=0
         self.panel[0] = False
         self.step()
         warm = self.started[0]
@@ -2131,6 +2132,32 @@ class TouchWakeTest(WarmLoopTest.__base__):  # type: ignore[misc]
         self.step()
         self.assertEqual(self.delay.taken, 1)
         self.assertEqual(self.resume.taken, 1)
+
+    def test_sleep_disarms_then_rearms_after_resume(self) -> None:
+        self.assertTrue(self.loop.sleep_disarm)  # the default
+        self.panel[0] = False
+        self.step()
+        warm = self.started[0]
+        warm.say("SERVE idle")
+        self.step()
+        self.assertEqual(warm.sent, ["auth"])     # armed in the dark
+        warm.say("AUTH 1 arm mode=1 irq=4")
+        self.step()
+        # PrepareForSleep(true): cancel; the session answers and goes idle.
+        warm.say("AUTH 1 cancelled", "SERVE result 3", "SERVE idle")
+        self.sig.events = [True]
+        self.step()
+        self.assertEqual(warm.sent, ["auth", "cancel"])
+        self.assertFalse(self.loop.armed)
+        self.assertEqual(self.delay.released, 1)
+        # Still sleeping: nothing is armed.
+        self.step()
+        self.assertEqual(warm.sent, ["auth", "cancel"])
+        # PrepareForSleep(false): armed again on the next step.
+        self.sig.events = [False]
+        self.step()
+        self.assertEqual(warm.sent, ["auth", "cancel", "auth"])
+        self.assertEqual(self.delay.taken, 1)
 
     def test_sleep_with_no_session_still_releases(self) -> None:
         self.lock[0] = False

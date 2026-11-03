@@ -18,4 +18,6 @@ fprintd is done, so the lock screen does not pay the ~1 s reload.
 `~/.config/systemd/user/fp5-qtee-unlock.service.d/` is still the fallback
 if fprintd ever reports "another fp5-qtee-session is running".
 
+Sleep: the watcher now disarms the sensor before s2idle and arms it again after resume (`FP5_QTEE_SLEEP_DISARM=1`, default). Add `Environment=FP5_QTEE_SLEEP_DISARM=0` to `20-fp5-dark-unlock.conf` for the old touch-to-wake from suspend (docs/fp-wake.md).
+
 Kernel: `focaltech-fp` with DT `wakeup-source` arms `enable_irq_wake` on gpio34 (PDC) in suspend while the session listens.
