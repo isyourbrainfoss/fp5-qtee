@@ -2204,10 +2204,20 @@ static const char *group_path(void)
 	return "";
 }
 
+static int gallery_in_cmd(struct svc *s, int *count);
+
+/*
+ * Prints "TEMPLATES loaded=<n>" from the SET_GROUP answer ("there is N
+ * template loaded"), or loaded=-1 when the trustlet did not say. 0 means
+ * the store is empty (never enrolled, or reset after a crash) and every
+ * press can only miss; the watcher and fp5-fprintd then do not count
+ * those misses as strikes.
+ */
 static int set_group(struct svc *s, const char *path)
 {
 	uint8_t g[FP5_GROUP_CAP];
 	int n = fp5_build_group(g, sizeof(g), path);
+	int loaded = -1;
 
 	if (n < 0) {
 		logf("SET_GROUP path too long (%zu bytes, max %zu)",
@@ -2218,6 +2228,9 @@ static int set_group(struct svc *s, const char *path)
 	 * SET_GROUP rc -2 (no share template) still returns 0 here. */
 	if (send_cmd(s, fp5_op_set_group(), (uint32_t)n, g, "SET_GROUP"))
 		return -1;
+	if (!gallery_in_cmd(s, &loaded))
+		loaded = -1;
+	logf("TEMPLATES loaded=%d", loaded);
 	return send_cmd(s, fp5_op_enum(), 0, NULL, "ENUM");
 }
 
