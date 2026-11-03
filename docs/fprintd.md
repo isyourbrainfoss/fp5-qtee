@@ -45,6 +45,29 @@ The trustlet stores fids only. `/var/lib/fp5-qtee/fingers.json` maps
 GNOME asked for. A verify hit on a fid owned by another user is a
 no-match.
 
+## Empty or reset store
+
+After a crash the trustlet can reset its template store (seen 2026-11-03
+18:54:50: the index was reset, likely an RPMB counter vs SD-copy
+rollback) while `fingers.json` still names the old fingers. Every press
+then came back as a wrong finger (`FtVerifyByTemplate() = -2`) and
+counted toward the lockout.
+
+- The session prints `TEMPLATES loaded=<n>` after SET_GROUP (-1 when the
+  trustlet does not say).
+- With 0, the daemon ends a verify with `verify-unknown-error` (never
+  `verify-no-match`) and answers ListEnrolledFingers / VerifyStart with
+  `NoEnrolledPrints` ("the fingerprint store is empty or was reset; enroll
+  again"). ListDetailed is empty. A stale name does not block EnrollStart.
+- A `list` that shows fewer templates than `fingers.json` names logs
+  `WARNING: fingerprint store reset? ...`, backs up `fingers.json` to
+  `backup/`, and syncs the map; only a list that printed `FINGERS count=0`
+  empties it.
+- The lock-screen watcher does not count such a miss as a strike and
+  shows "No fingerprint enrolled. Use PIN.".
+
+Fix on the phone: enroll the finger again.
+
 ## Calls
 
 | call | what happens |

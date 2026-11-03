@@ -29,7 +29,7 @@ class Flow(unittest.TestCase):
                    FP5_FPRINTD_SESSION=str(HERE / "testdata" / "fake-session"),
                    FP5_FPRINTD_STATE=str(t / "state"), FP5_FPRINTD_LOCK=str(t / "lock"),
                    FP5_FPRINTD_FAKE_LOCKED=str(cls.lockflag), FP5_FPRINTD_LOAD="/nonexistent",
-                   FP5_FPRINTD_STORE=str(t / "store"), FP5_FPRINTD_WANT=str(t / "want-sensor"), FAKE_SEQ_FILE=str(t / "seq"), FP5_FPRINTD_USER=os.environ.get("USER", "kb"))
+                   FP5_FPRINTD_STORE=str(t / "store"), FP5_FPRINTD_WANT=str(t / "want-sensor"), FAKE_SEQ_FILE=str(t / "seq"), FAKE_EMPTY_FILE=str(t / "empty"), FP5_FPRINTD_USER=os.environ.get("USER", "kb"))
         cls.env = env
         # An empty map, as on first boot or after an enroll outside
         # fprintd: ListEnrolledFingers must list the trustlet and fill it.
@@ -146,6 +146,33 @@ class Flow(unittest.TestCase):
         backups = list((Path(self.tmp.name) / "state" / "backup").glob("fingers-*.json"))
         self.assertTrue(backups)               # fingers.json copied before the rename
         self.assertEqual(str(man.RelabelFinger("left-thumb", "left-index-finger")), "renamed")
+
+    def test_7_empty_store(self):
+        # The trustlet store was reset (2026-11-03): fingers.json still
+        # names fingers, the session loads 0 templates. Not a wrong finger.
+        empty = Path(self.tmp.name) / "empty"
+        empty.write_text("1")
+        try:
+            got = self.verify("miss")
+            self.assertEqual(got[-1], ("verify-unknown-error", True))
+            self.assertNotIn(("verify-no-match", True), got)
+            with self.assertRaises(dbus.exceptions.DBusException) as e:
+                self.dev.ListEnrolledFingers("")
+            self.assertEqual("net.reactivated.Fprint.Error.NoEnrolledPrints", e.exception.get_dbus_name())
+            self.assertIn("reset", e.exception.get_dbus_message())
+            man = dbus.Interface(self.dev, "org.fp5.Fprint.Manage")
+            self.assertEqual(list(man.ListDetailed("")), [])
+            # A name left over in fingers.json does not block enrolling again.
+            self.dev.Claim("")
+            got, loop, m = self.wait_signal("EnrollStatus")
+            self.dev.EnrollStart("left-index-finger")
+            loop.run()
+            m.remove()
+            self.dev.Release()
+            self.assertEqual(got[-1], ("enroll-completed", True))
+        finally:
+            empty.unlink()
+        self.assertIn("left-index-finger", list(self.dev.ListEnrolledFingers("")))
 
 
 if __name__ == "__main__":

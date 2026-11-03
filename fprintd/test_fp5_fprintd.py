@@ -32,6 +32,52 @@ class EventTest(unittest.TestCase):
         self.assertEqual(f.listed_fids(out), [1558157930, 1979259351])
 
 
+class StoreTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "fingers.json"
+        self.old_backup = f.BACKUP_DIR
+        f.BACKUP_DIR = Path(self.dir.name) / "backup"
+
+    def tearDown(self):
+        f.BACKUP_DIR = self.old_backup
+        self.dir.cleanup()
+
+    def test_lines(self):
+        self.assertEqual(f.templates_loaded("TEMPLATES loaded=0\n"), 0)
+        self.assertEqual(f.templates_loaded("TEMPLATES loaded=-1"), -1)
+        self.assertIsNone(f.templates_loaded("SERVE ready"))
+        self.assertEqual(f.listed_count("x\nFINGERS count=0 loaded_log=0\n"), 0)
+        self.assertEqual(f.listed_count("FINGERS count=2 loaded_log=-1\nFINGER index=0 gid=0 fid=1 slot=1"), 2)
+        # A list that failed before its count is not an empty store.
+        self.assertIsNone(f.listed_count("LIST not a finger list (status=-5 word0=0)"))
+
+    def test_store_reset(self):
+        self.assertIsNone(f.store_reset([1, 2], 2, [1, 2]))
+        self.assertIsNone(f.store_reset([1], None, []))
+        self.assertIsNone(f.store_reset([], 0, []))
+        self.assertIn("missing fids [1]", f.store_reset([1], 0, []))
+        self.assertIn("Enroll", f.store_reset([1, 2], 1, [2]))
+
+    def test_apply_list_empty_store_drops_stale_names(self):
+        m = f.FingerMap(self.path)
+        self.assertEqual(len(m.rows), 2)
+        self.assertTrue(f.apply_list(m, "FINGERS count=0 loaded_log=0\n", "user"))
+        self.assertEqual(m.rows, [])
+        self.assertTrue(list(f.BACKUP_DIR.glob("fingers-*.json")))
+
+    def test_apply_list_failed_list_changes_nothing(self):
+        m = f.FingerMap(self.path)
+        self.assertFalse(f.apply_list(m, "LIST not a finger list\n", "user"))
+        self.assertEqual(len(m.rows), 2)
+
+    def test_apply_list_partial_reset(self):
+        m = f.FingerMap(self.path)
+        out = "FINGERS count=1 loaded_log=1\nFINGER index=0 gid=0 fid=1979259351 slot=1\n"
+        self.assertFalse(f.apply_list(m, out, "user"))
+        self.assertEqual([r["fid"] for r in m.rows], [1979259351])
+
+
 class MapTest(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()

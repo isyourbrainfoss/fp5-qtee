@@ -108,6 +108,12 @@ _FINGER = re.compile(r"^FINGER index=\d+ gid=\d+ fid=(\d+) ")
 _REM = re.compile(r"^rem=(\d+) sample=")
 _ENROLL_FID = re.compile(r"^ENROLL fid=(\d+) rc=(-?\d+)")
 _ENROLL_DONE = re.compile(r"^enroll done rem=(\d+) wrote=(\d+)")
+# set_group: templates the trustlet loaded (-1 unknown). list: its count.
+_TEMPLATES = re.compile(r"^TEMPLATES loaded=(-?\d+)")
+_COUNT = re.compile(r"^FINGERS count=(\d+) ")
+# Said to pam_fprintd / GNOME Settings when the trustlet has no templates
+# but fingers.json still names some (store reset after a crash, 2026-11-03).
+EMPTY_STORE_MSG = "No fingerprints enrolled (the fingerprint store is empty or was reset; enroll again)"
 
 
 def log(msg: str) -> None:
@@ -171,6 +177,35 @@ def listed_fids(text: str) -> list[int]:
             if fid not in out:
                 out.append(fid)
     return out
+
+
+def templates_loaded(line: str) -> int | None:
+    """n from the session's "TEMPLATES loaded=<n>" line, else None."""
+    m = _TEMPLATES.match(line.strip())
+    return int(m.group(1)) if m else None
+
+
+def listed_count(text: str) -> int | None:
+    """The `list` mode's "FINGERS count=<n>", or None if it did not get
+    that far (a failed list must never look like an empty store)."""
+    for line in text.splitlines():
+        m = _COUNT.match(line.strip() + " ")
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def store_reset(known: list[int], count: int | None, listed: list[int]) -> str | None:
+    """A warning when the trustlet holds fewer templates than fingers.json
+    names (store reset or rolled back), else None. count None: unknown."""
+    if count is None or not known:
+        return None
+    missing = [fid for fid in known if fid not in listed]
+    if count >= len(known) and not missing:
+        return None
+    return (f"fingerprint store reset? trustlet has {count} template(s), "
+            f"fingers.json names {len(known)}; missing fids {missing}. "
+            "Enroll the finger(s) again.")
 
 
 class FingerMap:
@@ -651,6 +686,32 @@ def run_once(mode_args: list[str], tag: str, timeout: float = 120) -> str:
     return "".join(out)
 
 
+def apply_list(fmap: "FingerMap", out: str, owner: str) -> bool:
+    """Bring fingers.json in line with a `list` output. True if the
+    trustlet store is empty.
+
+    A drop below what fingers.json names is logged as a store reset with
+    a backup of the map. Only a list that printed its count of 0 empties
+    the map; a failed list changes nothing.
+    """
+    count = listed_count(out)
+    fids = listed_fids(out)
+    warn = store_reset([int(r["fid"]) for r in fmap.rows], count, fids)
+    if warn:
+        log(f"WARNING: {warn}")
+        try:
+            log(f"fingers.json backup {backup_map(fmap.path)}")
+        except OSError as e:
+            log(f"fingers.json backup failed: {e}")
+    if count == 0:
+        if fmap.rows:
+            fmap.sync([], owner)
+        return True
+    if fids and fmap.sync(fids, owner):
+        log(f"sync: map now {fmap.rows}")
+    return False
+
+
 def backup_map(path: Path = MAP_PATH) -> Path | None:
     """Copy fingers.json to BACKUP_DIR before a rename. None if absent."""
     if not path.is_file():
@@ -734,6 +795,11 @@ def main() -> int:  # pragma: no cover - needs a system bus
             self.enroll_fid: int | None = None
             self.watch = None
             self.sync_at = 0.0
+            # The trustlet said it has no templates (list count 0 or a
+            # session's TEMPLATES loaded=0). Then we answer NoEnrolledPrints
+            # and never report a wrong finger. Cleared by a good enroll or
+            # a session that loads templates.
+            self.store_empty = False
             GLib.timeout_add(100, self._tick)
             GLib.timeout_add_seconds(2, self._lock_check)
 
@@ -811,12 +877,9 @@ def main() -> int:  # pragma: no cover - needs a system bus
                 return
             try:
                 out = run_once(["list", FIRMWARE], "fprintd-list", timeout=30)
-                fids = listed_fids(out)
-                log(f"sync: trustlet lists {fids}")
-                if fids:
-                    owner = sync_owner(user, graphical_users())
-                    if fmap.sync(fids, owner):
-                        log(f"sync: map now {fmap.rows}")
+                log(f"sync: trustlet lists {listed_fids(out)}")
+                owner = sync_owner(user, graphical_users())
+                self.store_empty = apply_list(fmap, out, owner)
             except Busy as e:
                 log(f"sync: {e}")
             finally:
@@ -853,6 +916,10 @@ def main() -> int:  # pragma: no cover - needs a system bus
                     self.op = None
                     self.lock.release()
                     return True
+                n = templates_loaded(line)
+                if n is not None:
+                    self._templates(n)
+                    continue
                 if self.op == "verify":
                     self._verify_line(line)
                 elif self.op == "enroll":
@@ -864,6 +931,23 @@ def main() -> int:  # pragma: no cover - needs a system bus
                 log("idle; closing session")
                 self._close_sess()
             return True
+
+        def _templates(self, n: int) -> None:
+            """A session's TEMPLATES loaded=<n>. 0 ends a verify at once:
+            every press would be reported as a wrong finger."""
+            if n > 0:
+                self.store_empty = False
+                return
+            if n < 0 or self.op == "enroll":
+                return
+            self.store_empty = True
+            log("WARNING: the trustlet loaded 0 templates but fingers.json names "
+                f"{len(fmap.rows)}; the store was reset or never enrolled. Enroll the finger again.")
+            if self.op == "verify":
+                self.op = None
+                if self.sess is not None:
+                    self.sess.send("cancel")
+                self.VerifyStatus("verify-unknown-error", True)
 
         def _lock_check(self) -> bool:
             if self.sess is not None and seat_locked() is not False:
@@ -900,6 +984,10 @@ def main() -> int:  # pragma: no cover - needs a system bus
                 self.VerifyStatus("verify-match", True)
             elif kind == "no-match":
                 self.op = None
+                if self.store_empty:
+                    # Nothing to match against: not a wrong finger.
+                    self.VerifyStatus("verify-unknown-error", True)
+                    return
                 self.VerifyStatus("verify-no-match", True)
             elif kind == "retry":
                 self.VerifyStatus("verify-retry-scan", False)
@@ -931,6 +1019,7 @@ def main() -> int:  # pragma: no cover - needs a system bus
         def _enroll_done(self, ok: bool) -> None:
             self.op = None
             if ok and self.enroll_fid:
+                self.store_empty = False
                 fmap.add(self.enroll_fid, self.user or DEFAULT_USER, self.op_finger, "enroll")
                 log(f"enrolled fid={self.enroll_fid} as {self.op_finger}")
                 self.EnrollStatus("enroll-completed", True)
@@ -947,6 +1036,8 @@ def main() -> int:  # pragma: no cover - needs a system bus
         def ListEnrolledFingers(self, username, sender=None):
             user = self._user_for(str(username), sender)
             self._sync_if_empty(user)
+            if self.store_empty:
+                raise dbus_err("NoEnrolledPrints", EMPTY_STORE_MSG)
             names = fmap.names(user)
             if not names:
                 raise dbus_err("NoEnrolledPrints", "Failed to discover prints")
@@ -982,6 +1073,8 @@ def main() -> int:  # pragma: no cover - needs a system bus
             if self.op is not None:
                 raise dbus_err("AlreadyInUse", "Action already in progress")
             self._sync_if_empty(self.user or "")
+            if self.store_empty:
+                raise dbus_err("NoEnrolledPrints", EMPTY_STORE_MSG)
             names = fmap.names(self.user or "")
             if not names:
                 raise dbus_err("NoEnrolledPrints", "No fingerprints enrolled")
@@ -1018,7 +1111,8 @@ def main() -> int:  # pragma: no cover - needs a system bus
             finger = str(finger_name)
             if finger not in FINGERS:
                 raise dbus_err("InvalidFingername", "Invalid finger name")
-            if fmap.fid(self.user or "", finger) is not None:
+            # A name left over from a reset store does not block enrolling it.
+            if fmap.fid(self.user or "", finger) is not None and not self.store_empty:
                 raise dbus_err("FingerAlreadyEnrolled", f"{finger} is already enrolled; delete it first")
             if self.op is not None:
                 raise dbus_err("AlreadyInUse", "Action already in progress")
@@ -1150,7 +1244,8 @@ def main() -> int:  # pragma: no cover - needs a system bus
                              sender_keyword="sender")
         def ListDetailed(self, username, sender=None):
             user = self._user_for(str(username), sender)
-            return dbus.Array([(n, dbus.Int64(fid), src) for n, fid, src in fmap.details(user)],
+            rows = [] if self.store_empty else fmap.details(user)
+            return dbus.Array([(n, dbus.Int64(fid), src) for n, fid, src in rows],
                               signature="(sxs)")
 
         @dbus.service.method(IFACE_MANAGE, in_signature="ss", out_signature="s",
@@ -1245,11 +1340,13 @@ def main() -> int:  # pragma: no cover - needs a system bus
                 return
             try:
                 out = run_once(["list", FIRMWARE], "fprintd-list")
-                fids = listed_fids(out)
-                if fids:
-                    owner = sync_owner(None, graphical_users())
-                    GLib.idle_add(lambda: fmap.sync(fids, owner) and False)
-                    log(f"trustlet lists {fids}")
+                log(f"trustlet lists {listed_fids(out)}")
+                owner = sync_owner(None, graphical_users())
+
+                def apply() -> bool:
+                    dev.store_empty = apply_list(fmap, out, owner)
+                    return False
+                GLib.idle_add(apply)
             except Busy as e:
                 log(f"list: {e}")
             finally:

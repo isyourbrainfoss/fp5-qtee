@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """Stand-in for fp5-qtee-session in the D-Bus test. FAKE_SEQ picks the
-outcome of each auth: hit, miss, empty, none (comma separated)."""
+outcome of each auth: hit, miss, empty, none (comma separated). With the
+file FAKE_EMPTY_FILE present the trustlet store is empty (reset)."""
 import os, sys, time
 mode = sys.argv[1]
 sf = os.environ.get("FAKE_SEQ_FILE")
 seq = (open(sf).read().strip() if sf and os.path.exists(sf) else "hit").split(",")
 fids = [1558157930, 1979259351]
+ef = os.environ.get("FAKE_EMPTY_FILE")
+if ef and os.path.exists(ef):
+    fids = []
 def out(s):
     print(s, flush=True)
 if mode == "list":
+    out(f"FINGERS count={len(fids)} loaded_log={len(fids)}")
     for i, f in enumerate(fids):
         out(f"FINGER index={i} gid=0 fid={f} slot={i}")
     sys.exit(0)
@@ -27,6 +32,7 @@ if mode == "enroll":
         out(f"rem={r} sample=0")
     out("enroll done rem=0 wrote=1 save_ms=90")
     sys.exit(0)
+out(f"TEMPLATES loaded={len(fids)}")
 out("SERVE ready")
 n = 0
 while True:
