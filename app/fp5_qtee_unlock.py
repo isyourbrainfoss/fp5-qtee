@@ -89,6 +89,11 @@ _DOWN = re.compile(r"^AUTH \d+ REAL DOWN ")
 # The finger left before any in-range frame (Android: "finger touched but
 # is leaving too fast"). Not a strike: nothing was scored.
 _TOOFAST = re.compile(r"^AUTH \d+ toofast ")
+# set_group prints how many templates the trustlet loaded (-1: unknown).
+# With 0 the store is empty (never enrolled, or reset after a crash, seen
+# 2026-11-03): every press comes back as a no-match. Those are not
+# strikes; the lock screen says no finger is enrolled instead.
+_TEMPLATES = re.compile(r"^TEMPLATES loaded=(-?\d+)")
 # Keep the warm session loaded after an unlock (no ~1 s reload on the
 # next lock). It is quit as soon as the Finger app is running, which
 # needs the sensor to itself. FP5_QTEE_KEEP_WARM=0 restores quit-on-unlock.
@@ -132,6 +137,7 @@ MISS_TEXT = {
     "nomatch": "Not recognized. Try again or use PIN.",
     "partial": "Finger not read. Cover the whole sensor.",
     "toofast": "Finger moved too fast. Try again.",
+    "notemplates": "No fingerprint enrolled. Use PIN.",
 }
 APP_NAME = "Fingerprint"
 # Running out of finger tries. These notices are critical: Phosh turns the
@@ -547,6 +553,19 @@ def miss_kind(line: str) -> str | None:
     if _PARTIAL.match(text):
         return "partial"
     return None
+
+
+def templates_loaded(line: str) -> int | None:
+    """n from "TEMPLATES loaded=<n>", else None."""
+    match = _TEMPLATES.match(line.strip())
+    return int(match.group(1)) if match else None
+
+
+def store_miss_kind(kind: str | None, loaded: int | None) -> str | None:
+    """A no-match against an empty store is "notemplates", not a strike."""
+    if kind == "nomatch" and loaded == 0:
+        return "notemplates"
+    return kind
 
 
 def keep_session(kind: str | None, nonzero: bool) -> bool:
@@ -1139,6 +1158,12 @@ class UnlockWatcher:
         # Transient, so misses do not pile up in the notification list.
         self._background(notify_args(MISS_TEXT[kind], 2500, transient=True))
 
+    def note_empty_store(self) -> None:
+        """Log once per session that the trustlet has no templates."""
+        self.note("WARNING: the fingerprint store is empty (TEMPLATES loaded=0); "
+                  "it was reset or never enrolled. Misses are not strikes. "
+                  "Enroll the finger again.")
+
     def tell_toofast(self) -> None:
         """A short triple tick: the finger left before it could be read."""
         self.note("miss toofast")
@@ -1326,6 +1351,7 @@ class UnlockWatcher:
         down_at: float | None = None
         saw_arm = False
         press_nz = False
+        loaded: int | None = None
         bad_since: float | None = None
         held_note = False
         with path.open("w", encoding="utf-8") as log:
@@ -1352,6 +1378,11 @@ class UnlockWatcher:
                     self._note_panel(panel(), saw_arm)
                 log.write(line)
                 log.flush()
+                n = templates_loaded(line)
+                if n is not None:
+                    loaded = n
+                    if n == 0:
+                        self.note_empty_store()
                 if armed(line):
                     saw_arm = True
                     press_nz = False
@@ -1421,6 +1452,7 @@ class UnlockWatcher:
                             self.note(f"miss {kind} ignored: wake press")
                             kind = None
                             stay = False
+                kind = store_miss_kind(kind, loaded)
                 if kind is not None:
                     # A screen-on press. The strike still counts if the
                     # seat unlocked while it was scored; the notice does not.
@@ -1724,6 +1756,8 @@ class WarmLoop:
         # lock screen never has to allocate at lock time.
         self.reload_after_yield = False
         self.dark_toofast_at: float | None = None
+        # TEMPLATES loaded=<n> of the current serve session (None: not seen).
+        self.templates: int | None = None
 
     def wait(self, timeout: float) -> None:
         """Sleep until the session prints a line, or timeout.
@@ -1755,6 +1789,7 @@ class WarmLoop:
         self.armed = False
         self.attempt_n = 0
         self.live_attempt = None
+        self.templates = None
 
     def stop(self) -> None:
         if self.warm is not None:
@@ -1810,6 +1845,12 @@ class WarmLoop:
             if line.startswith("SERVE reject"):
                 self.w.note(f"warm session: {line.strip()}")
                 continue
+            n = templates_loaded(line)
+            if n is not None:
+                self.templates = n
+                if n == 0:
+                    self.w.note_empty_store()
+                continue
             if armed(line):
                 self.saw_arm = True
                 self.press_nz = False
@@ -1861,6 +1902,8 @@ class WarmLoop:
                     continue
                 # A real press was scored for an auth we sent. It counts
                 # even if the panel went off or we cancelled meanwhile.
+                # Not against an empty store: there is nothing to match.
+                kind = store_miss_kind(kind, self.templates) or kind
                 if kind == "nomatch":
                     self.w.policy.on_miss()
                 # A miss never wakes the panel. In the dark the double

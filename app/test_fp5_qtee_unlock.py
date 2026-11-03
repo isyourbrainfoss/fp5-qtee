@@ -166,6 +166,18 @@ class MissTest(unittest.TestCase):
         self.assertIsNone(miss_kind("AUTH stay: all-zero miss"))
         self.assertIsNone(miss_kind("AUTH 1 skip falling avgv=158,158,165 first=241"))
 
+    def test_empty_store_is_not_a_strike(self) -> None:
+        f = fp5_qtee_unlock
+        self.assertEqual(f.templates_loaded("TEMPLATES loaded=0\n"), 0)
+        self.assertEqual(f.templates_loaded("TEMPLATES loaded=-1"), -1)
+        self.assertIsNone(f.templates_loaded("SERVE ready"))
+        self.assertEqual(f.store_miss_kind("nomatch", 0), "notemplates")
+        self.assertEqual(f.store_miss_kind("nomatch", 2), "nomatch")
+        self.assertEqual(f.store_miss_kind("nomatch", -1), "nomatch")
+        self.assertEqual(f.store_miss_kind("nomatch", None), "nomatch")
+        self.assertEqual(f.store_miss_kind("partial", 0), "partial")
+        self.assertIn("notemplates", f.MISS_TEXT)
+
     def test_keep_session_is_an_all_zero_nomatch(self) -> None:
         self.assertTrue(keep_session("nomatch", False))
         self.assertFalse(keep_session("nomatch", True))
@@ -931,6 +943,19 @@ class FollowTest(unittest.TestCase):
         self.assertEqual(self.w.policy.failed, 1)
         self.assertEqual(self.misses, [])
 
+    def test_miss_on_an_empty_store_is_not_a_strike(self) -> None:
+        notes: list[str] = []
+        self.w.note = lambda text: notes.append(text)  # type: ignore[method-assign]
+        proc = FakeProc(
+            ["TEMPLATES loaded=0\n",
+             "AUTH FAIL 1 itype=0x2 esd=0 avgv=291 fid=0 rc=-11\n", "session_exit:2\n"],
+            then_exit=True,
+        )
+        self.w.follow("c4", proc, lambda: True, poll_s=0.01)  # type: ignore[arg-type]
+        self.assertEqual(self.w.policy.failed, 0)
+        self.assertEqual(self.misses, ["notemplates"])
+        self.assertTrue(any("store is empty" in n for n in notes))
+
     def test_miss_with_panel_off_is_not_a_strike(self) -> None:
         proc = FakeProc(
             ["AUTH FAIL 1 itype=0x2 esd=0 avgv=291 fid=0 rc=-11\n", "session_exit:2\n"],
@@ -1301,6 +1326,25 @@ class WarmLoopTest(unittest.TestCase):
 
     def unlocks(self) -> list[tuple]:
         return [e for e in self.events if e[0] == "unlock"]
+
+    def test_empty_store_miss_is_not_a_strike(self) -> None:
+        self.step()
+        warm = self.started[0]
+        warm.say("TEMPLATES loaded=0", "SERVE ready", "SERVE idle")
+        self.step()
+        self.assertEqual(warm.sent, ["auth"])
+        warm.say("AUTH 1 arm mode=1 irq=4", "AUTH 1 REAL DOWN itype=0x2", self.FAIL)
+        self.step()
+        self.assertEqual(self.w.policy.failed, 0)
+        self.assertIn(("miss", "notemplates"), self.events)
+        # A store with templates still counts the miss.
+        self.loop.templates = 1
+        warm.say("SERVE result 1", "SERVE idle")
+        self.step()
+        warm.say("AUTH 2 arm mode=1 irq=5", "AUTH 2 REAL DOWN itype=0x2",
+                 "AUTH FAIL 2 itype=0x2 esd=0 avgv=291 fid=0 rc=-11")
+        self.step()
+        self.assertEqual(self.w.policy.failed, 1)
 
     def test_loads_while_dark_and_rechecks_lock_on_wake(self) -> None:
         self.step()                      # panel on, locked: starts cold
