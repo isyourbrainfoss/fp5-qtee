@@ -2114,7 +2114,7 @@ class TouchWakeTest(WarmLoopTest.__base__):  # type: ignore[misc]
         self.assertEqual(self.screen, [])
 
     def test_sleep_arms_idle_session_then_releases_delay_lock(self) -> None:
-        self.loop.sleep_disarm = False   # FP5_QTEE_SLEEP_DISARM=0
+        self.assertFalse(self.loop.sleep_disarm)  # the default: touch-to-wake
         self.panel[0] = False
         self.step()
         warm = self.started[0]
@@ -2134,7 +2134,7 @@ class TouchWakeTest(WarmLoopTest.__base__):  # type: ignore[misc]
         self.assertEqual(self.resume.taken, 1)
 
     def test_sleep_disarms_then_rearms_after_resume(self) -> None:
-        self.assertTrue(self.loop.sleep_disarm)  # the default
+        self.loop.sleep_disarm = True   # opt-in: FP5_QTEE_SLEEP_DISARM=1
         self.panel[0] = False
         self.step()
         warm = self.started[0]

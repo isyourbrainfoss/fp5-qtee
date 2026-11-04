@@ -166,13 +166,13 @@ WAKE = os.environ.get("FP5_QTEE_WAKE", "0") == "1"
 if WAKE:
     WARM = True
 SLEEP_ARM_WAIT_S = 1.5
-# Default since 2026-11-03: do not stay armed into s2idle. On
-# PrepareForSleep(true) the armed attempt is cancelled (bounded by the
-# delay lock), nothing is armed while sleeping, and the next step arms
-# again after PrepareForSleep(false). The power key still wakes the
-# phone. FP5_QTEE_SLEEP_DISARM=0 keeps the old touch-to-wake behaviour
-# (arm before sleep so a press can resume s2idle).
-SLEEP_DISARM = os.environ.get("FP5_QTEE_SLEEP_DISARM", "1") != "0"
+# Opt-in (off by default since 2026-11-04): FP5_QTEE_SLEEP_DISARM=1 stops
+# the watcher from staying armed into s2idle. On PrepareForSleep(true) the
+# armed attempt is cancelled (bounded by the delay lock), nothing is armed
+# while sleeping, and the next step arms again after PrepareForSleep(false).
+# Default (unset or 0): arm before sleep so a touch on the sensor can
+# resume s2idle and unlock (touch-to-wake).
+SLEEP_DISARM = os.environ.get("FP5_QTEE_SLEEP_DISARM", "0") == "1"
 try:
     RESUME_HOLD_S = max(0, int(os.environ.get("FP5_QTEE_WAKE_HOLD_S", "0")))
 except ValueError:
