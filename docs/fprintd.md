@@ -110,3 +110,6 @@ but a drop-in inside a sysext is only seen after the merge, which is too
 late when the image is merged late. Install the same file once under
 `/etc` with `sysext/install-etc.sh` (as root):
 `/etc/systemd/system/polkit.service.d/10-after-sysext.conf`.
+
+pam_fprintd for polkit/run0 prompts on BengalOS (module in the sysext,
+opt-in `/etc/pam.d/polkit-1`): see `docs/bengalos-pam-fprintd.md`.

@@ -9,3 +9,4 @@ session/test_fp5_finger
 __pycache__/
 *.pyc
 session/test_fp5_fw
+sysext/cache/

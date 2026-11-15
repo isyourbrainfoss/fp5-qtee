@@ -1,0 +1,19 @@
+#%PAM-1.0
+# fp5-qtee example, NOT installed automatically. Copy to /etc/pam.d/polkit-1
+# to let polkit prompts (pkexec, run0, Settings) take a fingerprint first.
+# /etc/pam.d/polkit-1 fully shadows /usr/lib/pam.d/polkit-1 (polkitd), so
+# everything below the fingerprint line is a verbatim copy of Debian
+# polkitd 128-1's /usr/lib/pam.d/polkit-1 (BengalOS 0.26.1114.1).
+# Recheck it against /usr/lib/pam.d/polkit-1 after every BengalOS update:
+#   diff <(grep -v '^#' /etc/pam.d/polkit-1 | grep -v pam_fprintd) \
+#        <(grep -v '^#' /usr/lib/pam.d/polkit-1)
+# Needs pam_fprintd.so from the fp5-qtee sysext. Rollback: delete this file.
+# max-tries=1 timeout=5: the PAM conversation is sequential, so the
+# password prompt only appears after a miss or 5 s without a finger.
+auth    [success=done default=ignore]   pam_fprintd.so max-tries=1 timeout=5
+
+@include common-auth
+@include common-account
+@include common-password
+session       required   pam_env.so readenv=1 user_readenv=0
+@include common-session-noninteractive
