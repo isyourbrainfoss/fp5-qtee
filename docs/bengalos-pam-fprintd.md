@@ -45,24 +45,23 @@ Prerequisites:
 
 - The sysext with `pam_fprintd.so` is merged:
   `ls /usr/lib/aarch64-linux-gnu/security/pam_fprintd.so`.
-- The unlock watcher lets go of the sensor while the phone is unlocked.
-  Use the user drop-in
-  `~/.config/systemd/user/fp5-qtee-unlock.service.d/30-fp5-release-when-unlocked.conf`:
+- The unlock watcher hands the sensor to `fp5-fprintd` on request. This
+  is the default want-sensor handshake (since 2026-11-02): while
+  `/run/fp5-fprintd/want-sensor` exists the watcher yields its session.
+  No drop-in is needed. The old `FP5_QTEE_KEEP_WARM=0` user drop-in
+  (`30-fp5-release-when-unlocked.conf`) is retired, see
+  `sysext/bengalos-user/README.md`; don't bring it back for this.
+  `fp5-fprintd` only takes the sensor from the watcher when 2 free 4 MiB
+  contiguous blocks are available (`/proc/buddyinfo`, order 10). It
+  compacts memory and drops caches first; if there still aren't enough,
+  the prompt falls through to the password.
 
-      [Service]
-      Environment=FP5_QTEE_KEEP_WARM=0
-
-  then `systemctl --user daemon-reload && systemctl --user restart
-  fp5-qtee-unlock`, and check right away that the lock screen still
-  unlocks with a finger. This is the setup that handed the sensor over on
-  the phone (2026-11-01). The newer want-sensor handshake (watcher yields
-  while `/run/fp5-fprintd/want-sensor` exists) is the default since
-  2026-11-02; if fprintd reports "another fp5-qtee-session is running",
-  the drop-in above is the fix. Either way `fp5-fprintd` needs free
-  4 MiB contiguous blocks for a new session (`/proc/buddyinfo`,
-  order 10). It compacts memory (and drops caches) first and only takes
-  the sensor when enough are free; otherwise the prompt falls through to
-  the password.
+On BengalOS images where `/etc/pam.d` is a symlink to
+`/usr/share/factory/etc/pam.d` (0.26.1114.1: tmpfiles `L? /etc/pam.d`),
+`/etc/pam.d/polkit-1` cannot be written. There the file has to come from
+a sysext as `/usr/share/factory/etc/pam.d/polkit-1`; the FP5 feed build
+does that, and the module and the PAM file then show up in the same
+merge. The steps below are for images with a writable `/etc/pam.d`.
 
 Keep a root shell open in another session while you switch, then:
 
