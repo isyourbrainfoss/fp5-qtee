@@ -505,6 +505,12 @@ polkit actions can be "not registered" after boot and the lock-screen
 fingerprint fails. The same drop-in inside the image is read too late
 when the sysext is merged late; see `docs/fprintd.md`.
 
+The sysext also ships Debian's `pam_fprintd.so` and an opt-in
+`/usr/share/fp5-qtee/pam/polkit-1.example`, so polkit/run0 prompts can
+take a finger after unlock. Nothing is put into `/etc` automatically;
+install steps, the watcher hand-over and rollback are in
+`docs/bengalos-pam-fprintd.md`.
+
 ## SERVE
 
 `fp5-qtee-session serve` stays loaded and waits on stdin. There is no

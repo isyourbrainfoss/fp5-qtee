@@ -29,5 +29,7 @@ install:
 	install -Dm644 $(APP)/fp5-qtee-feedback.json $(DESTDIR)$(DATADIR)/fp5-qtee-feedback.json
 	for f in $(PY); do install -Dm644 $(APP)/$$f $(DESTDIR)$(DATADIR)/$$f; done
 	install -Dm644 ../docs/bengalos-mbn.md $(DESTDIR)$(DOCDIR)/bengalos-mbn.md
+	install -Dm644 ../docs/bengalos-pam-fprintd.md $(DESTDIR)$(DOCDIR)/bengalos-pam-fprintd.md
+	install -Dm644 ../pam/polkit-1.example $(DESTDIR)$(DATADIR)/pam/polkit-1.example
 	install -Dm644 99-fp5-qtee.preset $(DESTDIR)$(PREFIX)/lib/systemd/system-preset/99-fp5-qtee.preset
 	install -Dm644 99-fp5-qtee-user.preset $(DESTDIR)$(PREFIX)/lib/systemd/user-preset/99-fp5-qtee.preset
