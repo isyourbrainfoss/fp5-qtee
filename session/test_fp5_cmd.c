@@ -180,8 +180,91 @@ static void test_held_miss_is_one_attempt(void)
 	CHECK(fp5_lift_check_ms(60000) == 2000, "long hold (pocket) 2 s");
 }
 
+/* Shared attempt: the watcher's auth wins and is run next. */
+static void test_share_watcher_wins(void)
+{
+	struct fp5_attempt a;
+	int pending = 0, drop = 0;
+
+	fp5_att_begin(&a, 0);
+	CHECK(fp5_share_from_watcher(&a, FP5_CMD_CANCEL, &pending) == FP5_REPLY_NONE,
+	      "watcher cancel accepted");
+	CHECK(!a.cancelled && !pending, "watcher cancel does not touch a shared attempt");
+	CHECK(fp5_share_from_watcher(&a, FP5_CMD_AUTH, &pending) == FP5_REPLY_NONE,
+	      "watcher auth is not busy");
+	CHECK(a.cancelled && pending, "watcher auth cancels the shared attempt and queues");
+	CHECK(fp5_att_finish(&a, 1) == FP5_ATT_CANCELLED, "no hit for the client after that");
+	CHECK(!drop, "client not dropped by the watcher");
+	fp5_share_from_watcher(&a, FP5_CMD_CANCEL, &pending);
+	CHECK(pending == 2, "a cancel after the pending auth is kept for it");
+	fp5_share_from_watcher(&a, FP5_CMD_CANCEL, &pending);
+	CHECK(pending == 2, "and stays so");
+}
+
+static void test_unshift(void)
+{
+	struct fp5_cmdbuf b;
+	char line[FP5_CMD_LINE];
+
+	memset(&b, 0, sizeof(b));
+	fp5_cmd_push(&b, "auth\n", 5);
+	CHECK(fp5_cmd_unshift(&b, "cancel"), "unshift fits");
+	CHECK(fp5_cmd_next(&b, line, sizeof(line)) && !strcmp(line, "cancel"), "cancel first");
+	CHECK(fp5_cmd_next(&b, line, sizeof(line)) && !strcmp(line, "auth"), "then the queued line");
+	memset(&b, 0, sizeof(b));
+	memset(line, 'x', sizeof(line));
+	fp5_cmd_push(&b, line, sizeof(b.buf) - 2);
+	CHECK(!fp5_cmd_unshift(&b, "cancel"), "no room: refused");
+	CHECK(b.n == sizeof(b.buf) - 2, "and the buffer is unchanged");
+}
+
+static void test_share_watcher_quit(void)
+{
+	struct fp5_attempt a;
+	int pending = 0;
+
+	fp5_att_begin(&a, 0);
+	fp5_share_from_watcher(&a, FP5_CMD_QUIT, &pending);
+	CHECK(a.cancelled && a.quit && !pending, "watcher quit cancels and quits");
+	fp5_att_begin(&a, 0);
+	CHECK(fp5_share_from_watcher(&a, FP5_CMD_UNKNOWN, &pending) == FP5_REPLY_UNKNOWN,
+	      "unknown from the watcher");
+}
+
+static void test_share_client(void)
+{
+	struct fp5_attempt a;
+	int drop = 0;
+
+	fp5_att_begin(&a, 0);
+	CHECK(fp5_share_from_client(&a, FP5_CMD_AUTH, &drop) == FP5_REPLY_BUSY,
+	      "second client auth is busy");
+	CHECK(!a.cancelled, "and does not cancel");
+	fp5_share_from_client(&a, FP5_CMD_CANCEL, &drop);
+	CHECK(a.cancelled && !drop && !a.quit, "client cancel keeps the client and the session");
+	fp5_att_begin(&a, 0);
+	fp5_share_from_client(&a, FP5_CMD_QUIT, &drop);
+	CHECK(a.cancelled && drop && !a.quit, "client quit/EOF drops only the client");
+	CHECK(fp5_share_from_client(&a, FP5_CMD_UNKNOWN, &drop) == FP5_REPLY_UNKNOWN,
+	      "unknown from the client");
+}
+
+static void test_share_pick(void)
+{
+	CHECK(fp5_share_pick(1, 1) == 1, "watcher first when both have a line");
+	CHECK(fp5_share_pick(0, 1) == 2, "client when only it has one");
+	CHECK(fp5_share_pick(1, 0) == 1, "watcher alone");
+	CHECK(fp5_share_pick(0, 0) == 0, "nothing");
+	CHECK(FP5_SHARE_FIRST > 1000, "shared numbers far from watcher numbers");
+}
+
 int main(void)
 {
+	test_share_watcher_wins();
+	test_share_watcher_quit();
+	test_share_client();
+	test_share_pick();
+	test_unshift();
 	test_held_miss_is_one_attempt();
 	test_lines();
 	test_parse();

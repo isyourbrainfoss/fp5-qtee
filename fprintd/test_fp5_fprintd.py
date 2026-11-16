@@ -1,4 +1,6 @@
 import json
+import os
+import time
 import tempfile
 import unittest
 from pathlib import Path
@@ -186,6 +188,116 @@ class SyncHelpersTest(unittest.TestCase):
             self.assertEqual(m.names("fp5"), ["right-index-finger"])
             self.assertEqual(json.loads(path.read_text())["fingers"][0]["user"], "fp5")
 
+
+
+class ShareTest(unittest.TestCase):
+    """SharedSession against a small in-process share server."""
+
+    def setUp(self):
+        import socket
+        import threading
+        self.socket = socket
+        self.name = f"fp5-share-unit-{os.getpid()}-{id(self)}"
+        self.srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.srv.bind("\0" + self.name)
+        self.srv.listen(2)
+        self.got = []
+        self.greeting = b"SERVE ready\nSERVE idle\n"
+        self.tmp = tempfile.TemporaryDirectory()
+        self._log_dir = f.LOG_DIR
+        f.LOG_DIR = Path(self.tmp.name)
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        f.LOG_DIR = self._log_dir
+        self.srv.close()
+        self.tmp.cleanup()
+
+    def _serve(self):
+        try:
+            c, _ = self.srv.accept()
+        except OSError:
+            return
+        c.sendall(self.greeting)
+        for line in c.makefile("r"):
+            self.got.append(line.strip())
+            if line.strip() == "auth":
+                c.sendall(b"AUTH 100001 arm mode=1 irq=0\n"
+                          b"AUTH HIT 100001 itype=0x2 avgv=900 fid=1979259351 rc=0\n"
+                          b"SERVE result 0\nSERVE idle\n")
+        c.close()
+
+    def lines_until(self, sess, prefix, timeout=5):
+        end = time.monotonic() + timeout
+        seen = []
+        while time.monotonic() < end:
+            try:
+                line = sess.lines.get(timeout=0.2)
+            except Exception:
+                continue
+            if line is None:
+                break
+            seen.append(line.strip())
+            if line.startswith(prefix):
+                return seen
+        self.fail(f"no {prefix!r} in {seen}")
+
+    def test_peer_ok(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "42").mkdir()
+            (root / "42" / "comm").write_text("fp5-qtee-sessio\n")
+            (root / "43").mkdir()
+            (root / "43" / "comm").write_text("python3\n")
+            self.assertTrue(f.share_peer_ok(42, 0, proc_root=root))
+            self.assertFalse(f.share_peer_ok(42, 1000, proc_root=root), "non-root peer")
+            self.assertFalse(f.share_peer_ok(43, 0, proc_root=root), "other root service")
+            self.assertFalse(f.share_peer_ok(44, 0, proc_root=root), "gone")
+            self.assertFalse(f.share_peer_ok(0, 0, proc_root=root))
+
+    def test_verify_through_share(self):
+        s = f.SharedSession(self.name, want_uid=os.getuid(), want_comm="")
+        self.assertTrue(s.alive())
+        self.assertEqual(s.peer_pid, os.getpid())
+        self.lines_until(s, "SERVE idle")
+        s.send("auth")
+        seen = self.lines_until(s, "SERVE result")
+        events = [f.verify_event(x) for x in seen]
+        self.assertIn(("match", 1979259351), events)
+        s.close()
+        self.assertFalse(s.alive())
+        self.thread.join(2)
+        self.assertEqual(self.got, ["auth", "quit"])
+
+    def test_wrong_uid_refused(self):
+        with self.assertRaises(f.Busy):
+            f.SharedSession(self.name, want_uid=os.getuid() + 1, want_comm="")
+
+    def test_wrong_comm_refused(self):
+        with self.assertRaises(f.Busy):
+            f.SharedSession(self.name, want_uid=os.getuid(), want_comm="fp5-qtee-sessio")
+
+    def test_busy_refused(self):
+        self.greeting = b"SERVE reject busy\n"
+        with self.assertRaises(f.Busy):
+            f.SharedSession(self.name, want_uid=os.getuid(), want_comm="")
+
+    def test_no_socket(self):
+        with self.assertRaises(OSError):
+            f.SharedSession(self.name + "-missing", want_uid=os.getuid(), want_comm="")
+
+    def test_silent_server_times_out(self):
+        self.greeting = b""
+        t0 = time.monotonic()
+        with self.assertRaises(f.Busy):
+            f.SharedSession(self.name, want_uid=os.getuid(), want_comm="", timeout=0.5)
+        self.assertLess(time.monotonic() - t0, 3)
+
+    def test_defaults_are_strict(self):
+        self.assertEqual(f.SHARE_UID, 0)
+        self.assertEqual(f.SHARE_COMM, "fp5-qtee-sessio")
+        self.assertEqual(f.SHARE_NAME, "fp5-qtee-share")
 
 if __name__ == "__main__":
     unittest.main()

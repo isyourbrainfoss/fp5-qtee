@@ -32,15 +32,19 @@ test_fp5_image: test_fp5_image.c fp5_image.c fp5_image.h
 test_fp5_cmd: test_fp5_cmd.c fp5_cmd.c fp5_cmd.h
 	$(CC) $(CFLAGS) -o $@ test_fp5_cmd.c fp5_cmd.c
 
+test_fp5_share: test_fp5_share.c $(SESSION_SRC) fp5_cmd.h fp5_finger.h fp5_fw.h fp5_image.h fp5_tee.h fp5_wire.h
+	$(CC) $(CFLAGS) -Wno-builtin-declaration-mismatch -o $@ test_fp5_share.c $(filter-out fp5-qtee-session.c,$(SESSION_SRC)) -lpthread
+
 test_fp5_finger: test_fp5_finger.c fp5_finger.c fp5_finger.h
 	$(CC) $(CFLAGS) -o $@ test_fp5_finger.c fp5_finger.c
 
-test: test_fp5_wire test_fp5_image test_fp5_cmd test_fp5_finger test_fp5_fw
+test: test_fp5_wire test_fp5_image test_fp5_cmd test_fp5_finger test_fp5_fw test_fp5_share
 	./test_fp5_fw
 	./test_fp5_wire
 	./test_fp5_image
 	./test_fp5_cmd
 	./test_fp5_finger
+	python3 test_fp5_share.py
 
 clean:
-	rm -f fp5-qtee-session fp5-qtee-load test_fp5_fw test_fp5_wire test_fp5_image test_fp5_cmd test_fp5_finger
+	rm -f fp5-qtee-session fp5-qtee-load test_fp5_fw test_fp5_wire test_fp5_image test_fp5_cmd test_fp5_finger test_fp5_share

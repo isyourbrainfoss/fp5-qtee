@@ -104,4 +104,31 @@ int fp5_lift_gate(int need_lift, int from_query, int real_down,
 /* Re-arm check interval while a missed finger stays down for held_ms. */
 int fp5_lift_check_ms(long held_ms);
 
+/*
+ * Shared attempts (fp5-fprintd verifying through the watcher's kept serve
+ * session, see docs/fprintd-share.md). A root client on the share socket
+ * sends "auth"; the session runs one attempt for it with its output going
+ * to that client only. The watcher (stdin) always wins:
+ * - watcher auth during a shared attempt: cancel the shared attempt and
+ *   run the watcher's auth right after it (pending_auth);
+ * - watcher quit or EOF: cancel and leave serve mode;
+ * - watcher cancel: nothing to cancel, unless its auth is pending; then
+ *   that auth runs with the cancel applied at once (pending_auth 2), as
+ *   if "auth\ncancel\n" had come in one write;
+ * - client cancel: cancel; client quit or EOF: cancel and drop the client;
+ * - client auth while its attempt runs: busy.
+ * Return value as fp5_att_cmd.
+ */
+int fp5_share_from_watcher(struct fp5_attempt *a, int cmd, int *pending_auth);
+int fp5_share_from_client(struct fp5_attempt *a, int cmd, int *drop_client);
+/* Put one line back in front of what is queued (the pending cancel).
+ * 0 if it does not fit; then nothing changes. */
+int fp5_cmd_unshift(struct fp5_cmdbuf *b, const char *line);
+/* Who goes next when the session is idle. 1: the watcher's line,
+ * 2: the client's line, 0: nothing. The watcher always comes first. */
+int fp5_share_pick(int watcher_has_line, int client_has_line);
+/* Attempt numbers for shared attempts start here, so they never look
+ * like one of the watcher's numbered auths. */
+#define FP5_SHARE_FIRST 100000
+
 #endif

@@ -18,6 +18,14 @@ One owner of the sensor at a time:
     our own session only if no other fp5-qtee-session runs, and quit it
     when the client releases.
   - If the seat locks while we hold the sensor, we stop and release it.
+  - Shared verify (preferred while unlocked): when the watcher keeps a
+    warm session, Claim/VerifyStart connect to that session's share socket
+    (abstract "@fp5-qtee-share", served by the root fp5-qtee-session only
+    to uid 0) and verify through it. No want-sensor marker, no handover,
+    no second 4 MiB qcomtee buffer, so it works with fragmented memory.
+    The watcher's own auth always wins over a shared attempt. If the share
+    socket is missing or refuses us, the handover above is used as before.
+    FP5_FPRINTD_SHARE=0 turns sharing off.
 
 Finger names: the trustlet knows only numeric fids. fingers.json maps
 fid -> {user, finger}. Fids the trustlet lists that the map lacks get the
@@ -38,6 +46,8 @@ import queue
 import re
 import shutil
 import signal
+import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -97,6 +107,16 @@ ENROLL_STAGES = int(os.environ.get("FP5_FPRINTD_ENROLL_STAGES", "16"))
 IDLE_RELEASE_S = 60.0
 READY_TIMEOUT_S = 20.0
 ALLOW_LAST = os.environ.get("FP5_FPRINTD_ALLOW_LAST", "0") == "1"
+# Verify through the unlock watcher's kept serve session (see the docstring).
+SHARE = os.environ.get("FP5_FPRINTD_SHARE", "1") != "0"
+SHARE_NAME = "fp5-qtee-share"
+SHARE_UID = 0
+SHARE_COMM = "fp5-qtee-sessio"  # /proc/<pid>/comm is cut at 15 chars
+SHARE_CONNECT_S = 2.0
+if os.environ.get("FP5_FPRINTD_TEST", "0") == "1":  # D-Bus test only
+    SHARE_NAME = os.environ.get("FP5_FPRINTD_SHARE_NAME", SHARE_NAME)
+    SHARE_UID = int(os.environ.get("FP5_FPRINTD_SHARE_UID", str(SHARE_UID)))
+    SHARE_COMM = os.environ.get("FP5_FPRINTD_SHARE_COMM", SHARE_COMM)
 
 _HIT = re.compile(r"^AUTH HIT (\d+) .* fid=(\d+) ")
 _NOMATCH = re.compile(r"^AUTH FAIL \d+ itype=0x2 ")
@@ -629,6 +649,136 @@ class Session:
             pass
 
 
+def share_peer_ok(pid: int, uid: int, want_uid: int = 0,
+                  want_comm: str = "fp5-qtee-sessio",
+                  proc_root: Path = Path("/proc")) -> bool:
+    """The share socket must be served by a root fp5-qtee-session.
+
+    The uid is what makes it safe: a match from this socket authorizes
+    run0/polkit, so only a peer that can already do anything (root) may
+    answer. The comm check guards against talking to some other root
+    service that happens to hold the name.
+    """
+    if uid != want_uid or pid <= 0:
+        return False
+    try:
+        comm = (proc_root / str(pid) / "comm").read_text().strip()
+    except OSError:
+        return False
+    return comm.startswith(want_comm)
+
+
+class SharedSession:
+    """A verify client of the unlock watcher's kept serve session.
+
+    Same surface as Session (lines, send, alive, close). close() only
+    disconnects: the session itself belongs to the watcher and is never
+    signalled from here.
+    """
+
+    shared = True
+
+    def __init__(self, name: str | None = None, want_uid: int | None = None,
+                 want_comm: str | None = None,
+                 timeout: float = SHARE_CONNECT_S) -> None:
+        name = SHARE_NAME if name is None else name
+        want_uid = SHARE_UID if want_uid is None else want_uid
+        want_comm = SHARE_COMM if want_comm is None else want_comm
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM | socket.SOCK_CLOEXEC)
+        try:
+            sock.settimeout(timeout)
+            sock.connect("\0" + name)
+            pid, uid, _gid = struct.unpack(
+                "3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                                      struct.calcsize("3i")))
+            if not share_peer_ok(pid, uid, want_uid, want_comm):
+                raise Busy(f"share socket peer pid {pid} uid {uid} is not the fp5-qtee session")
+            first = self._readline(sock, timeout)
+            if first != "SERVE ready":
+                raise Busy(f"share socket said {first or 'nothing'!r}")
+            sock.settimeout(None)
+        except BaseException:
+            sock.close()
+            raise
+        self.sock = sock
+        self.peer_pid = pid
+        self._dead = False
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        try:
+            self.logf = (LOG_DIR / f"fprintd-shared-{stamp}.txt").open("w")
+        except OSError:
+            self.logf = None
+        self.lines: "queue.Queue[str | None]" = queue.Queue()
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    @staticmethod
+    def _readline(sock: socket.socket, timeout: float) -> str:
+        """One line, byte by byte, so nothing after it is taken from the pump."""
+        buf = b""
+        end = time.monotonic() + timeout
+        while not buf.endswith(b"\n"):
+            left = end - time.monotonic()
+            if left <= 0 or len(buf) > 256:
+                break
+            sock.settimeout(left)
+            try:
+                b = sock.recv(1)
+            except socket.timeout:
+                break
+            if not b:
+                break
+            buf += b
+        return buf.decode("ascii", "replace").strip()
+
+    def _pump(self) -> None:
+        buf = b""
+        while True:
+            try:
+                data = self.sock.recv(4096)
+            except OSError:
+                data = b""
+            if not data:
+                break
+            buf += data
+            while b"\n" in buf:
+                raw, buf = buf.split(b"\n", 1)
+                line = raw.decode("utf-8", "replace") + "\n"
+                if self.logf is not None:
+                    try:
+                        self.logf.write(line)
+                        self.logf.flush()
+                    except (OSError, ValueError):
+                        pass
+                self.lines.put(line)
+        self._dead = True
+        self.lines.put(None)
+
+    def send(self, cmd: str) -> None:
+        try:
+            self.sock.sendall((cmd + "\n").encode())
+        except OSError:
+            self._dead = True
+
+    def alive(self) -> bool:
+        return not self._dead
+
+    def close(self, grace: float = 10.0) -> None:
+        self.send("quit")
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self.sock.close()
+        self._dead = True
+        if self.logf is not None:
+            try:
+                self.logf.close()
+            except OSError:
+                pass
+            self.logf = None
+
+
 def run_once(mode_args: list[str], tag: str, timeout: float = 120) -> str:
     """Run a one-shot session mode (list, remove) and return its output."""
     binary = session_bin()
@@ -753,8 +903,26 @@ def main() -> int:  # pragma: no cover - needs a system bus
                     raise dbus_err("PermissionDenied", "Not allowed to act for another user")
             return username
 
+        def _try_share(self) -> bool:
+            """Verify through the watcher's kept session. True if open."""
+            if self.sess is not None and self.sess.alive():
+                return bool(getattr(self.sess, "shared", False))
+            if not SHARE or seat_locked() is not False or not other_session_pids():
+                return False
+            try:
+                self.sess = SharedSession()
+            except (OSError, Busy) as e:
+                log(f"share unavailable ({e}); falling back to the handover")
+                return False
+            self.armed_sent = False
+            self.idle_since = time.monotonic()
+            log(f"verify through the unlock watcher's session (pid {self.sess.peer_pid})")
+            return True
+
         def _open_serve(self) -> None:
             if self.sess is not None and self.sess.alive():
+                return
+            if self._try_share():
                 return
             binary = session_bin()
             if binary is None:
@@ -964,8 +1132,11 @@ def main() -> int:  # pragma: no cover - needs a system bus
             self.user = user
             self.watch = bus.watch_name_owner(sender, self._sender_gone)
             log(f"claimed by {sender} for {user}")
-            # Ask the watcher to let go now, so VerifyStart finds the
+            # Verify through the watcher's kept session when it has one.
+            # Else ask the watcher to let go now, so VerifyStart finds the
             # sensor free. Only while unlocked: locked, it is the watcher's.
+            if self._try_share():
+                return
             if seat_locked() is False and (not other_session_pids() or memory_ok_for_yield()):
                 want_sensor(True)
 

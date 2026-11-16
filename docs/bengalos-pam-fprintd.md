@@ -51,6 +51,10 @@ Prerequisites:
   No drop-in is needed. The old `FP5_QTEE_KEEP_WARM=0` user drop-in
   (`30-fp5-release-when-unlocked.conf`) is retired, see
   `sysext/bengalos-user/README.md`; don't bring it back for this.
+  Since 2026-11-16 `fp5-fprintd` first verifies through the watcher's
+  kept session over the root-only share socket, which needs no new
+  memory (see `docs/fprintd-share.md`); the handover below is the
+  fallback.
   `fp5-fprintd` only takes the sensor from the watcher when 2 free 4 MiB
   contiguous blocks are available (`/proc/buddyinfo`, order 10). It
   compacts memory and drops caches first; if there still aren't enough,

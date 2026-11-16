@@ -4,6 +4,7 @@ session/test_fp5_wire
 session/test_fp5_image
 session/test_fp5_cmd
 session/test_fp5_finger
+session/test_fp5_share
 *.o
 *.ko
 __pycache__/

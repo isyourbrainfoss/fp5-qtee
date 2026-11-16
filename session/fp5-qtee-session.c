@@ -1,3 +1,6 @@
+/* accept4, struct ucred (SO_PEERCRED) for the share socket. */
+#define _GNU_SOURCE
+
 #include "fp5_cmd.h"
 #include "fp5_finger.h"
 #include "fp5_image.h"
@@ -16,6 +19,7 @@
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdio_ext.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
@@ -24,6 +28,9 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/epoll.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <stddef.h>
 #include <sched.h>
 #include <sys/syscall.h>
 
@@ -358,6 +365,39 @@ static struct fp5_attempt serve_att;
 static int irq_fd = -1;
 static struct fp5_cmdbuf serve_in;
 
+/*
+ * Share socket: fp5-fprintd (root) verifies through this kept serve
+ * session instead of making the watcher quit it, so no second 4 MiB
+ * qcomtee buffer is needed (docs/fprintd-share.md). Only a serve session
+ * whose stdin is the broker socket (the unlock watcher's) listens, on the
+ * abstract name "@fp5-qtee-share". Only uid 0 is served, one client at a
+ * time. A shared attempt prints to the client only; the watcher sees
+ * nothing of it, and its own auth always wins (fp5_share_from_watcher).
+ */
+#define FP5_SHARE_NAME "fp5-qtee-share"
+#ifdef FP5_SERVE_TEST
+/* Host test (test_fp5_share.c): no TEE, the test user, its own name. */
+static int test_set_group(struct svc *s);
+static int test_auth_once(struct svc *s, int which);
+#define SERVE_SET_GROUP(s) test_set_group(s)
+#define SERVE_AUTH_ONCE(s, w) test_auth_once(s, w)
+#define SHARE_UID getuid()
+#define SHARE_NAME (getenv("FP5_TEST_SHARE_NAME") ? getenv("FP5_TEST_SHARE_NAME") : FP5_SHARE_NAME)
+#else
+#define SERVE_SET_GROUP(s) set_group(s, group_path())
+#define SERVE_AUTH_ONCE(s, w) auth_once(s, w)
+#define SHARE_UID 0
+#define SHARE_NAME FP5_SHARE_NAME
+#endif
+static int share_lfd = -1;
+static int share_cfd = -1;
+static int share_active;	/* a shared attempt runs; stdout is the client */
+static int share_pending_auth;	/* the watcher's auth came in meanwhile */
+static int share_drop_req;	/* client said quit or went away */
+static int share_n;
+static struct fp5_cmdbuf share_in;
+static void share_ep_unwatch(void);
+
 static unsigned read_irq(void)
 {
 	char b[32];
@@ -433,6 +473,18 @@ static int serve_poll_cmds(void)
 
 		if (cmd == FP5_CMD_NONE && !memchr(serve_in.buf, '\n', serve_in.n))
 			break;
+		if (share_active) {
+			/* The watcher's line during a shared attempt. */
+			r = fp5_share_from_watcher(&serve_att, cmd,
+						   &share_pending_auth);
+			if (r == FP5_REPLY_UNKNOWN)
+				fprintf(stderr, "fp5-qtee: SERVE reject unknown (watcher, shared attempt)\n");
+			if (cmd == FP5_CMD_QUIT) {
+				serve_quit = 1;
+				break;
+			}
+			continue;
+		}
 		r = fp5_att_cmd(&serve_att, cmd);
 		if (r == FP5_REPLY_BUSY)
 			logl("SERVE reject auth busy");
@@ -442,6 +494,37 @@ static int serve_poll_cmds(void)
 			serve_quit = 1;
 			break;
 		}
+	}
+	/* The client's lines during its shared attempt. */
+	for (guard = 0; share_active && share_cfd >= 0 && !share_drop_req &&
+	     guard < 64; guard++) {
+		char line[FP5_CMD_LINE];
+		char chunk[FP5_CMD_LINE];
+		int cmd = FP5_CMD_NONE, r;
+
+		if (fp5_cmd_next(&share_in, line, sizeof(line))) {
+			cmd = fp5_cmd_parse(line);
+		} else {
+			ssize_t n = recv(share_cfd, chunk, sizeof(chunk),
+					 MSG_DONTWAIT);
+
+			if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK ||
+				      errno == EINTR))
+				break;
+			if (n <= 0)
+				cmd = FP5_CMD_QUIT;	/* client went away */
+			else {
+				fp5_cmd_push(&share_in, chunk, (size_t)n);
+				continue;
+			}
+		}
+		r = fp5_share_from_client(&serve_att, cmd, &share_drop_req);
+		if (r == FP5_REPLY_BUSY)
+			logl("SERVE reject auth busy");	/* stdout is the client */
+		else if (r == FP5_REPLY_UNKNOWN)
+			logl("SERVE reject unknown");
+		if (share_drop_req)
+			share_ep_unwatch();
 	}
 	return serve_att.cancelled;
 }
@@ -466,6 +549,7 @@ static int serve_poll_cmds(void)
 static int irq_ep = -1;
 static int irq_dev = -1;
 static int irq_ep_stdin;
+static int irq_ep_share;	/* share_cfd is in irq_ep */
 static int irq_spurious;
 
 static void irq_ep_close(const char *why)
@@ -476,6 +560,7 @@ static void irq_ep_close(const char *why)
 		close(irq_dev);
 	irq_ep = irq_dev = -1;
 	irq_ep_stdin = 0;
+	irq_ep_share = 0;
 	if (why)
 		logf("IRQWAIT poll %dms (%s)", FP5_IRQ_POLL_MS, why);
 }
@@ -533,7 +618,28 @@ static void irq_ep_watch_stdin(void)
 		irq_ep_close("stdin not pollable");
 }
 
-/* Sleep at most ms. 2 when stdin has input (serve), 1 on a device wake, 0 else. */
+/* A command from the share client also ends a finger wait. */
+static void share_ep_watch(void)
+{
+	struct epoll_event ev;
+
+	if (irq_ep < 0 || irq_ep_share || share_cfd < 0)
+		return;
+	memset(&ev, 0, sizeof(ev));
+	ev.events = EPOLLIN | EPOLLRDHUP;
+	ev.data.fd = share_cfd;
+	if (epoll_ctl(irq_ep, EPOLL_CTL_ADD, share_cfd, &ev) == 0)
+		irq_ep_share = 1;
+}
+
+static void share_ep_unwatch(void)
+{
+	if (irq_ep >= 0 && irq_ep_share && share_cfd >= 0)
+		epoll_ctl(irq_ep, EPOLL_CTL_DEL, share_cfd, NULL);
+	irq_ep_share = 0;
+}
+
+/* Sleep at most ms. 2 when stdin (or the share client) has input (serve), 1 on a device wake, 0 else. */
 static int irq_sleep(int ms)
 {
 	if (irq_ep >= 0) {
@@ -542,7 +648,8 @@ static int irq_sleep(int ms)
 
 		n = epoll_wait(irq_ep, out, 4, ms);
 		for (i = 0; i < n; i++) {
-			if (out[i].data.fd == 0)
+			if (out[i].data.fd == 0 ||
+			    (share_cfd >= 0 && out[i].data.fd == share_cfd))
 				r = 2;
 			else if (r == 0)
 				r = 1;
@@ -3327,6 +3434,227 @@ static int wait_until_lift(struct svc *s)
 	}
 }
 
+static void share_write(const char *msg)
+{
+	size_t len = strlen(msg);
+
+	if (share_cfd >= 0)
+		(void)!send(share_cfd, msg, len, MSG_NOSIGNAL | MSG_DONTWAIT);
+}
+
+static void share_open(void)
+{
+	struct stat st;
+	struct sockaddr_un a;
+	socklen_t len;
+	const char *env = getenv("FP5_QTEE_SHARE");
+	int fd;
+
+	if (env && !strcmp(env, "0")) {
+		logl("SHARE off (FP5_QTEE_SHARE=0)");
+		return;
+	}
+	/* Only the broker-started session (the unlock watcher's). */
+	if (fstat(0, &st) || !S_ISSOCK(st.st_mode)) {
+		logl("SHARE off (stdin is not a socket)");
+		return;
+	}
+	fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+	if (fd < 0) {
+		logf("SHARE off (socket: %s)", strerror(errno));
+		return;
+	}
+	memset(&a, 0, sizeof(a));
+	a.sun_family = AF_UNIX;
+	if (strlen(SHARE_NAME) > sizeof(a.sun_path) - 2) {
+		logl("SHARE off (name too long)");
+		close(fd);
+		return;
+	}
+	memcpy(a.sun_path + 1, SHARE_NAME, strlen(SHARE_NAME));
+	len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 +
+			  strlen(SHARE_NAME));
+	if (bind(fd, (struct sockaddr *)&a, len) || listen(fd, 2)) {
+		logf("SHARE off (bind: %s)", strerror(errno));
+		close(fd);
+		return;
+	}
+	share_lfd = fd;
+	logl("SHARE listen");
+}
+
+static void share_drop(void)
+{
+	share_ep_unwatch();
+	if (share_cfd >= 0) {
+		close(share_cfd);
+		fprintf(stderr, "fp5-qtee: share client gone\n");
+	}
+	share_cfd = -1;
+	share_drop_req = 0;
+	memset(&share_in, 0, sizeof(share_in));
+}
+
+static void share_accept(void)
+{
+	struct ucred cr;
+	socklen_t l = sizeof(cr);
+	struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+	int c = accept4(share_lfd, NULL, NULL, SOCK_CLOEXEC);
+
+	if (c < 0)
+		return;
+	if (getsockopt(c, SOL_SOCKET, SO_PEERCRED, &cr, &l) || cr.uid != SHARE_UID) {
+		fprintf(stderr, "fp5-qtee: share client refused (uid %d)\n",
+			l == sizeof(cr) ? (int)cr.uid : -1);
+		close(c);
+		return;
+	}
+	if (share_cfd >= 0) {
+		(void)!send(c, "SERVE reject busy\n", 18, MSG_NOSIGNAL | MSG_DONTWAIT);
+		close(c);
+		return;
+	}
+	/* A stuck client must not stall the session on a write. */
+	setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+	share_cfd = c;
+	share_drop_req = 0;
+	memset(&share_in, 0, sizeof(share_in));
+	fprintf(stderr, "fp5-qtee: share client pid %d\n", (int)cr.pid);
+	share_write("SERVE ready\nSERVE idle\n");
+}
+
+static void share_close(void)
+{
+	share_drop();
+	if (share_lfd >= 0)
+		close(share_lfd);
+	share_lfd = -1;
+}
+
+/*
+ * Next command while idle, from the watcher (*from_client 0) or the
+ * share client (1). New share clients are accepted here. The watcher's
+ * line always goes first. stdin EOF is the watcher's quit.
+ */
+static int serve_idle_next(int *from_client)
+{
+	char line[FP5_CMD_LINE];
+	char chunk[FP5_CMD_LINE];
+
+	for (;;) {
+		struct pollfd p[3];
+		int np = 0, il = -1, ic = -1, r;
+		int w = memchr(serve_in.buf, '\n', serve_in.n) != NULL;
+		int c = share_cfd >= 0 &&
+			memchr(share_in.buf, '\n', share_in.n) != NULL;
+
+		switch (fp5_share_pick(w, c)) {
+		case 1:
+			fp5_cmd_next(&serve_in, line, sizeof(line));
+			*from_client = 0;
+			return fp5_cmd_parse(line);
+		case 2:
+			fp5_cmd_next(&share_in, line, sizeof(line));
+			*from_client = 1;
+			return fp5_cmd_parse(line);
+		}
+		p[np].fd = 0;
+		p[np].events = POLLIN;
+		p[np++].revents = 0;
+		if (share_lfd >= 0) {
+			il = np;
+			p[np].fd = share_lfd;
+			p[np].events = POLLIN;
+			p[np++].revents = 0;
+		}
+		if (share_cfd >= 0) {
+			ic = np;
+			p[np].fd = share_cfd;
+			p[np].events = POLLIN;
+			p[np++].revents = 0;
+		}
+		r = poll(p, (nfds_t)np, -1);
+		if (r < 0) {
+			if (errno == EINTR)
+				continue;
+			*from_client = 0;
+			return FP5_CMD_QUIT;
+		}
+		if (p[0].revents) {
+			ssize_t n = read(0, chunk, sizeof(chunk));
+
+			if (n == 0 || (n < 0 && errno != EINTR && errno != EAGAIN)) {
+				*from_client = 0;
+				return FP5_CMD_QUIT;	/* the watcher went away */
+			}
+			if (n > 0)
+				fp5_cmd_push(&serve_in, chunk, (size_t)n);
+		}
+		if (ic >= 0 && p[ic].revents) {
+			ssize_t n = recv(share_cfd, chunk, sizeof(chunk), MSG_DONTWAIT);
+
+			if (n > 0)
+				fp5_cmd_push(&share_in, chunk, (size_t)n);
+			else if (n == 0 || (errno != EINTR && errno != EAGAIN &&
+					    errno != EWOULDBLOCK))
+				share_drop();
+		}
+		if (il >= 0 && (p[il].revents & POLLIN))
+			share_accept();
+	}
+}
+
+/*
+ * One attempt for the share client. stdout is the client while it runs,
+ * so every AUTH line (and the learn save after a hit) goes there and the
+ * watcher sees nothing. *pending is set when the watcher's auth cut it
+ * short; that auth runs next. Returns auth_once's result.
+ */
+static int share_attempt(struct svc *s, int which, int *pending)
+{
+	struct sigaction ign, old;
+	int saved, a;
+
+	*pending = 0;
+	fflush(stdout);
+	saved = fcntl(1, F_DUPFD_CLOEXEC, 3);
+	if (saved < 0) {
+		share_write("SERVE reject unknown\n");
+		return 0;
+	}
+	memset(&ign, 0, sizeof(ign));
+	ign.sa_handler = SIG_IGN;
+	sigaction(SIGPIPE, &ign, &old);
+	dup2(share_cfd, 1);
+	share_active = 1;
+	share_pending_auth = 0;
+	share_drop_req = 0;
+	share_ep_watch();
+	a = SERVE_AUTH_ONCE(s, which);
+	boost_press(0);
+	logf("SERVE result %d", a);
+	if (a >= 0 && !share_drop_req && !serve_quit)
+		logl("SERVE idle");
+	/* A line the client did not take (gone, or SO_SNDTIMEO) must not
+	 * reach the watcher after the switch back: drop it. */
+	if (fflush(stdout))
+		__fpurge(stdout);
+	clearerr(stdout);
+	dup2(saved, 1);
+	close(saved);
+	share_ep_unwatch();
+	sigaction(SIGPIPE, &old, NULL);
+	share_active = 0;
+	*pending = share_pending_auth;
+	share_pending_auth = 0;
+	fprintf(stderr, "fp5-qtee: shared attempt %d result %d%s\n", which, a,
+		*pending ? " (watcher auth next)" : "");
+	if (share_drop_req)
+		share_drop();
+	return a;
+}
+
 /*
  * Stay loaded and wait for commands, so a match does not pay for the
  * trustlet load and setup every time. Idle here is a blocking read on
@@ -3343,31 +3671,64 @@ static int wait_until_lift(struct svc *s)
  */
 static int serve_loop(struct svc *s)
 {
-	int n = 0, rc = 0;
+	int n = 0, rc = 0, say_idle = 1, pending_auth = 0;
 
 	irq_fd = open(IRQ_COUNT, O_RDONLY | O_CLOEXEC);
 	serve_on = 1;
 	irq_ep_open();
 	irq_ep_watch_stdin();
-	if (set_group(s, group_path())) {
+	if (SERVE_SET_GROUP(s)) {
 		rc = 1;
 		goto out;
 	}
+	share_open();
 	logl("SERVE ready");
 	while (!serve_quit) {
-		int cmd, a;
+		int cmd, a, from_client = 0;
 
-		logl("SERVE idle");
-		for (;;) {
-			cmd = serve_read_cmd(-1);
-			if (cmd == FP5_CMD_AUTH || cmd == FP5_CMD_QUIT)
-				break;
-			if (cmd == FP5_CMD_UNKNOWN)
-				logl("SERVE reject unknown");
+		/* "SERVE idle" goes to the watcher only after its own
+		 * attempts; a shared attempt changes nothing it knows. */
+		if (say_idle)
+			logl("SERVE idle");
+		say_idle = 0;
+		if (pending_auth) {
+			/* The watcher's auth that cut a shared attempt short,
+			 * with its cancel if one followed (pending_auth 2). */
+			if (pending_auth == 2 && !fp5_cmd_unshift(&serve_in, "cancel"))
+				fprintf(stderr, "fp5-qtee: pending cancel did not fit\n");
+			pending_auth = 0;
+			cmd = FP5_CMD_AUTH;
+		} else {
+			for (;;) {
+				cmd = serve_idle_next(&from_client);
+				if (from_client) {
+					if (cmd == FP5_CMD_AUTH)
+						break;
+					if (cmd == FP5_CMD_QUIT)
+						share_drop();
+					else if (cmd == FP5_CMD_UNKNOWN)
+						share_write("SERVE reject unknown\n");
+					continue;
+				}
+				if (cmd == FP5_CMD_AUTH || cmd == FP5_CMD_QUIT)
+					break;
+				if (cmd == FP5_CMD_UNKNOWN)
+					logl("SERVE reject unknown");
+			}
 		}
-		if (cmd == FP5_CMD_QUIT)
+		if (!from_client && cmd == FP5_CMD_QUIT)
 			break;
-		a = auth_once(s, ++n);
+		if (from_client) {
+			a = share_attempt(s, FP5_SHARE_FIRST + ++share_n,
+					  &pending_auth);
+			if (a < 0) {
+				rc = 1;
+				break;
+			}
+			continue;
+		}
+		say_idle = 1;
+		a = SERVE_AUTH_ONCE(s, ++n);
 		/* Every exit of an attempt ends the press boost and the
 		 * cpu_dma_latency hold, so an idle session never keeps the
 		 * CPU out of deep idle. */
@@ -3385,6 +3746,7 @@ static int serve_loop(struct svc *s)
 		}
 	}
 out:
+	share_close();
 	serve_on = 0;
 	if (irq_fd >= 0)
 		close(irq_fd);

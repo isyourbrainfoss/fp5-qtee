@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""Stand-in for the watcher's serve session in the share D-Bus test.
+
+It sets /proc/<pid>/comm to "fp5-qtee-sessio" (PR_SET_NAME), so fp5-fprintd
+sees "another session runs". It serves the share socket like
+fp5-qtee-session does: SERVE ready/idle on connect, one attempt per auth.
+FAKE_SHARE_SEQ (file) picks the outcomes; every client line is appended
+to FAKE_SHARE_LOG. No listen when FAKE_SHARE_LISTEN=0.
+"""
+import ctypes
+import os
+import socket
+import sys
+import time
+
+# Look like the real session in /proc/<pid>/comm, however we were started
+# (env re-execs python3, which would leave comm "python3").
+ctypes.CDLL(None).prctl(15, b"fp5-qtee-session", 0, 0, 0)  # PR_SET_NAME
+
+name = os.environ["FP5_FPRINTD_SHARE_NAME"]
+log = os.environ.get("FAKE_SHARE_LOG")
+seqf = os.environ.get("FAKE_SHARE_SEQ")
+
+
+def note(text):
+    if log:
+        with open(log, "a") as f:
+            f.write(text + "\n")
+
+
+if os.environ.get("FAKE_SHARE_LISTEN", "1") == "0":
+    time.sleep(3600)
+    sys.exit(0)
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind("\0" + name)
+srv.listen(2)
+note("listening")
+n = 0
+while True:
+    c, _ = srv.accept()
+    note("client")
+    c.sendall(b"SERVE ready\nSERVE idle\n")
+    f = c.makefile("r")
+    for line in f:
+        cmd = line.strip()
+        note(cmd)
+        if cmd == "quit":
+            break
+        if cmd != "auth":
+            continue
+        n += 1
+        w = 100000 + n
+        seq = (open(seqf).read().strip() if seqf and os.path.exists(seqf) else "hit").split(",")
+        what = seq[min(n - 1, len(seq) - 1)]
+        out = [f"AUTH {w} arm mode=1 irq=0"]
+        if what == "hit":
+            out.append(f"AUTH HIT {w} itype=0x2 avgv=900 fid=1979259351 rc=0")
+        elif what == "hit-other":
+            out.append(f"AUTH HIT {w} itype=0x2 avgv=900 fid=1558157930 rc=0")
+        elif what == "miss":
+            out.append(f"AUTH FAIL {w} itype=0x2 esd=0 avgv=800 fid=0 rc=-2")
+        elif what == "wait":
+            c.sendall((out[0] + "\n").encode())
+            continue  # no result: fprintd has to cancel or go away
+        out += ["SERVE result 0", "SERVE idle"]
+        time.sleep(0.2)
+        c.sendall(("\n".join(out) + "\n").encode())
+    note("client gone")
+    c.close()
