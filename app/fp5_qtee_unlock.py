@@ -120,6 +120,13 @@ PIN_MAX_AGE_S = 72 * 3600.0
 # not the PIN. Phosh clears LockedHint a little after logind unlocks.
 OUR_UNLOCK_GRACE_S = 10.0
 REQUIRE_PIN = os.environ.get("FP5_QTEE_REQUIRE_PIN_AFTER_BOOT", "1") != "0"
+# The graphical login after boot (greetd, the user's password) counts as
+# the PIN, as on Android, where the first unlock after boot is the PIN.
+# Only when the watcher finds no PIN yet, logind says the session is
+# unlocked, and the session began at most LOGIN_PIN_MAX_AGE_S ago, so a
+# watcher restart later in the session gets nothing. 0 turns it off.
+LOGIN_PIN = os.environ.get("FP5_QTEE_LOGIN_PIN", "1") != "0"
+LOGIN_PIN_MAX_AGE_S = 120.0
 # Short, Android-like. Phosh's lock screen shows only the summary.
 POLICY_TEXT = {
     "pin-after-boot": "PIN required after restart.",
@@ -748,6 +755,30 @@ class UnlockPolicy:
             return
         self._unlock_since = self.clock()
 
+    def credit_login(self, is_locked: bool | None, age_s: float | None) -> bool:
+        """Count a fresh login as the PIN. True when it was credited.
+
+        Only with no PIN on record, a confirmed unlocked session (unknown
+        is not unlocked) and a session at most LOGIN_PIN_MAX_AGE_S old.
+        Strikes and lockout stay as they are; the state file is written
+        so a PIN marker never exists without it.
+        """
+        if not self.require_pin or self.pin_at() is not None:
+            return False
+        if is_locked is not False or age_s is None:
+            return False
+        if not 0.0 <= age_s <= LOGIN_PIN_MAX_AGE_S:
+            return False
+        now = self.clock()
+        self._pin_at = now
+        self._save_state()
+        if self.marker is not None:
+            try:
+                _write_atomic(self.marker, f"{now:.3f}\n")
+            except OSError:
+                pass
+        return True
+
     # -- fingers -----------------------------------------------------
 
     def on_hit(self) -> None:
@@ -986,6 +1017,34 @@ def locked(sid: str) -> bool | None:
     return parse_locked(proc.stdout)
 
 
+def parse_session_age(show_text: str, now_mono: float) -> float | None:
+    """Seconds since the session began, from TimestampMonotonic. None if
+    absent or unparsable. CLOCK_MONOTONIC, like logind's value."""
+    for line in show_text.splitlines():
+        if line.startswith("TimestampMonotonic="):
+            try:
+                usec = int(line.split("=", 1)[1])
+            except ValueError:
+                return None
+            if usec <= 0:
+                return None
+            return now_mono - usec / 1e6
+    return None
+
+
+def session_age(sid: str) -> float | None:
+    try:
+        proc = subprocess.run(
+            ["loginctl", "show-session", sid, "-p", "TimestampMonotonic"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return parse_session_age(proc.stdout, time.monotonic())
+
+
 def other_session_running(our_pid: int | None) -> bool:
     try:
         out = _run(["ps", "-eo", "pid,args"], timeout=3)
@@ -1032,6 +1091,10 @@ class UnlockWatcher:
         # start is not treated as a wake.
         self._panel_was_on: bool | None = None
         self._clock: Callable[[], float] = time.monotonic
+        # The login-as-PIN check runs once, on the first known LockedHint.
+        self.login_pin_on = LOGIN_PIN
+        self._login_checked = False
+        self._session_age: Callable[[str], float | None] = session_age
 
     def _note_panel(self, on: bool, saw_arm: bool) -> bool:
         """Record panel state. A rise before this listen arms opens the
@@ -1161,10 +1224,24 @@ class UnlockWatcher:
             self.policy.forget_session()
         return sid  # type: ignore[return-value]
 
+    def login_pin(self, sid: str | None, state: bool | None) -> None:
+        """Once per watcher: a fresh, unlocked login counts as the PIN."""
+        if self._login_checked or sid is None or state is None:
+            return
+        self._login_checked = True
+        pol = self.policy
+        if not self.login_pin_on or not pol.require_pin or pol.pin_at() is not None:
+            return
+        if state is not False:
+            return
+        if pol.credit_login(state, self._session_age(sid)):
+            self.note(f"pin credited: fresh login (session {sid})")
+
     def lock_state(self, sid: str) -> bool | None:
         """locked(sid), feeding the policy. Unknown re-reads the session id."""
         state = locked(sid)
         self.policy.observe_lock(state)
+        self.login_pin(sid, state)
         if state is None:
             self._sid.forget()
         return state
@@ -1923,6 +2000,9 @@ class WarmLoop:
         self.sid = self.w.session_id()
         state = None if self.sid is None else self.is_locked(self.sid)
         self.w.policy.observe_lock(state)
+        login_pin = getattr(self.w, "login_pin", None)
+        if login_pin is not None:
+            login_pin(self.sid, state)
         if state is None:
             sid_cache = getattr(self.w, "_sid", None)
             if sid_cache is not None:

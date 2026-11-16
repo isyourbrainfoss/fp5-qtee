@@ -32,6 +32,7 @@ from fp5_qtee_unlock import (
     keep_session,
     miss_kind,
     parse_locked,
+    parse_session_age,
 
     notify_args,
     pump_lines,
@@ -530,6 +531,142 @@ class PolicyTest(unittest.TestCase):
         pinned = UnlockPolicy(require_pin=True, marker=None, clock=lambda: 1000.0, state=None)
         self.assertEqual(pinned.why_not(), "no-state")
         self.assertIn("saved", fp5_qtee_unlock.POLICY_TEXT["no-state"])
+
+
+class LoginPinTest(unittest.TestCase):
+    """The greetd login right before the watcher starts counts as the PIN."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.marker = Path(tmp.name) / "fp5-qtee-pin-ok"
+        self.now = [500.0]
+        self.w = UnlockWatcher()
+        self.w.policy = UnlockPolicy(
+            require_pin=True, marker=self.marker, clock=lambda: self.now[0],
+            state=lockout_state_for(self.marker),
+        )
+        self.w.login_pin_on = True
+        self.notes: list[str] = []
+        self.w.note = self.notes.append  # type: ignore[method-assign,assignment]
+        self.age: list[float | None] = [8.0]
+        self.age_asks = 0
+
+        def age(sid: str) -> float | None:
+            self.age_asks += 1
+            return self.age[0]
+
+        self.w._session_age = age  # type: ignore[method-assign,assignment]
+
+    def test_fresh_unlocked_login_credits(self) -> None:
+        self.assertEqual(self.w.policy.why_not(), "pin-after-boot")
+        self.w.login_pin("c2", False)
+        self.assertIsNone(self.w.policy.why_not())
+        self.assertEqual(self.marker.read_text(), "500.000\n")
+        self.assertTrue(lockout_state_for(self.marker).exists())
+        self.assertEqual(self.notes, ["pin credited: fresh login (session c2)"])
+        # A restart reads the marker and the state file: still no PIN needed.
+        again = UnlockPolicy(require_pin=True, marker=self.marker,
+                             clock=lambda: self.now[0],
+                             state=lockout_state_for(self.marker))
+        self.assertIsNone(again.why_not())
+
+    def test_old_session_no_credit(self) -> None:
+        self.age[0] = fp5_qtee_unlock.LOGIN_PIN_MAX_AGE_S + 1.0
+        self.w.login_pin("c2", False)
+        self.assertEqual(self.w.policy.why_not(), "pin-after-boot")
+        self.assertFalse(self.marker.exists())
+        self.assertEqual(self.notes, [])
+
+    def test_unknown_age_no_credit(self) -> None:
+        for age in (None, -5.0):
+            self.age[0] = age
+            self.w._login_checked = False
+            self.w.login_pin("c2", False)
+            self.assertEqual(self.w.policy.why_not(), "pin-after-boot")
+        self.assertFalse(self.marker.exists())
+
+    def test_locked_no_credit_and_no_retry(self) -> None:
+        self.w.login_pin("c2", True)
+        self.assertEqual(self.age_asks, 0)
+        # Unlocking later is a normal PIN unlock, not a login.
+        self.w.login_pin("c2", False)
+        self.assertEqual(self.age_asks, 0)
+        self.assertEqual(self.w.policy.why_not(), "pin-after-boot")
+
+    def test_unknown_state_or_sid_waits(self) -> None:
+        self.w.login_pin("c2", None)
+        self.w.login_pin(None, False)
+        self.assertEqual(self.age_asks, 0)
+        self.assertEqual(self.w.policy.why_not(), "pin-after-boot")
+        self.w.login_pin("c2", False)
+        self.assertIsNone(self.w.policy.why_not())
+
+    def test_once_per_watcher(self) -> None:
+        self.age[0] = None
+        self.w.login_pin("c2", False)
+        self.age[0] = 5.0
+        self.w.login_pin("c2", False)
+        self.assertEqual(self.age_asks, 1)
+        self.assertEqual(self.w.policy.why_not(), "pin-after-boot")
+
+    def test_existing_marker_unchanged(self) -> None:
+        self.marker.write_text("100.000\n")
+        lockout_state_for(self.marker).write_text("3 0.000\n")
+        self.w.policy = UnlockPolicy(require_pin=True, marker=self.marker,
+                                     clock=lambda: self.now[0],
+                                     state=lockout_state_for(self.marker))
+        self.w.login_pin("c2", False)
+        self.assertEqual(self.marker.read_text(), "100.000\n")
+        self.assertEqual(lockout_state_for(self.marker).read_text(), "3 0.000\n")
+        self.assertEqual(self.age_asks, 0)
+
+    def test_strikes_kept(self) -> None:
+        lockout_state_for(self.marker).write_text("7 0.000\n")
+        self.w.policy = UnlockPolicy(require_pin=True, marker=self.marker,
+                                     clock=lambda: self.now[0],
+                                     state=lockout_state_for(self.marker))
+        self.w.login_pin("c2", False)
+        self.assertEqual(self.w.policy.failed, 7)
+        self.assertEqual(lockout_state_for(self.marker).read_text().split()[0], "7")
+
+    def test_off_switch(self) -> None:
+        self.w.login_pin_on = False
+        self.w.login_pin("c2", False)
+        self.assertEqual(self.age_asks, 0)
+        self.assertEqual(self.w.policy.why_not(), "pin-after-boot")
+
+    def test_off_switch_env(self) -> None:
+        code = "import fp5_qtee_unlock as m; print(m.LOGIN_PIN)"
+        here = str(Path(__file__).resolve().parent)
+        for value, want in (("0", "False"), ("1", "True"), (None, "True")):
+            env = {k: v for k, v in os.environ.items() if k != "FP5_QTEE_LOGIN_PIN"}
+            if value is not None:
+                env["FP5_QTEE_LOGIN_PIN"] = value
+            out = subprocess.run([sys.executable, "-c", code], cwd=here, env=env,
+                                 capture_output=True, text=True, check=True)
+            self.assertEqual(out.stdout.strip(), want)
+
+    def test_pin_not_required_no_credit(self) -> None:
+        self.w.policy.require_pin = False
+        self.w.login_pin("c2", False)
+        self.assertEqual(self.age_asks, 0)
+        self.assertFalse(self.marker.exists())
+
+    def test_parse_session_age(self) -> None:
+        self.assertAlmostEqual(
+            parse_session_age("TimestampMonotonic=152173621\n", 160.0), 7.826379)
+        self.assertIsNone(parse_session_age("TimestampMonotonic=0\n", 160.0))
+        self.assertIsNone(parse_session_age("TimestampMonotonic=x\n", 160.0))
+        self.assertIsNone(parse_session_age("", 160.0))
+
+    def test_warm_loop_credits_fresh_login(self) -> None:
+        loop = WarmLoop(self.w, panel=lambda: True, is_locked=lambda sid: False,
+                        clock=lambda: self.now[0])
+        self.w.session_id = lambda: "c2"  # type: ignore[method-assign]
+        self.assertFalse(loop.ask_lock())
+        self.assertIsNone(self.w.policy.why_not())
+        self.assertEqual(self.notes, ["pin credited: fresh login (session c2)"])
 
 
 class PumpAndThrottleTest(unittest.TestCase):
