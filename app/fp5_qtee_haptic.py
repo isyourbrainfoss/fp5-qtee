@@ -297,6 +297,55 @@ def read_bus_profile() -> str:
     return parse_profile(proc.stdout)
 
 
+_LEVELS = {"silent": 0, "quiet": 1, "full": 2}
+# feedbackd's per-application settings for this app id (gsettings
+# relocatable schema). Its effective level is the lower of the global
+# profile and this one.
+APP_SCHEMA = "org.sigxcpu.feedbackd.application:/org/sigxcpu/feedbackd/application/org-fp5-qtee/"
+# How long a prepare() answer stays good. A press is ~0.2 s from finger
+# down to the match; the arm before it can be a few seconds earlier.
+PREPARED_S = 15.0
+
+
+def effective_profile(global_profile: str | None, app_profile: str | None) -> str | None:
+    """The lower of feedbackd's global and per-app profile, like feedbackd.
+
+    None (unreadable global) stays None, so nothing plays. An unreadable
+    or unknown app profile does not lower the global one.
+    """
+    if global_profile is None:
+        return None
+    g = global_profile.strip().lower()
+    if g not in _LEVELS:
+        return None
+    a = (app_profile or "").strip().strip("'\"").lower()
+    if a in _LEVELS and _LEVELS[a] < _LEVELS[g]:
+        return a
+    return g
+
+
+def _gsettings(args: list[str]) -> str:
+    try:
+        proc = subprocess.run(["gsettings", "get", *args], capture_output=True,
+                              text=True, timeout=2, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def read_app_profile() -> str:
+    return _gsettings([APP_SCHEMA, "profile"]).strip("'\"")
+
+
+def read_max_strength() -> float:
+    """feedbackd's max-haptic-strength (0..1). 1.0 when unreadable."""
+    text = _gsettings(["org.sigxcpu.feedbackd", "max-haptic-strength"])
+    try:
+        return max(0.0, min(1.0, float(text)))
+    except ValueError:
+        return 1.0
+
+
 class Haptic:
     """Plays one waveform. Tests pass profile, a writer, and a sleeper."""
 
@@ -332,6 +381,17 @@ class Haptic:
         self._dev_root = dev_root if dev_root is not None else Path("/dev/input")
         self._has_haptic = has_haptic if has_haptic is not None else feedbackd_has_haptic
         self._haptic_known: bool | None = None
+        # Direct path: prepare() reads the profile off the critical path
+        # (at arm and at finger-down); play() then starts the first pulse
+        # on the aw86927 itself in the caller's thread, ~1 ms, instead of
+        # busctl + fbcli + D-Bus + feedbackd (~30-60 ms) from a new thread.
+        self._direct = os.environ.get("FP5_QTEE_HAPTIC_DIRECT", "1") != "0"
+        self._ready: tuple[float, bool, float, int | None] | None = None
+        self._ready_lock = threading.Lock()
+        self._preparing = False
+        self._clock: Callable[[], float] = time.monotonic
+        self._prefetch: Callable[[], tuple[bool, float]] | None = None
+        self._starter: Callable[[str, float], bool] | None = None
         if enabled is None:
             enabled = os.environ.get("FP5_QTEE_HAPTIC", "1") != "0"
         self.enabled = enabled
@@ -346,8 +406,130 @@ class Haptic:
             return self._read_profile()
         return read_bus_profile()
 
+    def _read_settings(self) -> tuple[bool, float]:
+        """(may vibrate, strength) the way feedbackd would decide."""
+        if self._prefetch is not None:
+            return self._prefetch()
+        if not self.enabled:
+            return False, 0.0
+        prof = effective_profile(self.profile() or None, read_app_profile())
+        if not plays(prof):
+            return False, 0.0
+        return True, read_max_strength()
+
+    def prepare(self) -> None:
+        """Read the profile and open the motor now, in the background.
+
+        Called when the sensor is armed and again at finger-down, so the
+        match does not wait for busctl/gsettings. Never vibrates.
+        """
+        if not self._direct or self.find_led_cached() is not None:
+            return
+        with self._ready_lock:
+            if self._preparing:
+                return
+            self._preparing = True
+
+        def work() -> None:
+            fd: int | None = None
+            try:
+                ok, strength = self._read_settings()
+                if ok and self._starter is None:
+                    fd = self._open_ff()
+                    if fd is None:
+                        ok = False
+                with self._ready_lock:
+                    old = self._ready
+                    self._ready = (self._clock(), ok, strength, fd)
+                    fd = None
+                if old is not None and old[3] is not None:
+                    os.close(old[3])
+            finally:
+                if fd is not None:
+                    os.close(fd)
+                with self._ready_lock:
+                    self._preparing = False
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def find_led_cached(self) -> Path | None:
+        return find_led(self._leds)
+
+    def _take_ready(self) -> tuple[bool, float, int | None] | None:
+        with self._ready_lock:
+            ready, self._ready = self._ready, None
+        if ready is None:
+            return None
+        at, ok, strength, fd = ready
+        if self._clock() - at > PREPARED_S:
+            if fd is not None:
+                os.close(fd)
+            return None
+        return ok, strength, fd
+
+    def play_now(self, kind: str) -> str | None:
+        """The prepared direct path. None when not prepared: use play()."""
+        if not self._direct or waveform(kind) is None:
+            return None
+        ready = self._take_ready()
+        if ready is None:
+            return None
+        ok, strength, fd = ready
+        if not ok:
+            if fd is not None:
+                os.close(fd)
+            return "none"
+        if self._starter is not None:
+            return "direct" if self._starter(kind, strength) else None
+        if fd is None:
+            return None
+        if self._start_direct(fd, kind, strength):
+            return "direct"
+        return None
+
+    def _start_direct(self, fd: int, kind: str, strength: float) -> bool:
+        """First pulse now in this thread; the rest, erase and gain in a thread."""
+        steps = ff_steps(kind) or []
+        magnitude = max(0, min(0xFFFF, int(round(RUMBLE_MAGNITUDE * strength))))
+        if not steps or steps[0][0] != "rumble" or magnitude == 0:
+            os.close(fd)
+            return magnitude == 0 and bool(steps)
+        self._write_gain(fd, FULL_GAIN)
+        first = self._upload_play(fd, steps[0][1], magnitude)
+        if first is None:
+            self._write_gain(fd, RESTORE_GAIN)
+            os.close(fd)
+            return False
+
+        def rest() -> None:
+            last_id: int | None = first
+            last_ms = steps[0][1]
+            try:
+                for op, value in steps[1:]:
+                    if op == "sleep":
+                        self._sleeper(value / 1000.0)
+                        if last_id is not None:
+                            self._erase(fd, last_id)
+                            last_id = None
+                        continue
+                    last_id = self._upload_play(fd, value, magnitude)
+                    last_ms = value
+                    if last_id is None:
+                        return
+                if last_id is not None:
+                    self._sleeper(last_ms / 1000.0)
+                    self._erase(fd, last_id)
+            finally:
+                self._write_gain(fd, RESTORE_GAIN)
+                os.close(fd)
+
+        threading.Thread(target=rest, daemon=True).start()
+        return True
+
     def play(self, kind: str, *, background: bool = True) -> None:
         """Return at once. The GTK app and the watcher must not wait on it."""
+        if self.play_now(kind) is not None:
+            return
         if background:
             threading.Thread(
                 target=self.play_sync, args=(kind,), daemon=True
@@ -508,8 +690,9 @@ class Haptic:
         except OSError:
             pass
 
-    def _upload_play(self, fd: int, duration_ms: int) -> int | None:
-        buf = bytearray(rumble_effect(duration_ms))
+    def _upload_play(self, fd: int, duration_ms: int,
+                     magnitude: int = RUMBLE_MAGNITUDE) -> int | None:
+        buf = bytearray(rumble_effect(duration_ms, magnitude))
         try:
             fcntl.ioctl(fd, EVIOCSFF, buf)
         except OSError:

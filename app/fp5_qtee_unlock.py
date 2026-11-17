@@ -1186,6 +1186,12 @@ class UnlockWatcher:
         if args is not None:
             self._background(args)
 
+    def haptic_prepare(self) -> None:
+        """Read the feedback profile and open the motor before a match."""
+        prepare = getattr(self.haptic, "prepare", None)
+        if prepare is not None:
+            prepare()
+
     def tell_hit(self) -> None:
         """The Android confirm click. Nothing extra is added for lockout."""
         self.haptic.play("success")
@@ -1437,6 +1443,7 @@ class UnlockWatcher:
                         down_at = None
                 if is_down(line):
                     down_at = self._clock()
+                    self.haptic_prepare()
                     press_nz = False
                 score = verify_score(line)
                 if score not in (None, 0):
@@ -1892,6 +1899,8 @@ class WarmLoop:
             if armed(line):
                 self.saw_arm = True
                 self.press_nz = False
+                if self.believed_locked:
+                    self.w.haptic_prepare()
                 if self.wake_open and self.arm_at is None:
                     self.arm_at = self.clock()
                     self.down_at = None
@@ -1899,6 +1908,9 @@ class WarmLoop:
             if is_down(line):
                 self.down_at = self.clock()
                 self.press_nz = False
+                if self.believed_locked:
+                    # Profile + motor ready before the match (~170 ms away).
+                    self.w.haptic_prepare()
                 continue
             score = verify_score(line)
             if score not in (None, 0):

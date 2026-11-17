@@ -355,3 +355,109 @@ class PlayTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DirectPathTest(unittest.TestCase):
+    """Prepared direct aw86927 path: profile read before the match."""
+
+    def make(self, settings: tuple[bool, float]) -> tuple["Haptic", list]:
+        import tempfile
+        from fp5_qtee_haptic import Haptic
+        leds = tempfile.TemporaryDirectory()
+        self.addCleanup(leds.cleanup)
+        started: list = []
+        fallback: list = []
+        h = Haptic(leds=Path(leds.name), runner=lambda args: fallback.append(args))
+        h._direct = True
+        h._prefetch = lambda: settings
+        h._starter = lambda kind, strength: started.append((kind, strength)) or True
+        self.fallback = fallback
+        return h, started
+
+    def prepared(self, h: "Haptic") -> None:
+        import time as _t
+        h.prepare()
+        for _ in range(200):
+            if not h._preparing and h._ready is not None:
+                return
+            _t.sleep(0.005)
+        self.fail("prepare did not finish")
+
+    def test_effective_profile_is_the_lower_one(self) -> None:
+        from fp5_qtee_haptic import effective_profile
+        self.assertEqual(effective_profile("full", "full"), "full")
+        self.assertEqual(effective_profile("full", "'quiet'"), "quiet")
+        self.assertEqual(effective_profile("full", "silent"), "silent")
+        self.assertEqual(effective_profile("silent", "full"), "silent")
+        self.assertEqual(effective_profile("quiet", ""), "quiet")
+        self.assertIsNone(effective_profile(None, "full"))
+        self.assertIsNone(effective_profile("bogus", "full"))
+
+    def test_prepared_success_starts_directly(self) -> None:
+        h, started = self.make((True, 1.0))
+        self.prepared(h)
+        self.assertEqual(h.play_now("success"), "direct")
+        self.assertEqual(started, [("success", 1.0)])
+
+    def test_prepared_is_one_shot(self) -> None:
+        h, started = self.make((True, 1.0))
+        self.prepared(h)
+        h.play_now("success")
+        self.assertIsNone(h.play_now("success"))
+        self.assertEqual(len(started), 1)
+
+    def test_silent_prepared_plays_nothing(self) -> None:
+        h, started = self.make((False, 0.0))
+        self.prepared(h)
+        h.play("success", background=False)
+        self.assertEqual(started, [])
+        self.assertEqual(self.fallback, [])
+
+    def test_not_prepared_uses_the_old_path(self) -> None:
+        h, started = self.make((True, 1.0))
+        h._profile = "full"
+        h.play("success", background=False)
+        self.assertEqual(started, [])
+        self.assertEqual(self.fallback[0][:3], ["fbcli", "-A", "org.fp5.qtee"])
+
+    def test_stale_prepare_is_dropped(self) -> None:
+        h, started = self.make((True, 1.0))
+        now = [100.0]
+        h._clock = lambda: now[0]
+        self.prepared(h)
+        now[0] += 60.0
+        self.assertIsNone(h.play_now("success"))
+        self.assertEqual(started, [])
+
+    def test_direct_off_by_env_switch(self) -> None:
+        h, started = self.make((True, 1.0))
+        h._direct = False
+        h.prepare()
+        self.assertIsNone(h.play_now("success"))
+        self.assertEqual(started, [])
+
+    def test_miss_also_uses_the_prepared_path(self) -> None:
+        h, started = self.make((True, 0.5))
+        self.prepared(h)
+        self.assertEqual(h.play_now("miss"), "direct")
+        self.assertEqual(started, [("miss", 0.5)])
+
+    def test_start_direct_first_pulse_is_synchronous(self) -> None:
+        import os as _os
+        import time as _t
+        from fp5_qtee_haptic import FULL_GAIN, RESTORE_GAIN, Haptic
+        h = Haptic(leds=Path(tempfile.mkdtemp()), sleeper=lambda s: None)
+        log: list = []
+        h._write_gain = lambda fd, v: log.append(("gain", v))  # type: ignore[method-assign]
+        h._upload_play = lambda fd, ms, mag=0xFFFF: log.append(("play", ms, mag)) or 7  # type: ignore[method-assign]
+        h._erase = lambda fd, eid: log.append(("erase", eid))  # type: ignore[method-assign]
+        r, w = _os.pipe()
+        _os.close(w)
+        self.assertTrue(h._start_direct(r, "success", 1.0))
+        # Before the call returns: full gain and the pulse are already out.
+        self.assertEqual(log[:2], [("gain", FULL_GAIN), ("play", 60, 0xFFFF)])
+        for _ in range(200):
+            if ("gain", RESTORE_GAIN) in log[2:]:
+                break
+            _t.sleep(0.005)
+        self.assertEqual(log[2:], [("erase", 7), ("gain", RESTORE_GAIN)])

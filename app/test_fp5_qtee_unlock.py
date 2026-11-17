@@ -2199,6 +2199,17 @@ class TouchWakeTest(WarmLoopTest.__base__):  # type: ignore[misc]
         self.assertEqual(self.screen, ["on"])
         self.assertEqual(self.resume.released, 1)
 
+    def test_down_prepares_the_haptic_while_locked(self) -> None:
+        prepared: list[int] = []
+        self.w.haptic_prepare = lambda: prepared.append(1)  # type: ignore[method-assign]
+        self.step()
+        warm = self.started[0]
+        warm.say("SERVE idle")
+        self.step()
+        warm.say("AUTH 1 arm mode=1 irq=4", "AUTH 1 REAL DOWN itype=0x2")
+        self.step()
+        self.assertGreaterEqual(len(prepared), 1)
+
     def test_hit_buzzes_before_unlock(self) -> None:
         self.step()
         warm = self.started[0]
