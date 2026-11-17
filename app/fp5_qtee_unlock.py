@@ -1466,13 +1466,15 @@ class UnlockWatcher:
                         self._listen_why = self.policy.why_not()
                         outcome = "stop"
                         break
+                    # Buzz on the match itself, like the Android HAL, before
+                    # logind and the strike file (008a50a moved it after them).
+                    self.tell_hit()
                     if not self.unlock(sid, fid):
                         self._listen_why = "unlock failed"
                         outcome = "stop"
                         break
                     outcome = "hit"
                     self.policy.on_hit()
-                    self.tell_hit()
                     break
                 kind = miss_kind(line)
                 stay = False
@@ -1982,6 +1984,10 @@ class WarmLoop:
             return
         if self.is_locked(sid) is not True:
             return
+        # Buzz on the match itself, like the Android HAL: before the wake,
+        # loginctl unlock-session, screen on and the fsync'd strike file.
+        # A failed unlock still leaves the strikes alone (008a50a).
+        self.w.tell_hit()
         if should_wake_panel(True, panel, self.dark_arm):
             self.wake()
         dark = not self.panel()
@@ -1992,7 +1998,6 @@ class WarmLoop:
         if self.resume_lock is not None:
             self.resume_lock.release()
         self.w.policy.on_hit()
-        self.w.tell_hit()
         self.believed_locked = False
 
     def ask_lock(self) -> bool | None:

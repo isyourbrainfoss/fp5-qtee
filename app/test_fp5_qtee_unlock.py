@@ -922,7 +922,8 @@ class FollowTest(unittest.TestCase):
         out = self.w.follow("c4", proc, lambda: True, poll_s=0.01)  # type: ignore[arg-type]
         self.assertEqual(out, "stop")
         self.assertEqual(self.w._listen_why, "unlock failed")
-        self.assertEqual(self.hits, [])
+        # The match buzzes at once; the strikes stay.
+        self.assertEqual(self.hits, ["hit"])
         self.assertEqual(self.w.policy.failed, self.failed_before)
         self.assertEqual(self.unlocked, [])
 
@@ -932,7 +933,8 @@ class FollowTest(unittest.TestCase):
         out = self.w.follow("c4", proc, lambda: True, poll_s=0.01)  # type: ignore[arg-type]
         self.assertEqual(out, "stop")
         self.assertEqual(self.w._listen_why, "unlock failed")
-        self.assertEqual(self.hits, [])
+        # The match buzzes at once; the strikes stay.
+        self.assertEqual(self.hits, ["hit"])
         self.assertEqual(self.w.policy.failed, self.failed_before)
 
     def test_loginctl_oserror_does_not_count_as_a_hit(self) -> None:
@@ -941,7 +943,8 @@ class FollowTest(unittest.TestCase):
         out = self.w.follow("c4", proc, lambda: True, poll_s=0.01)  # type: ignore[arg-type]
         self.assertEqual(out, "stop")
         self.assertEqual(self.w._listen_why, "unlock failed")
-        self.assertEqual(self.hits, [])
+        # The match buzzes at once; the strikes stay.
+        self.assertEqual(self.hits, ["hit"])
         self.assertEqual(self.w.policy.failed, self.failed_before)
 
     def test_loginctl_ok_resets_strikes_and_buzzes(self) -> None:
@@ -1579,7 +1582,7 @@ class WarmLoopTest(unittest.TestCase):
         self.step()
         self.assertEqual(self.unlocks(), [("unlock", "c4", 1403494260)])
 
-    def test_failed_unlock_does_not_reset_or_buzz(self) -> None:
+    def test_failed_unlock_buzzes_match_but_does_not_reset(self) -> None:
         self.w.policy.on_miss()
         self.w.policy.on_miss()
         failed = self.w.policy.failed
@@ -1598,7 +1601,7 @@ class WarmLoopTest(unittest.TestCase):
             warm.say(self.HIT)
             self.step()
         self.assertEqual(self.unlocks(), [])
-        self.assertEqual(buzzed, [])
+        self.assertEqual(buzzed, ["hit"])
         self.assertEqual(self.w.policy.failed, failed)
         self.assertTrue(self.loop.believed_locked)
 
@@ -2195,6 +2198,16 @@ class TouchWakeTest(WarmLoopTest.__base__):  # type: ignore[misc]
         self.assertEqual(self.unlocks(), [("unlock", "c4", 1403494260)])
         self.assertEqual(self.screen, ["on"])
         self.assertEqual(self.resume.released, 1)
+
+    def test_hit_buzzes_before_unlock(self) -> None:
+        self.step()
+        warm = self.started[0]
+        warm.say("SERVE idle")
+        self.step()
+        warm.say(self.HIT)
+        self.step()
+        kinds = [e[0] for e in self.events if e[0] in ("haptic", "unlock")]
+        self.assertEqual(kinds, ["haptic", "unlock"])
 
     def test_lit_hit_does_not_call_screen_on(self) -> None:
         self.step()
