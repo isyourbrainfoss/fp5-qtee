@@ -2186,6 +2186,36 @@ class TouchWakeTest(WarmLoopTest.__base__):  # type: ignore[misc]
         self.loop.delay_lock = self.delay  # type: ignore[assignment]
         self.loop.resume_lock = self.resume  # type: ignore[assignment]
 
+    def test_dark_hit_skips_screen_on_when_power_key_turns_panel_on(self) -> None:
+        # One press is both the hit and KEY_POWER: Phosh turns the panel
+        # on by itself, so SetActive(false) must not race it.
+        self.panel[0] = False
+        self.step()
+        warm = self.started[0]
+        warm.say("SERVE idle")
+        self.step()
+        naps: list[float] = []
+
+        def nap(s: float) -> None:
+            naps.append(s)
+            if len(naps) == 2:
+                self.panel[0] = True
+
+        warm.say("AUTH 1 arm mode=1 irq=4", "AUTH 1 REAL DOWN itype=0x2", self.HIT)
+        self.loop.nap = nap
+        self.step()
+        self.assertEqual(self.unlocks(), [("unlock", "c4", 1403494260)])
+        self.assertEqual(self.screen, [])
+
+    def test_screen_on_after_hit_is_debounced(self) -> None:
+        self.panel[0] = False
+        self.assertTrue(self.loop.screen_on_after_hit())
+        self.now[0] += 0.5
+        self.assertFalse(self.loop.screen_on_after_hit())
+        self.now[0] += 2.0
+        self.assertTrue(self.loop.screen_on_after_hit())
+        self.assertEqual(self.screen, ["on", "on"])
+
     def test_dark_hit_unlocks_then_turns_screen_on(self) -> None:
         self.panel[0] = False
         self.step()

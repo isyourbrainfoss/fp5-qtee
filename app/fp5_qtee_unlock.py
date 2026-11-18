@@ -230,6 +230,25 @@ def sleep_signal(line: str) -> bool | None:
     return match.group(1) == "true"
 
 
+# Screen on after a dark hit (touch_wake). The FP5 sensor sits in the
+# power key, so one physical press can be both a fingerprint hit and a
+# KEY_POWER that Phosh uses to toggle the panel. On 18 Nov 2026 (10:43:14
+# and 14:40:25) SetActive(false) reached Phosh within 20-40 ms of that
+# key press, and Phoc then turned DSI-1 on and off about twice a second
+# for 10-40 s (96 modesets) until another key press. Every other dark
+# hit (key >= 0.14 s away, or no key at all) was fine. So after the
+# unlock, wait a short settle for the key path to turn the panel on and
+# only ask Phosh when the panel is still off. Also never ask twice in
+# SCREEN_ON_GAP_S.
+try:
+    SCREEN_ON_SETTLE_S = max(0, int(os.environ.get(
+        "FP5_QTEE_SCREEN_ON_SETTLE_MS", "350"))) / 1000.0
+except ValueError:
+    SCREEN_ON_SETTLE_S = 0.35
+SCREEN_ON_GAP_S = 2.0
+SCREEN_ON_POLL_S = 0.05
+
+
 def screen_on_args() -> list[str]:
     """Phosh: SetActive(false) turns power save off. Lock state is kept."""
     return ["gdbus", "call", "--session", "--dest", "org.gnome.ScreenSaver",
@@ -1776,6 +1795,8 @@ class WarmLoop:
         self.dark_arm = dark_arm
         self.wake = wake if wake is not None else watcher.wake_panel
         self.warm: WarmSession | None = None
+        # When this loop last asked Phosh for the screen (clock()).
+        self.screen_on_at: float | None = None
         self.armed = False
         # The auth number we are waiting on. None once that attempt is
         # cancelled, the session reports its result, or it goes idle.
@@ -2006,11 +2027,36 @@ class WarmLoop:
         if not self.w.unlock(sid, fid):
             return
         if self.touch_wake and dark:
-            self.w.screen_on()
+            self.screen_on_after_hit()
         if self.resume_lock is not None:
             self.resume_lock.release()
         self.w.policy.on_hit()
         self.believed_locked = False
+
+    def screen_on_after_hit(self) -> bool:
+        """Ask Phosh for the screen after a dark unlock, unless the power
+        key already did it. True when SetActive(false) was sent.
+
+        Polls the panel for SCREEN_ON_SETTLE_S in SCREEN_ON_POLL_S naps
+        (a fixed number of naps, so a frozen test clock cannot spin).
+        """
+        now = self.clock()
+        if (self.screen_on_at is not None
+                and now - self.screen_on_at < SCREEN_ON_GAP_S):
+            self.w.note(f"screen on skipped: asked {now - self.screen_on_at:.2f} s ago")
+            return False
+        naps = int(round(SCREEN_ON_SETTLE_S / SCREEN_ON_POLL_S))
+        for _ in range(naps):
+            if self.panel():
+                self.w.note("screen on skipped: panel came on (power key)")
+                return False
+            self.nap(SCREEN_ON_POLL_S)
+        if self.panel():
+            self.w.note("screen on skipped: panel came on (power key)")
+            return False
+        self.screen_on_at = self.clock()
+        self.w.screen_on()
+        return True
 
     def ask_lock(self) -> bool | None:
         """LockedHint now: True, False, or None when unknown."""
