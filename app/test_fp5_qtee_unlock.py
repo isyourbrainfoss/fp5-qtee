@@ -2186,9 +2186,9 @@ class TouchWakeTest(WarmLoopTest.__base__):  # type: ignore[misc]
         self.loop.delay_lock = self.delay  # type: ignore[assignment]
         self.loop.resume_lock = self.resume  # type: ignore[assignment]
 
-    def test_dark_hit_skips_screen_on_when_power_key_turns_panel_on(self) -> None:
-        # One press is both the hit and KEY_POWER: Phosh turns the panel
-        # on by itself, so SetActive(false) must not race it.
+    def _hit_with_key(self, keys: list[int], panel_on_after_naps: int | None):
+        self.keys = keys
+        self.loop.key_count = lambda: self.keys[0]  # type: ignore[assignment]
         self.panel[0] = False
         self.step()
         warm = self.started[0]
@@ -2198,16 +2198,67 @@ class TouchWakeTest(WarmLoopTest.__base__):  # type: ignore[misc]
 
         def nap(s: float) -> None:
             naps.append(s)
-            if len(naps) == 2:
+            if panel_on_after_naps is not None and len(naps) == panel_on_after_naps:
                 self.panel[0] = True
 
-        warm.say("AUTH 1 arm mode=1 irq=4", "AUTH 1 REAL DOWN itype=0x2", self.HIT)
         self.loop.nap = nap
+        return warm, naps
+
+    def test_dark_hit_skips_screen_on_when_power_key_turns_panel_on(self) -> None:
+        # One press is both the hit and KEY_POWER: Phosh turns the panel
+        # on by itself, so SetActive(false) must not race it.
+        warm, naps = self._hit_with_key([84], 2)
+        warm.say("AUTH 1 arm mode=1 irq=4", "AUTH 1 REAL DOWN itype=0x2")
+        self.step()
+        self.keys[0] = 85            # key pressed while the finger is down
+        self.now[0] += 1.0
+        warm.say(self.HIT)
         self.step()
         self.assertEqual(self.unlocks(), [("unlock", "c4", 1403494260)])
         self.assertEqual(self.screen, [])
 
+    def test_touch_only_dark_hit_turns_screen_on_without_waiting(self) -> None:
+        warm, naps = self._hit_with_key([84], None)
+        warm.say("AUTH 1 arm mode=1 irq=4", "AUTH 1 REAL DOWN itype=0x2", self.HIT)
+        self.step()
+        self.assertEqual(self.unlocks(), [("unlock", "c4", 1403494260)])
+        self.assertEqual(self.screen, ["on"])
+        self.assertEqual(naps, [])
+
+    def test_key_pressed_and_released_just_before_match_defers(self) -> None:
+        warm, naps = self._hit_with_key([84], None)
+        self.keys[0] = 86
+        warm.say("AUTH 1 arm mode=1 irq=4", "AUTH 1 REAL DOWN itype=0x2", self.HIT)
+        self.step()
+        self.assertEqual(self.screen, ["on"])      # panel stayed off: asked after the settle
+        self.assertEqual(len(naps), round(fp5_qtee_unlock.SCREEN_ON_SETTLE_S
+                                          / fp5_qtee_unlock.SCREEN_ON_POLL_S))
+
+    def test_no_key_counter_means_no_delay(self) -> None:
+        warm, naps = self._hit_with_key([0], None)
+        self.loop.key_count = lambda: None  # type: ignore[assignment]
+        warm.say("AUTH 1 arm mode=1 irq=4", "AUTH 1 REAL DOWN itype=0x2", self.HIT)
+        self.step()
+        self.assertEqual(self.screen, ["on"])
+        self.assertEqual(naps, [])
+
+    def test_stale_odd_count_does_not_defer(self) -> None:
+        self.loop.key_count = lambda: 85  # type: ignore[assignment]
+        self.loop.key_sample(self.now[0])
+        self.now[0] += 60.0
+        self.assertIsNone(self.loop.key_involved(self.now[0]))
+
+    def test_pwrkey_irq_count_parses_proc_interrupts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "interrupts"
+            f.write_text("           CPU0       CPU1\n"
+                         " 116:         80          4  pmic_arb 1302639 Edge      pmic_pwrkey\n"
+                         " 172:          0          0  spmi-gpio   5 Edge      Volume up\n")
+            self.assertEqual(fp5_qtee_unlock.pwrkey_irq_count(f), 84)
+            self.assertIsNone(fp5_qtee_unlock.pwrkey_irq_count(Path(tmp) / "nope"))
+
     def test_screen_on_after_hit_is_debounced(self) -> None:
+        self.loop.key_count = lambda: None  # type: ignore[assignment]
         self.panel[0] = False
         self.assertTrue(self.loop.screen_on_after_hit())
         self.now[0] += 0.5

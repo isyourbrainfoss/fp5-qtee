@@ -15,14 +15,20 @@ away, or no key press) gave 0-2 modesets. The later
 were while the screen was on and in use; that message shows up every day
 and is not the cause.
 
-Fix (WarmLoop.screen_on_after_hit): after a dark unlock, poll the panel for
-FP5_QTEE_SCREEN_ON_SETTLE_MS (default 350 ms). If the power key turned it
-on, do not call SetActive(false). Never ask more than once in 2 s.
-Cost: a touch-only dark unlock (no click) turns the screen on up to
-350 ms later. The haptic still fires on the match, before this.
+Fix (WarmLoop.screen_on_after_hit), v2 (18 Nov 20:44: v1 waited 350 ms on every
+touch-only unlock, which felt slow):
+- The watcher reads the pmic_pwrkey line of /proc/interrupts (world-readable, one
+  edge per press and per release; KEY_POWER is on pmic_pwrkey, gpio-keys is volume
+  up). It samples it every loop step (<= 0.2 s), at finger down and at the match.
+- Touch only (no edge): SetActive(false) at once, no added delay (as before v1).
+- Power key part of this touch: an edge within FP5_QTEE_KEY_RECENT_MS (400 ms), an
+  edge since the finger went down (down < 5 s ago), or an odd count (key held) that
+  changed < 3 s ago. Then poll the panel up to FP5_QTEE_SCREEN_ON_SETTLE_MS (350 ms);
+  if the key path turned it on, skip SetActive(false); else send it.
+- No counter (line missing): behaves like touch only.
+- Never more than one SetActive(false) in 2 s.
 
 Install (as root, from this dir): `./install.sh`. It checks SHA256SUMS and
-that the installed copy is the expected base (BASE.sha256, sha cd821291 =
-origin/main afa5687), keeps a .orig copy, replaces only
+that the installed copy is the expected base (BASE.sha256: v1 2e4b6e0, sha ec3d6f81), keeps a .orig copy, replaces only
 /var/lib/fp5-qtee-loginpin/fp5_qtee_unlock.py and restarts only the fp5
 user unit fp5-qtee-unlock.service. Undo: `./rollback.sh`.

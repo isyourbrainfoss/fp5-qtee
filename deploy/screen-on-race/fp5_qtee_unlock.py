@@ -236,10 +236,15 @@ def sleep_signal(line: str) -> bool | None:
 # and 14:40:25) SetActive(false) reached Phosh within 20-40 ms of that
 # key press, and Phoc then turned DSI-1 on and off about twice a second
 # for 10-40 s (96 modesets) until another key press. Every other dark
-# hit (key >= 0.14 s away, or no key at all) was fine. So after the
-# unlock, wait a short settle for the key path to turn the panel on and
-# only ask Phosh when the panel is still off. Also never ask twice in
-# SCREEN_ON_GAP_S.
+# hit (key >= 0.14 s away, or no key at all) was fine. So only when the
+# power key took part in this touch (see key_involved), wait a short
+# settle for the key path to turn the panel on and only ask Phosh when the
+# panel is still off. A touch with no key press asks Phosh at once, with
+# no added delay. Also never ask twice in SCREEN_ON_GAP_S.
+#
+# The key is seen without any device access: the pmic_pwrkey line of
+# /proc/interrupts (world-readable) counts one edge per press and one per
+# release (KEY_POWER is on pmic_pwrkey; gpio-keys is volume up).
 try:
     SCREEN_ON_SETTLE_S = max(0, int(os.environ.get(
         "FP5_QTEE_SCREEN_ON_SETTLE_MS", "350"))) / 1000.0
@@ -247,6 +252,35 @@ except ValueError:
     SCREEN_ON_SETTLE_S = 0.35
 SCREEN_ON_GAP_S = 2.0
 SCREEN_ON_POLL_S = 0.05
+try:
+    KEY_RECENT_S = max(0, int(os.environ.get("FP5_QTEE_KEY_RECENT_MS", "400"))) / 1000.0
+except ValueError:
+    KEY_RECENT_S = 0.4
+# A key edge since the finger went down counts only for a down this recent.
+KEY_DOWN_WINDOW_S = 5.0
+# An odd edge count means the key is held, but only trust that for a
+# change this recent (a lost edge must not defer every later unlock).
+KEY_HELD_MAX_S = 3.0
+INTERRUPTS = Path("/proc/interrupts")
+
+
+def pwrkey_irq_count(path: Path = INTERRUPTS, name: str = "pmic_pwrkey") -> int | None:
+    """Edges seen on the PMIC power key IRQ (all CPUs), or None."""
+    try:
+        text = path.read_text()
+    except OSError:
+        return None
+    for line in text.splitlines():
+        fields = line.split()
+        if not fields or fields[-1] != name or not fields[0].endswith(":"):
+            continue
+        total = 0
+        for f in fields[1:]:
+            if not f.isdigit():
+                break
+            total += int(f)
+        return total
+    return None
 
 
 def screen_on_args() -> list[str]:
@@ -1797,6 +1831,12 @@ class WarmLoop:
         self.warm: WarmSession | None = None
         # When this loop last asked Phosh for the screen (clock()).
         self.screen_on_at: float | None = None
+        # Power key edges (pmic_pwrkey IRQ count): last sample, when it last
+        # changed, and the count at the last finger down.
+        self.key_count: Callable[[], int | None] = pwrkey_irq_count
+        self.key_last: int | None = None
+        self.key_changed_at: float | None = None
+        self.down_key: int | None = None
         self.armed = False
         # The auth number we are waiting on. None once that attempt is
         # cancelled, the session reports its result, or it goes idle.
@@ -1928,6 +1968,7 @@ class WarmLoop:
                 continue
             if is_down(line):
                 self.down_at = self.clock()
+                self.down_key = self.key_sample(self.down_at)
                 self.press_nz = False
                 if self.believed_locked:
                     # Profile + motor ready before the match (~170 ms away).
@@ -2033,18 +2074,51 @@ class WarmLoop:
         self.w.policy.on_hit()
         self.believed_locked = False
 
+    def key_sample(self, now: float) -> int | None:
+        """Read the power key edge count; note when it changed."""
+        n = self.key_count()
+        if n is None:
+            return None
+        if self.key_last is not None and n != self.key_last:
+            self.key_changed_at = now
+        self.key_last = n
+        return n
+
+    def key_involved(self, now: float) -> str | None:
+        """Why the power key is part of this touch, or None (touch only)."""
+        n = self.key_sample(now)
+        if n is None:
+            return None
+        if self.key_changed_at is not None and now - self.key_changed_at <= KEY_RECENT_S:
+            return "recent"
+        if (self.down_key is not None and n != self.down_key
+                and self.down_at is not None and now - self.down_at <= KEY_DOWN_WINDOW_S):
+            return "since finger down"
+        if (n % 2 == 1 and self.key_changed_at is not None
+                and now - self.key_changed_at <= KEY_HELD_MAX_S):
+            return "held"
+        return None
+
     def screen_on_after_hit(self) -> bool:
         """Ask Phosh for the screen after a dark unlock, unless the power
         key already did it. True when SetActive(false) was sent.
 
-        Polls the panel for SCREEN_ON_SETTLE_S in SCREEN_ON_POLL_S naps
-        (a fixed number of naps, so a frozen test clock cannot spin).
+        With no power key in this touch it asks at once. Otherwise it polls
+        the panel for SCREEN_ON_SETTLE_S in SCREEN_ON_POLL_S naps (a fixed
+        number of naps, so a frozen test clock cannot spin).
         """
         now = self.clock()
         if (self.screen_on_at is not None
                 and now - self.screen_on_at < SCREEN_ON_GAP_S):
             self.w.note(f"screen on skipped: asked {now - self.screen_on_at:.2f} s ago")
             return False
+        why = self.key_involved(now)
+        if why is None:
+            # Touch only: as before the fix, no added delay.
+            self.screen_on_at = now
+            self.w.screen_on()
+            return True
+        self.w.note(f"screen on deferred: power key {why}")
         naps = int(round(SCREEN_ON_SETTLE_S / SCREEN_ON_POLL_S))
         for _ in range(naps):
             if self.panel():
@@ -2167,6 +2241,7 @@ class WarmLoop:
     def step(self) -> None:
         self._step_no += 1
         now = self.clock()
+        self.key_sample(now)
         panel = self.panel()
         signalled = self._signalled()
         self._sleep_events()
